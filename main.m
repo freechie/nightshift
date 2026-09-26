@@ -10,7 +10,7 @@ static BOOL methodMatches(id client, SEL sel, const char *expected) {
 }
 
 static void usage(void) {
-  fprintf(stderr, "usage: nshift <0-100>\n");
+  fprintf(stderr, "usage: nightshift <0-100>\n");
 }
 
 int main(int argc, const char *argv[]) {
