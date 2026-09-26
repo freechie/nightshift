@@ -2,7 +2,7 @@
 
 Set the macOS Night Shift warmth from the terminal. `0` is off. `100` is as warm as Night Shift goes.
 
-The idea and the `0`–`100` scale come from [nshift](https://github.com/jenghis/nshift) by Jenghis, the parked shell utility this project started from. That program calls the same private helper, `CBBlueLightClient`, and turns Night Shift off when the strength is `0`.
+The idea and the `0`–`100` scale come from [nshift](https://github.com/jenghis/nshift) by Jenghis (Copyright 2017, [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0)). That program calls the same private helper, `CBBlueLightClient`, and turns Night Shift off when the strength is `0`. These files were written for this repository. They do not include nshift's source.
 
 The program calls `CBBlueLightClient` in the private `CoreBrightness` framework. There is no public Night Shift API. A macOS update can change those methods. Before it sets or reads anything, `nightshift` compares the live method encodings with the ones below. A mismatch prints `Night Shift is unavailable` and exits `1`.
 
@@ -58,3 +58,9 @@ The daemon uses the same encoding check and the same three methods.
 3. Read the schedule Night Shift already stores and follow sunset with that, rather than calculating the sun position in this program.
 
 The socket path is `~/Library/Application Support/nightshift/nightshiftd.sock`. The daemon listens there. The command connects, writes one line containing the integer, and reads back one line containing the stored warmth or an error.
+
+## License
+
+Apache License 2.0. See `LICENSE`.
+
+Copyright 2026 John.
