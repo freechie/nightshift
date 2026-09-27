@@ -14,9 +14,31 @@
 // limitations under the License.
 
 #import <Foundation/Foundation.h>
+#include <Security/cssmerr.h>
 
-@interface CBBlueLightClient: NSObject
+typedef struct {
+  int hour;
+  int minute;
+} BLTime;
+
+typedef struct {
+  BLTime from;
+  BLTime to;
+} BLSchedule;
+
+typedef struct {
+  BOOL active;
+  BOOL enabled;
+  BOOL sunSchedulePermitted;
+  int mode;
+  BLSchedule schedule;
+  unsigned long long disableFlags;
+  BOOL reserved;
+} BLStatus;
+
+@interface CBBlueLightClient : NSObject
 - (BOOL)setStrength:(float)strength commit: (BOOL)commit;
 - (BOOL)setEnabled:(BOOL)enabled;
 - (BOOL)getStrength:(float *)strength;
+- (BOOL)getBlueLightStatus:(BLStatus *)status;
 @end

@@ -1,4 +1,5 @@
 #import "NightShift.h"
+#include "CBBlueLightClient.h"
 #import <objc/runtime.h>
 #import <string.h>
 
@@ -18,6 +19,7 @@ CBBlueLightClient *makeClient(void) {
   }
   return client;
 }
+
 BOOL readStrength(CBBlueLightClient *client, long *stored) {
   float actual = 0;
   if (![client getStrength:&actual]) {
@@ -26,6 +28,7 @@ BOOL readStrength(CBBlueLightClient *client, long *stored) {
   *stored = lroundf(actual * 100.0f);
   return YES;
 }
+
 BOOL applyStrength(CBBlueLightClient *client, long value, long *stored) {
   if (value == 0) {
     if (![client setStrength:0 commit:YES] || ![client setEnabled:NO]) {
@@ -39,4 +42,13 @@ BOOL applyStrength(CBBlueLightClient *client, long value, long *stored) {
     return NO;
   }
   return readStrength(client, stored);
+}
+
+BOOL readStatus(CBBlueLightClient *client, BLStatus *status) {
+  if (!methodMatches(client, @selector(getBlueLightStatus:),
+                     "B24@0:8^{?=BBBi{?={?=ii}{?=ii}}QB}16")) {
+    return NO;
+  }
+  memset(status, 0, sizeof(*status));
+  return [client getBlueLightStatus:status];
 }

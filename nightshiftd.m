@@ -102,6 +102,16 @@ int main(void) {
       return 1;
     }
 
+    BLStatus status;
+    if (readStatus(client, &status)) {
+      fprintf(stderr, "mode %d, enabled %d, schedule %02d:%02d to %02d:%02d\n",
+              status.mode, status.enabled, status.schedule.from.hour,
+              status.schedule.from.minute,
+              status.schedule.to.hour, status.schedule.to.minute);
+    } else {
+      fprintf(stderr, "Night Shift schedule is unavailable\n");
+    }
+
     NSString *dir =
         [NSHomeDirectory() stringByAppendingPathComponent:
                                @"Library/Application Support/nightshift"];

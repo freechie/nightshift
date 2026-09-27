@@ -3,3 +3,4 @@
 CBBlueLightClient *makeClient(void);
 BOOL readStrength(CBBlueLightClient *client, long *stored);
 BOOL applyStrength(CBBlueLightClient *client, long value, long *stored);
+BOOL readStatus(CBBlueLightClient *client, BLStatus *status);
