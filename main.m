@@ -13,32 +13,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#import "CBBlueLightClient.h"
-#import <Foundation/Foundation.h>
+#import "NightShift.h"
 #import <errno.h>
-#import <objc/runtime.h>
 #import <string.h>
 #import <sys/socket.h>
 #import <sys/stat.h>
 #import <sys/un.h>
 #include <unistd.h>
-
-static BOOL methodMatches(id client, SEL sel, const char *expected) {
-  Method method = class_getInstanceMethod([client class], sel);
-  const char *encoding = method ? method_getTypeEncoding(method) : NULL;
-  return encoding != NULL && strcmp(encoding, expected) == 0;
-}
-
-static CBBlueLightClient *makeClient(void) {
-  CBBlueLightClient *client = [[CBBlueLightClient alloc] init];
-  if (client == nil ||
-      !methodMatches(client, @selector(setStrength:commit:), "B24@0:8f16B20") ||
-      !methodMatches(client, @selector(setEnabled:), "B20@0:8B16") ||
-      !methodMatches(client, @selector(getStrength:), "B24@0:8^f16")) {
-    return nil;
-  }
-  return client;
-}
 
 static int sendToDaemon(long value, long *stored) {
   NSString *sock = [[NSHomeDirectory()
@@ -61,7 +42,7 @@ static int sendToDaemon(long value, long *stored) {
   int one = 1;
   setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
   struct timeval tv = {.tv_sec = 2, .tv_usec = 0};
-  setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
   struct sockaddr_un addr;
   memset(&addr, 0, sizeof(addr));
@@ -123,12 +104,13 @@ int main(int argc, const char *argv[]) {
         fprintf(stderr, "Night Shift is unavailable\n");
         return 1;
       }
-      float actual = 0;
-      if (![client getStrength:&actual]) {
+
+      long stored = 0;
+      if (!readStrength(client, &stored)) {
         fprintf(stderr, "failed to read Night Shift\n");
         return 1;
       }
-      printf("%ld\n", lroundf(actual * 100.0f));
+      printf("%ld\n", stored);
       return 0;
     }
     if (argc != 2) {
@@ -148,7 +130,7 @@ int main(int argc, const char *argv[]) {
       return 0;
     }
     if (sent == 1) {
-      fprintf(stderr, "Failed to disable Night Shift\n");
+      fprintf(stderr, "failed to set Night Shift\n");
       return 1;
     }
     CBBlueLightClient *client = makeClient();
@@ -156,25 +138,12 @@ int main(int argc, const char *argv[]) {
       fprintf(stderr, "Night Shift is unavailable\n");
       return 1;
     }
-    if (value == 0) {
-      if (![client setStrength:0 commit:YES] || ![client setEnabled:NO]) {
-        fprintf(stderr, "failed to disable Night Shift");
-        return 1;
-      }
-      printf("0\n");
-      return 0;
-    }
-    float strength = (float)value / 100.0f;
-    if (![client setStrength:strength commit:YES] || ![client setEnabled:YES]) {
-      fprintf(stderr, "failed to set Night Shift\n");
+    if (!applyStrength(client, value, &stored)) {
+      fprintf(stderr, value == 0 ? "failed to disable Night Shift\n"
+                                 : "failed to set Night Shift\n");
       return 1;
     }
-    float actual = 0;
-    if (![client getStrength:&actual]) {
-      fprintf(stderr, "failed to read Night Shift\n");
-      return 1;
-    }
-    printf("%ld\n", lroundf(actual * 100.0f));
+    printf("%ld\n", stored);
   }
   return 0;
 }

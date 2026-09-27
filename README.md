@@ -24,7 +24,7 @@ With no arguments it prints the warmth Night Shift has stored. That number can s
 
 A set prints the warmth read back after the call, not the number you typed. Night Shift stores a fraction from `0` to `1`. The program multiplies by `100` and rounds to the nearest integer.
 
-Anything other than one integer from `0` to `100` prints `usage: nightshift <0-100>` and exits `1`. A failed read or write also exits `1`.
+Anything other than one integer from `0` to `100` prints `usage: nightshift [0-100]` and exits `1`. A failed read or write also exits `1`.
 
 `nightshift` does not need the daemon. When `nightshiftd` is listening, `nightshift 40` sends `40` to it and prints the daemon's reply. When nothing is listening, `nightshift` sets Night Shift itself. Once the daemon has accepted a value, a failed reply exits `1` instead of setting Night Shift a second time. With no arguments, `nightshift` always reads the warmth directly.
 

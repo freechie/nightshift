@@ -1,15 +1,16 @@
 SDK := $(shell xcrun --show-sdk-path)
-CFLAGS := -fobjc-arc -F$(SDK)/System/Library/PrivateFrameworks
+CFLAGS := -fobjc-arc -Wall -Wextra -F$(SDK)/System/Library/PrivateFrameworks
 LDLIBS := -framework Foundation -framework CoreBrightness
 PREFIX ?= /usr/local
+SHARED := NightShift.m NightShift.h CBBlueLightClient.h
 
 all: nightshift nightshiftd
 
-nightshift: main.m CBBlueLightClient.h
-	clang $(CFLAGS) $(LDLIBS) -o $@ main.m
+nightshift: main.m $(SHARED)
+	clang $(CFLAGS) $(LDLIBS) -o $@ main.m NightShift.m
 
-nightshiftd: nightshiftd.m CBBlueLightClient.h
-	clang $(CFLAGS) $(LDLIBS) -o $@ nightshiftd.m
+nightshiftd: nightshiftd.m $(SHARED)
+	clang $(CFLAGS) $(LDLIBS) -o $@ nightshiftd.m NightShift.m
 
 install: all
 	install -d $(PREFIX)/bin

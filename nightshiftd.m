@@ -13,49 +13,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#import "CBBlueLightClient.h"
-#include <CoreFoundation/CoreFoundation.h>
-#include <Foundation/Foundation.h>
-#include <_stdio.h>
+#import "NightShift.h"
 #import <errno.h>
-#include <objc/objc.h>
-#import <objc/runtime.h>
 #import <signal.h>
 #import <string.h>
-#include <sys/_types/_s_ifmt.h>
-#include <sys/_types/_ssize_t.h>
 #import <sys/socket.h>
 #import <sys/stat.h>
 #import <sys/un.h>
 #import <unistd.h>
-
-static BOOL methodMatches(id client, SEL sel, const char *expected) {
-  Method method = class_getInstanceMethod([client class], sel);
-  const char *encoding = method ? method_getTypeEncoding(method) : NULL;
-  return encoding != NULL && strcmp(encoding, expected) == 0;
-}
-
-static int applyStrength(CBBlueLightClient *client, long value, long *stored) {
-  if (value == 0) {
-    if (![client setStrength:0 commit:(YES)] || ![client setEnabled:NO]) {
-      return 1;
-    }
-    *stored = 0;
-    return 0;
-  }
-
-  float strength = (float)value / 100.0f;
-  if (![client setStrength:strength commit:YES] || ![client setEnabled:YES]) {
-    return 1;
-  }
-
-  float actual = 0;
-  if (![client getStrength:&actual]) {
-    return 1;
-  }
-  *stored = lroundf(actual * 100.0f);
-  return 0;
-}
 
 static BOOL daemonAlreadyRunning(const char *path) {
   int fd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -131,12 +96,8 @@ int main(void) {
   @autoreleasepool {
     signal(SIGPIPE, SIG_IGN);
 
-    CBBlueLightClient *client = [[CBBlueLightClient alloc] init];
-    if (client == nil ||
-        !methodMatches(client, @selector(setStrength:commit:),
-                       "B24@0:8f16B20") ||
-        !methodMatches(client, @selector(setEnabled:), "B20@0:8B16") ||
-        !methodMatches(client, @selector(getStrength:), "B24@0:8^f16")) {
+    CBBlueLightClient *client = makeClient();
+    if (client == nil) {
       fprintf(stderr, "Night Shift is unavailable\n");
       return 1;
     }
@@ -174,6 +135,9 @@ int main(void) {
         return 1;
       }
 
+      struct timeval tv = {.tv_sec = 2, .tv_usec = 0};
+      setsockopt(connection, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
       char buf[64];
       char *end = NULL;
       BOOL gotLine = readMessage(connection, buf, sizeof(buf));
@@ -181,7 +145,7 @@ int main(void) {
       BOOL numeric = gotLine && end != buf && *end == '\0';
       long stored = 0;
       if (numeric && value >= 0 && value <= 100 &&
-          applyStrength(client, value, &stored) == 0) {
+          applyStrength(client, value, &stored)) {
         dprintf(connection, "%ld\n", stored);
       } else {
         dprintf(connection, "failed\n");
