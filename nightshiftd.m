@@ -15,6 +15,7 @@
 
 #import "NightShift.h"
 #import <errno.h>
+#import <poll.h>
 #import <signal.h>
 #import <string.h>
 #import <sys/socket.h>
@@ -119,6 +120,24 @@ static long rampValue(BLSchedule schedule, long peak, int now) {
   return value < 1 ? 1 : value;
 }
 
+static void rampTick(CBBlueLightClient *client, long peak, long *applied) {
+  BLStatus status;
+  if (!readStatus(client, &status) || status.mode != kModeCustom ||
+      !status.enabled) {
+    return;
+  }
+  long value = rampValue(status.schedule, peak, minutesNow());
+  if (value < 0) {
+    *applied = -1;
+    return;
+  }
+  long stored = 0;
+  if (value != *applied && applyStrength(client, value, &stored)) {
+    *applied = value;
+    fprintf(stderr, "ramp set %ld\n", stored);
+  }
+}
+
 int main(void) {
   @autoreleasepool {
     signal(SIGPIPE, SIG_IGN);
@@ -129,18 +148,18 @@ int main(void) {
       return 1;
     }
 
-    BLStatus status;
     long peak = 0;
-    if (!readStatus(client, &status) || !readStrength(client, &peak)) {
+    if (!readStrength(client, &peak)) {
+      fprintf(stderr, "failed to read Night Shift strength\n");
+      return 1;
+    }
+    long applied = -1;
+
+    BLStatus status;
+    if (!readStatus(client, &status)) {
       fprintf(stderr, "Night Shift schedule is unavailable\n");
     } else if (status.mode != kModeCustom) {
       fprintf(stderr, "evening ramp needs a Custom Night Shift schedule\n");
-    } else {
-      fprintf(stderr,
-              "schedule %02d:%02d to %02d:%02d, peak %ld, ramp now %ld\n",
-              status.schedule.from.hour, status.schedule.from.minute,
-              status.schedule.to.hour, status.schedule.to.minute,
-              peak, rampValue(status.schedule, peak, minutesNow()));
     }
 
     NSString *dir =
@@ -164,7 +183,23 @@ int main(void) {
     }
     fprintf(stderr, "listening on %s\n", sock.fileSystemRepresentation);
 
+    struct pollfd waiter = {.fd = server, .events = POLLIN};
     for (;;) {
+      rampTick(client, peak, &applied);
+      int ready = poll(&waiter, 1, 60 * 1000);
+      if (ready == 0) {
+        continue;
+      }
+      if (ready < 0) {
+        if (errno == EINTR) {
+          continue;
+        }
+        fprintf(stderr, "poll failed\n");
+        close(server);
+        unlink(sock.fileSystemRepresentation);
+        return 1;
+      }
+
       int connection = accept(server, NULL, NULL);
       if (connection < 0) {
         if (errno == EINTR) {
@@ -187,6 +222,10 @@ int main(void) {
       long stored = 0;
       if (numeric && value >= 0 && value <= 100 &&
           applyStrength(client, value, &stored)) {
+        if (value > 0) {
+          peak = value;
+        }
+        applied = stored;
         dprintf(connection, "%ld\n", stored);
       } else {
         dprintf(connection, "failed\n");
