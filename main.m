@@ -19,7 +19,7 @@
 #import <sys/socket.h>
 #import <sys/stat.h>
 #import <sys/un.h>
-#include <unistd.h>
+#import <unistd.h>
 
 static int sendToDaemon(long value, long *stored) {
   NSString *sock = [[NSHomeDirectory()

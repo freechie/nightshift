@@ -20,6 +20,7 @@
 #import <sys/socket.h>
 #import <sys/stat.h>
 #import <sys/un.h>
+#import <time.h>
 #import <unistd.h>
 
 static BOOL daemonAlreadyRunning(const char *path) {
@@ -92,6 +93,32 @@ static BOOL readMessage(int fd, char *buf, size_t cap) {
   return NO;
 }
 
+static const int kModeCustom = 2;
+static const int kRampMinutes = 120;
+
+static int minutesNow(void) {
+  time_t now = time(NULL);
+  struct tm local;
+  localtime_r(&now, &local);
+  return local.tm_hour * 60 + local.tm_min;
+}
+
+static long rampValue(BLSchedule schedule, long peak, int now) {
+  int start = schedule.from.hour * 60 + schedule.from.minute;
+  int end = schedule.to.hour * 60 + schedule.to.minute;
+  int length = (end - start + 1440) % 1440;
+  int elapsed = (now - start + 1440) % 1440;
+  if (length == 0 || elapsed >= length) {
+    return -1;
+  }
+  if (elapsed >= kRampMinutes) {
+    return peak;
+  }
+
+  long value = peak * elapsed / kRampMinutes;
+  return value < 1 ? 1 : value;
+}
+
 int main(void) {
   @autoreleasepool {
     signal(SIGPIPE, SIG_IGN);
@@ -103,13 +130,17 @@ int main(void) {
     }
 
     BLStatus status;
-    if (readStatus(client, &status)) {
-      fprintf(stderr, "mode %d, enabled %d, schedule %02d:%02d to %02d:%02d\n",
-              status.mode, status.enabled, status.schedule.from.hour,
-              status.schedule.from.minute,
-              status.schedule.to.hour, status.schedule.to.minute);
-    } else {
+    long peak = 0;
+    if (!readStatus(client, &status) || !readStrength(client, &peak)) {
       fprintf(stderr, "Night Shift schedule is unavailable\n");
+    } else if (status.mode != kModeCustom) {
+      fprintf(stderr, "evening ramp needs a Custom Night Shift schedule\n");
+    } else {
+      fprintf(stderr,
+              "schedule %02d:%02d to %02d:%02d, peak %ld, ramp now %ld\n",
+              status.schedule.from.hour, status.schedule.from.minute,
+              status.schedule.to.hour, status.schedule.to.minute,
+              peak, rampValue(status.schedule, peak, minutesNow()));
     }
 
     NSString *dir =
