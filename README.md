@@ -4,7 +4,53 @@ Set the macOS Night Shift warmth from the terminal. `0` is off. `100` is as warm
 
 The idea and the `0`–`100` scale come from [nshift](https://github.com/jenghis/nshift) by Jenghis (Copyright 2017, [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0)). That program calls the same private helper, `CBBlueLightClient`, and turns Night Shift off when the strength is `0`. These files were written for this repository. They do not include nshift's source.
 
-The program calls `CBBlueLightClient` in the private `CoreBrightness` framework. There is no public Night Shift API. A macOS update can change those methods. Before it sets or reads anything, `nightshift` compares the live method encodings with the ones below. A mismatch prints `Night Shift is unavailable` and exits `1`.
+## Install
+
+```sh
+brew install freechie/tap/nightshift
+```
+
+This installs `nightshift` and `nightshiftd`. Homebrew builds them from source with the Command Line Tools.
+
+## Usage
+
+```sh
+nightshift        # print the stored warmth, 0-100
+nightshift 40     # set warmth to 40 and turn Night Shift on
+nightshift 0      # set warmth to 0 and turn Night Shift off
+```
+
+With no arguments it prints the warmth Night Shift has stored. That number can stay above `0` while Night Shift is off.
+
+A set prints the warmth read back after the call, not the number you typed. Night Shift stores a fraction from `0` to `1`. The program multiplies by `100` and rounds to the nearest integer.
+
+Anything other than one integer from `0` to `100` prints `usage: nightshift <0-100>` and exits `1`. A failed read or write also exits `1`.
+
+`nightshift` does not need the daemon. When `nightshiftd` is listening, `nightshift 40` sends `40` to it and prints the daemon's reply. When nothing is listening, `nightshift` sets Night Shift itself. Once the daemon has accepted a value, a failed reply exits `1` instead of setting Night Shift a second time. With no arguments, `nightshift` always reads the warmth directly.
+
+## nightshiftd (optional)
+
+Start it now and at every login:
+
+```sh
+brew services start freechie/tap/nightshift
+```
+
+`brew services` takes the formula name. The program it runs is `nightshiftd`. To run the daemon in a terminal instead, type `nightshiftd` and stop it with Control-c. The service logs to `$(brew --prefix)/var/log/nightshiftd.log`.
+
+It listens on:
+
+```text
+~/Library/Application Support/nightshift/nightshiftd.sock
+```
+
+The socket is mode `0600`, so only your user can connect. A second `nightshiftd` exits when one is already listening. Each connection sends one line, an integer from `0` to `100`. The daemon writes back the stored warmth, or `failed`.
+
+Still to build: reapply the last strength on wake, fade between two strengths on a timer, and follow the schedule Night Shift already stores.
+
+## Private API
+
+Both programs call `CBBlueLightClient` in the private `CoreBrightness` framework. There is no public Night Shift API, and a macOS update can change these methods. Before setting or reading anything, each program compares the live method encodings with the ones below. A mismatch prints `Night Shift is unavailable` and exits `1`.
 
 | Method | Encoding on macOS 27.0 |
 | --- | --- |
@@ -14,71 +60,14 @@ The program calls `CBBlueLightClient` in the private `CoreBrightness` framework.
 
 Checked on macOS 27.0 (Golden Gate), build 26A428.
 
-## Build
-
-From this directory, with Xcode installed:
+## Build from source
 
 ```sh
-clang -fobjc-arc -framework Foundation \
-  -F"$(xcrun --show-sdk-path)/System/Library/PrivateFrameworks" \
-  -framework CoreBrightness \
-  -o nightshift main.m
-
-clang -fobjc-arc -framework Foundation \
-  -F"$(xcrun --show-sdk-path)/System/Library/PrivateFrameworks" \
-  -framework CoreBrightness \
-  -o nightshiftd nightshiftd.m
+make
+make install PREFIX="$HOME/.local"
 ```
 
-`-F` points the linker at the SDK copy of `CoreBrightness`. The system copy lives in the dynamic linker shared cache, so a plain `-framework CoreBrightness` does not find it.
-
-## Usage today
-
-`nightshift` calls `CBBlueLightClient` itself. Run it from this directory:
-
-```sh
-./nightshift        # print the stored warmth, 0-100
-./nightshift 40     # set warmth to 40 and turn Night Shift on
-./nightshift 0      # set warmth to 0 and turn Night Shift off
-```
-
-With no arguments it prints the warmth the helper has stored. That number can stay above `0` while Night Shift is off.
-
-A set prints the warmth read back after the call, not the number you typed. The helper stores a fraction from `0` to `1`. The program multiplies by `100` and rounds to the nearest integer.
-
-Anything other than one integer from `0` to `100` prints `usage: nightshift <0-100>` and exits `1`. A failed read or write also exits `1`.
-
-## nightshiftd
-
-`nightshiftd` is a foreground process. Leave it running in a terminal. It listens on:
-
-```text
-~/Library/Application Support/nightshift/nightshiftd.sock
-```
-
-The socket is mode `0600`. A second `nightshiftd` exits when one is already listening. Each connection sends one line, an integer from `0` to `100`. The daemon writes back the stored warmth, or `failed`. It uses the same encoding check and the same three methods as the command.
-
-```sh
-./nightshiftd
-printf '70\n' | nc -U "$HOME/Library/Application Support/nightshift/nightshiftd.sock"
-```
-
-Stop it with Control-c in that terminal.
-
-Still to build in the daemon: start it with `launchd`, reapply the last strength on wake, fade between two strengths on a timer, and follow the schedule Night Shift already stores.
-
-## Calling it from any directory
-
-The command to type is `nightshift 70` or `nightshift 100`, from any directory, with no shell function.
-
-That path is not built yet. `main.m` still talks only to `CBBlueLightClient`. The next change is inside this repo:
-
-1. `nightshift 70` connects to `nightshiftd.sock`, writes `70` and a newline, and prints the daemon’s reply.
-2. If nothing is listening, the command sets Night Shift itself, as it does now.
-3. `nightshift` with no arguments keeps reading the stored warmth directly. The daemon has no read command.
-4. Symlink the `nightshift` binary into a directory already on `PATH`, such as `~/.local/bin`, so the name works outside this directory.
-
-## Layout
+`make install` copies both programs into `PREFIX/bin`. The Makefile passes `-F` with the SDK's `PrivateFrameworks` folder. The system copy of `CoreBrightness` lives in the dynamic linker shared cache, so a plain `-framework CoreBrightness` does not find it.
 
 `main.m` is the command. `nightshiftd.m` is the daemon. `CBBlueLightClient.h` declares the three methods both use.
 
