@@ -23,11 +23,18 @@ clang -fobjc-arc -framework Foundation \
   -F"$(xcrun --show-sdk-path)/System/Library/PrivateFrameworks" \
   -framework CoreBrightness \
   -o nightshift main.m
+
+clang -fobjc-arc -framework Foundation \
+  -F"$(xcrun --show-sdk-path)/System/Library/PrivateFrameworks" \
+  -framework CoreBrightness \
+  -o nightshiftd nightshiftd.m
 ```
 
 `-F` points the linker at the SDK copy of `CoreBrightness`. The system copy lives in the dynamic linker shared cache, so a plain `-framework CoreBrightness` does not find it.
 
-## Usage
+## Usage today
+
+`nightshift` calls `CBBlueLightClient` itself. Run it from this directory:
 
 ```sh
 ./nightshift        # print the stored warmth, 0-100
@@ -35,29 +42,45 @@ clang -fobjc-arc -framework Foundation \
 ./nightshift 0      # set warmth to 0 and turn Night Shift off
 ```
 
-`nightshift` with no arguments prints the warmth the helper has stored. That number can stay above `0` while Night Shift is off.
+With no arguments it prints the warmth the helper has stored. That number can stay above `0` while Night Shift is off.
 
 A set prints the warmth read back after the call, not the number you typed. The helper stores a fraction from `0` to `1`. The program multiplies by `100` and rounds to the nearest integer.
 
 Anything other than one integer from `0` to `100` prints `usage: nightshift <0-100>` and exits `1`. A failed read or write also exits `1`.
 
-## Layout
-
-`main.m` is the command. `CBBlueLightClient.h` declares the three methods the command uses.
-
 ## nightshiftd
 
-Not built yet. This is the program to write next.
+`nightshiftd` is a foreground process. Leave it running in a terminal. It listens on:
 
-`nightshiftd` stays running under `launchd`. `nightshift` keeps working when `nightshiftd` is absent: it calls `CBBlueLightClient` itself, as it does now. When `nightshiftd` is running, `nightshift 40` sends `40` to the daemon, and the daemon makes the Night Shift call.
+```text
+~/Library/Application Support/nightshift/nightshiftd.sock
+```
 
-The daemon uses the same encoding check and the same three methods.
+The socket is mode `0600`. A second `nightshiftd` exits when one is already listening. Each connection sends one line, an integer from `0` to `100`. The daemon writes back the stored warmth, or `failed`. It uses the same encoding check and the same three methods as the command.
 
-1. Accept one integer over a Unix socket and set Night Shift.
-2. On wake, reapply the last strength. On sleep, leave the current setting in place. Fade from the current strength to a new one by stepping the value on a timer.
-3. Read the schedule Night Shift already stores and follow sunset with that, rather than calculating the sun position in this program.
+```sh
+./nightshiftd
+printf '70\n' | nc -U "$HOME/Library/Application Support/nightshift/nightshiftd.sock"
+```
 
-The socket path is `~/Library/Application Support/nightshift/nightshiftd.sock`. The daemon listens there. The command connects, writes one line containing the integer, and reads back one line containing the stored warmth or an error.
+Stop it with Control-c in that terminal.
+
+Still to build in the daemon: start it with `launchd`, reapply the last strength on wake, fade between two strengths on a timer, and follow the schedule Night Shift already stores.
+
+## Calling it from any directory
+
+The command to type is `nightshift 70` or `nightshift 100`, from any directory, with no shell function.
+
+That path is not built yet. `main.m` still talks only to `CBBlueLightClient`. The next change is inside this repo:
+
+1. `nightshift 70` connects to `nightshiftd.sock`, writes `70` and a newline, and prints the daemon’s reply.
+2. If nothing is listening, the command sets Night Shift itself, as it does now.
+3. `nightshift` with no arguments keeps reading the stored warmth directly. The daemon has no read command.
+4. Symlink the `nightshift` binary into a directory already on `PATH`, such as `~/.local/bin`, so the name works outside this directory.
+
+## Layout
+
+`main.m` is the command. `nightshiftd.m` is the daemon. `CBBlueLightClient.h` declares the three methods both use.
 
 ## License
 

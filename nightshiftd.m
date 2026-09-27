@@ -14,9 +14,18 @@
 // limitations under the License.
 
 #import "CBBlueLightClient.h"
+#include <CoreFoundation/CoreFoundation.h>
+#include <Foundation/Foundation.h>
+#include <_stdio.h>
+#import <errno.h>
+#include <objc/objc.h>
 #import <objc/runtime.h>
+#import <signal.h>
 #import <string.h>
+#include <sys/_types/_s_ifmt.h>
+#include <sys/_types/_ssize_t.h>
 #import <sys/socket.h>
+#import <sys/stat.h>
 #import <sys/un.h>
 #import <unistd.h>
 
@@ -33,5 +42,151 @@ static int applyStrength(CBBlueLightClient *client, long value, long *stored) {
     }
     *stored = 0;
     return 0;
+  }
+
+  float strength = (float)value / 100.0f;
+  if (![client setStrength:strength commit:YES] || ![client setEnabled:YES]) {
+    return 1;
+  }
+
+  float actual = 0;
+  if (![client getStrength:&actual]) {
+    return 1;
+  }
+  *stored = lroundf(actual * 100.0f);
+  return 0;
+}
+
+static BOOL daemonAlreadyRunning(const char *path) {
+  int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+  if (fd < 0) {
+    return NO;
+  }
+
+  struct sockaddr_un addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sun_family = AF_UNIX;
+  strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
+
+  BOOL running = connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0;
+  close(fd);
+  return running;
+}
+
+static int listenSocket(const char *path) {
+  if (strlen(path) >= sizeof(((struct sockaddr_un *)0)->sun_path)) {
+    return -1;
+  }
+  if (daemonAlreadyRunning(path)) {
+    return -1;
+  }
+  unlink(path);
+
+  int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+  if (fd < 0) {
+    return -1;
+  }
+
+  struct sockaddr_un addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sun_family = AF_UNIX;
+  strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
+
+  if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0 ||
+      chmod(path, S_IRUSR | S_IWUSR) < 0 || listen(fd, 4) < 0) {
+    close(fd);
+    unlink(path);
+    return -1;
+  }
+
+  return fd;
+}
+
+static BOOL readMessage(int fd, char *buf, size_t cap) {
+  size_t used = 0;
+
+  while (used + 1 < cap) {
+    char c;
+    ssize_t n = read(fd, &c, 1);
+    if (n == 0) {
+      buf[used] = '\0';
+      return used > 0;
+    }
+    if (n < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      return NO;
+    }
+    if (c == '\n') {
+      buf[used] = '\0';
+      return YES;
+    }
+    buf[used++] = c;
+  }
+  return NO;
+}
+
+int main(void) {
+  @autoreleasepool {
+    signal(SIGPIPE, SIG_IGN);
+
+    CBBlueLightClient *client = [[CBBlueLightClient alloc] init];
+    if (client == nil ||
+        !methodMatches(client, @selector(setStrength:commit:),
+                       "B24@0:8f16B20") ||
+        !methodMatches(client, @selector(setEnabled:), "B20@0:8B16") ||
+        !methodMatches(client, @selector(getStrength:), "B24@0:8^f16")) {
+      fprintf(stderr, "Night Shift is unavailable\n");
+      return 1;
+    }
+
+    NSString *dir =
+        [NSHomeDirectory() stringByAppendingPathComponent:
+                               @"Library/Application Support/nightshift"];
+    NSError *error = nil;
+    if (![[NSFileManager defaultManager] createDirectoryAtPath:dir
+                                   withIntermediateDirectories:YES
+                                                    attributes:nil
+                                                         error:&error]) {
+      fprintf(stderr, "failed to create %s\n", dir.fileSystemRepresentation);
+      return 1;
+    }
+
+    NSString *sock = [dir stringByAppendingPathComponent:@"nightshiftd.sock"];
+    int server = listenSocket(sock.fileSystemRepresentation);
+    if (server < 0) {
+      fprintf(stderr, "failed to listen on %s\n",
+              sock.fileSystemRepresentation);
+      return 1;
+    }
+    fprintf(stderr, "listening on %s\n", sock.fileSystemRepresentation);
+
+    for (;;) {
+      int connection = accept(server, NULL, NULL);
+      if (connection < 0) {
+        if (errno == EINTR) {
+          continue;
+        }
+        fprintf(stderr, "accept failed\n");
+        close(server);
+        unlink(sock.fileSystemRepresentation);
+        return 1;
+      }
+
+      char buf[64];
+      char *end = NULL;
+      BOOL gotLine = readMessage(connection, buf, sizeof(buf));
+      long value = gotLine ? strtol(buf, &end, 10) : -1;
+      BOOL numeric = gotLine && end != buf && *end == '\0';
+      long stored = 0;
+      if (numeric && value >= 0 && value <= 100 &&
+          applyStrength(client, value, &stored) == 0) {
+        dprintf(connection, "%ld\n", stored);
+      } else {
+        dprintf(connection, "failed\n");
+      }
+      close(connection);
+    }
   }
 }
