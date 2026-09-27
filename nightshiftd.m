@@ -14,6 +14,7 @@
 // limitations under the License.
 
 #import "NightShift.h"
+#import <UserNotifications/UserNotifications.h>
 #import <errno.h>
 #import <poll.h>
 #import <signal.h>
@@ -138,6 +139,28 @@ static void rampTick(CBBlueLightClient *client, long peak, long *applied) {
   }
 }
 
+static void notify(NSString *body) {
+  if (NSBundle.mainBundle.bundleIdentifier == nil) {
+    return;
+  }
+  UNMutableNotificationContent *content =
+      [[UNMutableNotificationContent alloc] init];
+  content.title = @"Night Shift";
+  content.body = body;
+  UNNotificationRequest *request =
+      [UNNotificationRequest requestWithIdentifier:@"ramp"
+                                           content:content
+                                           trigger:nil];
+  [[UNUserNotificationCenter currentNotificationCenter]
+      addNotificationRequest:request
+       withCompletionHandler:^(NSError *error) {
+         if (error != nil) {
+           fprintf(stderr, "notification failed %s\n",
+                   error.localizedDescription.UTF8String);
+         }
+       }];
+}
+
 int main(void) {
   @autoreleasepool {
     signal(SIGPIPE, SIG_IGN);
@@ -146,6 +169,22 @@ int main(void) {
     if (client == nil) {
       fprintf(stderr, "Night Shift is unavailable\n");
       return 1;
+    }
+
+    if (NSBundle.mainBundle.bundleIdentifier != nil) {
+      [[UNUserNotificationCenter currentNotificationCenter]
+          requestAuthorizationWithOptions:UNAuthorizationOptionAlert
+                        completionHandler:^(BOOL granted, NSError *error) {
+                          if (granted) {
+                            notify(@"nightshiftd started");
+                          } else {
+                            fprintf(stderr,
+                                    "notifications are not allowed: %s\n",
+                                    error != nil
+                                        ? error.localizedDescription.UTF8String
+                                        : "turned off in System Settings");
+                          }
+                        }];
     }
 
     long peak = 0;
