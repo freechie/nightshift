@@ -13,10 +13,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#import "CBBlueLightClient.h"
 #import <Foundation/Foundation.h>
+#import <errno.h>
 #import <objc/runtime.h>
 #import <string.h>
-#import "CBBlueLightClient.h"
+#import <sys/socket.h>
+#import <sys/stat.h>
+#import <sys/un.h>
+#include <unistd.h>
 
 static BOOL methodMatches(id client, SEL sel, const char *expected) {
   Method method = class_getInstanceMethod([client class], sel);
@@ -24,63 +29,147 @@ static BOOL methodMatches(id client, SEL sel, const char *expected) {
   return encoding != NULL && strcmp(encoding, expected) == 0;
 }
 
-static void usage(void) {
-  fprintf(stderr, "usage: nightshift <0-100>\n");
+static CBBlueLightClient *makeClient(void) {
+  CBBlueLightClient *client = [[CBBlueLightClient alloc] init];
+  if (client == nil ||
+      !methodMatches(client, @selector(setStrength:commit:), "B24@0:8f16B20") ||
+      !methodMatches(client, @selector(setEnabled:), "B20@0:8B16") ||
+      !methodMatches(client, @selector(getStrength:), "B24@0:8^f16")) {
+    return nil;
+  }
+  return client;
 }
 
-int main(int argc, const char *argv[]) {
+static int sendToDaemon(long value, long *stored) {
+  NSString *sock = [[NSHomeDirectory()
+      stringByAppendingPathComponent:@"Library/Application Support/nightshift"]
+      stringByAppendingPathComponent:@"nightshiftd.sock"];
+  const char *path = sock.fileSystemRepresentation;
 
-  @autoreleasepool {
-    CBBlueLightClient *client = [[CBBlueLightClient alloc] init];
+  struct stat st;
+  if (stat(path, &st) < 0 || !S_ISSOCK(st.st_mode) || st.st_uid != getuid()) {
+    return -1;
+  }
+  if (strlen(path) >= sizeof(((struct sockaddr_un *)0)->sun_path)) {
+    return -1;
+  }
+  int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+  if (fd < 0) {
+    return -1;
+  }
 
-    if (client == nil
-        || !methodMatches(client, @selector(setStrength:commit:), "B24@0:8f16B20")
-        || !methodMatches(client, @selector(setEnabled:), "B20@0:8B16")
-        || !methodMatches(client, @selector(getStrength:), "B24@0:8^f16")) {
-      fprintf(stderr, "Night Shift is unavailable\n");
+  int one = 1;
+  setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+  struct timeval tv = {.tv_sec = 2, .tv_usec = 0};
+  setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+
+  struct sockaddr_un addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sun_family = AF_UNIX;
+  memcpy(addr.sun_path, path, strlen(path) + 1);
+
+  if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+    close(fd);
+    return -1;
+  }
+
+  char out[16];
+  int len = snprintf(out, sizeof(out), "%ld\n", value);
+  if (len < 0 || (size_t)len >= sizeof(out) ||
+      write(fd, out, (size_t)len) != len) {
+    close(fd);
+    return 1;
+  }
+
+  char buf[64];
+  size_t used = 0;
+  while (used + 1 < sizeof(buf)) {
+    char c;
+    ssize_t n = read(fd, &c, 1);
+    if (n == 0) {
+      break;
+    }
+    if (n < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      close(fd);
       return 1;
     }
+    if (c == '\n') {
+      break;
+    }
+    buf[used++] = c;
+  }
+  buf[used] = '\0';
+  close(fd);
 
+  char *end = NULL;
+  long reply = strtol(buf, &end, 10);
+  if (end == buf || *end != '\0') {
+    return 1;
+  }
+  *stored = reply;
+  return 0;
+}
+
+static void usage(void) { fprintf(stderr, "usage: nightshift [0-100]\n"); }
+
+int main(int argc, const char *argv[]) {
+  @autoreleasepool {
     if (argc == 1) {
+      CBBlueLightClient *client = makeClient();
+      if (client == nil) {
+        fprintf(stderr, "Night Shift is unavailable\n");
+        return 1;
+      }
       float actual = 0;
       if (![client getStrength:&actual]) {
         fprintf(stderr, "failed to read Night Shift\n");
         return 1;
       }
-     printf("%ld\n", lroundf(actual * 100.0f));
+      printf("%ld\n", lroundf(actual * 100.0f));
       return 0;
     }
     if (argc != 2) {
       usage();
       return 1;
     }
-
     char *end = NULL;
     long value = strtol(argv[1], &end, 10);
-
     if (end == argv[1] || *end != '\0' || value < 0 || value > 100) {
       usage();
       return 1;
     }
-
+    long stored = 0;
+    int sent = sendToDaemon(value, &stored);
+    if (sent == 0) {
+      printf("%ld\n", stored);
+      return 0;
+    }
+    if (sent == 1) {
+      fprintf(stderr, "Failed to disable Night Shift\n");
+      return 1;
+    }
+    CBBlueLightClient *client = makeClient();
+    if (client == nil) {
+      fprintf(stderr, "Night Shift is unavailable\n");
+      return 1;
+    }
     if (value == 0) {
       if (![client setStrength:0 commit:YES] || ![client setEnabled:NO]) {
-        fprintf(stderr, "Failed to disable Night Shift\n");
+        fprintf(stderr, "failed to disable Night Shift");
         return 1;
       }
       printf("0\n");
       return 0;
     }
-
     float strength = (float)value / 100.0f;
-
     if (![client setStrength:strength commit:YES] || ![client setEnabled:YES]) {
       fprintf(stderr, "failed to set Night Shift\n");
       return 1;
     }
-
     float actual = 0;
-
     if (![client getStrength:&actual]) {
       fprintf(stderr, "failed to read Night Shift\n");
       return 1;
