@@ -15,6 +15,7 @@
 
 #import "NightShift.h"
 #import <objc/runtime.h>
+#import <stdlib.h>
 #import <string.h>
 
 static BOOL methodMatches(id client, SEL sel, const char *expected) {
@@ -58,6 +59,13 @@ BOOL applyStrength(CBBlueLightClient *client, long value, long *stored) {
   return readStrength(client, stored);
 }
 
+BOOL stageStrength(CBBlueLightClient *client, long value) {
+  if (value < 1 || value > 100) {
+    return NO;
+  }
+  return [client setStrength:(float)value / 100.0f commit:YES];
+}
+
 BOOL readStatus(CBBlueLightClient *client, BLStatus *status) {
   if (!methodMatches(client, @selector(getBlueLightStatus:),
                      "B24@0:8^{?=BBBi{?={?=ii}{?=ii}}QB}16")) {
@@ -65,4 +73,121 @@ BOOL readStatus(CBBlueLightClient *client, BLStatus *status) {
   }
   memset(status, 0, sizeof(*status));
   return [client getBlueLightStatus:status];
+}
+
+static BOOL onlyChars(NSString *text, NSString *allowed, NSUInteger maxLen) {
+  if (text == nil || text.length == 0 || text.length > maxLen) {
+    return NO;
+  }
+  NSCharacterSet *ok =
+      [NSCharacterSet characterSetWithCharactersInString:allowed];
+  return [text rangeOfCharacterFromSet:ok.invertedSet].location == NSNotFound;
+}
+
+BOOL parseNumber(const char *s, long min, long max, long *out) {
+  if (s == NULL || out == NULL) {
+    return NO;
+  }
+  char *end = NULL;
+  long value = strtol(s, &end, 10);
+  if (end == s || *end != '\0' || value < min || value > max) {
+    return NO;
+  }
+  *out = value;
+  return YES;
+}
+
+BOOL parseMaxText(NSString *text, long *out) {
+  if (!onlyChars(text, @"0123456789% \t", 8)) {
+    return NO;
+  }
+  NSString *trimmed = [text
+      stringByTrimmingCharactersInSet:[NSCharacterSet
+                                           whitespaceAndNewlineCharacterSet]];
+  if ([trimmed hasSuffix:@"%"]) {
+    trimmed = [[trimmed substringToIndex:trimmed.length - 1]
+        stringByTrimmingCharactersInSet:
+            [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+  }
+  return parseNumber(trimmed.UTF8String, 1, 100, out);
+}
+
+BOOL parseClockText(NSString *text, int *out) {
+  if (out == NULL ||
+      !onlyChars(text, @"0123456789:apmAPM. \u00a0\u202f\u2007\u2009", 32)) {
+    return NO;
+  }
+  NSCharacterSet *spaces = [NSCharacterSet whitespaceAndNewlineCharacterSet];
+  NSMutableString *raw = [NSMutableString stringWithString:text];
+  for (NSString *mark in @[ @"\u00a0", @"\u202f", @"\u2007", @"\u2009" ]) {
+    [raw replaceOccurrencesOfString:mark
+                          withString:@" "
+                             options:0
+                               range:NSMakeRange(0, raw.length)];
+  }
+  NSString *flat = [[[raw componentsSeparatedByCharactersInSet:spaces]
+      componentsJoinedByString:@""] lowercaseString];
+  flat = [flat stringByReplacingOccurrencesOfString:@"." withString:@""];
+  if (flat.length == 0) {
+    return NO;
+  }
+  int ampm = 0;
+  if ([flat hasSuffix:@"am"]) {
+    ampm = 1;
+    flat = [flat substringToIndex:flat.length - 2];
+  } else if ([flat hasSuffix:@"pm"]) {
+    ampm = 2;
+    flat = [flat substringToIndex:flat.length - 2];
+  }
+  NSArray<NSString *> *parts = [flat componentsSeparatedByString:@":"];
+  if (parts.count < 1 || parts.count > 2 || (ampm == 0 && parts.count == 1)) {
+    return NO;
+  }
+  long hour = 0;
+  long minute = 0;
+  if (!parseNumber(parts[0].UTF8String, 0, 23, &hour)) {
+    return NO;
+  }
+  if (parts.count == 2 && !parseNumber(parts[1].UTF8String, 0, 59, &minute)) {
+    return NO;
+  }
+  if (ampm != 0) {
+    if (hour < 1 || hour > 12) {
+      return NO;
+    }
+    if (hour == 12) {
+      hour = 0;
+    }
+    if (ampm == 2) {
+      hour += 12;
+    }
+  } else if (hour >= 1 && hour <= 12) {
+    return NO;
+  }
+  *out = (int)(hour * 60 + minute);
+  return YES;
+}
+
+NSString *clockString(int minute) {
+  if (minute < 0 || minute >= 1440) {
+    return @"";
+  }
+  static NSDateFormatter *fmt = nil;
+  static dispatch_once_t once;
+  dispatch_once(&once, ^{
+    fmt = [[NSDateFormatter alloc] init];
+    fmt.timeStyle = NSDateFormatterShortStyle;
+    fmt.dateStyle = NSDateFormatterNoStyle;
+  });
+  NSDateComponents *parts = [[NSDateComponents alloc] init];
+  parts.year = 2026;
+  parts.month = 1;
+  parts.day = 1;
+  parts.hour = minute / 60;
+  parts.minute = minute % 60;
+  NSDate *date = [[NSCalendar currentCalendar] dateFromComponents:parts];
+  if (date == nil) {
+    return @"";
+  }
+  return [fmt stringFromDate:date];
 }

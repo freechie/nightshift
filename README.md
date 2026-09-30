@@ -13,12 +13,16 @@ brew install freechie/tap/nightshift
 ## Usage
 
 ```sh
-nightshift        # print the current warmth
-nightshift 40     # set warmth to 40 and turn Night Shift on
-nightshift 0      # turn Night Shift off
+nightshift            # Warmth is at 20%, reaching 40% at 7:00 PM, while gliding
+nightshift            # Warmth is at 40%, once warmth and max are the same
+nightshift            # 40, when the daemon is not running
+nightshift 40         # set warmth to 40 and turn Night Shift on
+nightshift 0          # turn Night Shift off
+nightshift max 60     # set the ramp's max; needs the daemon
+nightshift ramp 8:30pm # reach the max at 8:30 PM; needs the daemon
 ```
 
-After a set, `nightshift` prints the warmth macOS stored. Anything other than one whole number from `0` to `100` prints the usage line and exits `1`.
+A warmth is a whole number from `0` to `100`. A max is from `1` to `100`.
 
 ## Daemon (optional)
 
@@ -26,9 +30,13 @@ After a set, `nightshift` prints the warmth macOS stored. Anything other than on
 brew services start freechie/tap/nightshift
 ```
 
-This runs `nightshiftd` at login. When it is running, `nightshift 40` sends the value to it. When it isn't, `nightshift` sets Night Shift itself. Both work the same today. The daemon is groundwork for a warmth ramp through the evening.
+This starts the daemon inside `Nightshift.app` at login. It posts a banner when it starts and when the warmth changes. On a Custom schedule it begins at warmth 1 and reaches your max two hours later, or at the time you set. If no max is saved, the current warmth becomes the max. It holds that max until the schedule ends. `nightshift 40` during the schedule jumps to 40 and glides toward the max. A warmth above the max becomes the new max. `nightshift max 60` changes the max directly. Sunset to Sunrise is left alone.
 
-The daemon listens on `~/Library/Application Support/nightshift/nightshiftd.sock`. Only your user can connect. Logs go to `$(brew --prefix)/var/log/nightshiftd.log`.
+Notifications say "Warmth is at 40%", or "Warmth is at 20%, reaching 40% at 7:00 PM" while it is still climbing. Each one has Set Max and Full at fields. In System Settings → Notifications → Nightshift, choose Alerts so those fields stay on screen.
+
+The daemon listens on `~/Library/Application Support/nightshift/nightshiftd.sock`. The max is stored beside it in `max`, and a chosen arrival time in `full`. Only your user can read them. Logs go to `$(brew --prefix)/var/log/nightshiftd.log`.
+
+When the daemon is not running, `nightshift 40` still sets Night Shift directly. `nightshift max` does not.
 
 ## Private API
 
@@ -41,7 +49,10 @@ Checked on macOS 27.0 (Golden Gate).
 ```sh
 make
 make install PREFIX="$HOME/.local"
+"$HOME/.local/Nightshift.app/Contents/MacOS/nightshiftd"
 ```
+
+`make install` puts the `nightshift` command in `PREFIX/bin` and the daemon in `PREFIX/Nightshift.app`. Run that app path, not a bare `nightshiftd`, or notifications have nowhere to go.
 
 `main.m` is the command and `nightshiftd.m` is the daemon. `NightShift.m` holds the Night Shift calls they share.
 

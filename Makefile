@@ -22,7 +22,9 @@ $(BUNDLED): nightshiftd Info.plist
 
 install: all
 	install -d $(PREFIX)/bin
-	install -m 755 nightshift nightshiftd $(PREFIX)/bin
+	install -m 755 nightshift $(PREFIX)/bin
+	rm -rf $(PREFIX)/Nightshift.app
+	cp -R Nightshift.app $(PREFIX)/Nightshift.app
 
 clean:
 	rm -rf nightshift nightshiftd $(APP)
