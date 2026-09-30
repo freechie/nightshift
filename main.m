@@ -15,11 +15,72 @@
 
 #import "NightShift.h"
 #import <errno.h>
+#import <fcntl.h>
+#import <limits.h>
+#import <mach-o/dyld.h>
+#import <spawn.h>
 #import <string.h>
 #import <sys/socket.h>
 #import <sys/stat.h>
 #import <sys/un.h>
 #import <unistd.h>
+
+extern char **environ;
+
+static NSString *daemonBinary(void) {
+  char exe[PATH_MAX];
+  uint32_t size = sizeof(exe);
+  if (_NSGetExecutablePath(exe, &size) != 0) {
+    return nil;
+  }
+  char resolved[PATH_MAX];
+  if (realpath(exe, resolved) == NULL) {
+    return nil;
+  }
+  NSString *dir = [NSString stringWithUTF8String:resolved].stringByDeletingLastPathComponent;
+  NSFileManager *files = [NSFileManager defaultManager];
+  NSString *beside = [dir stringByAppendingPathComponent:
+                               @"Nightshift.app/Contents/MacOS/nightshiftd"];
+  if ([files isExecutableFileAtPath:beside]) {
+    return beside;
+  }
+  NSString *installed = [[dir stringByDeletingLastPathComponent]
+      stringByAppendingPathComponent:@"Nightshift.app/Contents/MacOS/nightshiftd"];
+  if ([files isExecutableFileAtPath:installed]) {
+    return installed;
+  }
+  return nil;
+}
+
+static BOOL startDaemon(void) {
+  NSString *daemon = daemonBinary();
+  if (daemon == nil) {
+    return NO;
+  }
+  posix_spawnattr_t attr;
+  posix_spawn_file_actions_t actions;
+  pid_t pid = 0;
+  if (posix_spawnattr_init(&attr) != 0) {
+    return NO;
+  }
+  posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSID);
+  if (posix_spawn_file_actions_init(&actions) != 0) {
+    posix_spawnattr_destroy(&attr);
+    return NO;
+  }
+  posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY,
+                                   0);
+  posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, "/dev/null",
+                                   O_WRONLY, 0);
+  posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null",
+                                   O_WRONLY, 0);
+  char *argv[] = {(char *)daemon.fileSystemRepresentation, NULL};
+  int rc = posix_spawn(&pid, daemon.fileSystemRepresentation, &actions, &attr,
+                       argv, environ);
+  posix_spawn_file_actions_destroy(&actions);
+  posix_spawnattr_destroy(&attr);
+  return rc == 0;
+}
 
 static int talk(const char *line, char *reply, size_t cap) {
   NSString *sock = [[NSHomeDirectory()
@@ -83,6 +144,24 @@ static int talk(const char *line, char *reply, size_t cap) {
   return 0;
 }
 
+static int ask(const char *line, char *reply, size_t cap) {
+  int sent = talk(line, reply, cap);
+  if (sent != -1) {
+    return sent;
+  }
+  if (!startDaemon()) {
+    return -1;
+  }
+  for (int i = 0; i < 50; i++) {
+    usleep(100000);
+    sent = talk(line, reply, cap);
+    if (sent != -1) {
+      return sent;
+    }
+  }
+  return -1;
+}
+
 static void printStatus(const char *reply) {
   long now = 0;
   long maxv = 0;
@@ -113,7 +192,48 @@ static void printStatus(const char *reply) {
 }
 
 static void usage(void) {
-  fprintf(stderr, "usage: nightshift [0-100 | max 1-100 | ramp 8:30pm]\n");
+  fprintf(stderr, "usage: nightshift [0-100 | max 1-100 | ramp 8:30pm | -h]\n");
+}
+
+static void help(void) {
+  printf(
+      "nightshift sets Night Shift warmth from the terminal and warms it up\n"
+      "through the evening.\n"
+      "\n"
+      "Usage:\n"
+      "  nightshift             Show the warmth, and when it reaches the max\n"
+      "  nightshift 40          Set warmth to 40 (1-100)\n"
+      "  nightshift 0           Turn Night Shift off\n"
+      "  nightshift max 60      Set the warmth the evening ramp climbs to\n"
+      "  nightshift ramp 8:30pm Reach the max at 8:30 PM\n"
+      "  nightshift -h          Show this help\n"
+      "\n"
+      "Evening ramp:\n"
+      "  With a Custom schedule in System Settings > Displays > Night Shift,\n"
+      "  warmth starts at 1 when the schedule begins and climbs to the max\n"
+      "  over two hours, or by the ramp time. It holds the max until the\n"
+      "  schedule ends. Sunset to Sunrise is left alone.\n"
+      "\n"
+      "  Setting a warmth below the max glides from there to the max. A\n"
+      "  warmth above the max becomes the new max. With no max saved, the\n"
+      "  first warmth you set becomes the max. During the schedule,\n"
+      "  nightshift 0 pauses the ramp until you set a warmth or the next\n"
+      "  evening starts.\n"
+      "\n"
+      "Notifications:\n"
+      "  Every command goes through Nightshift.app, which starts on its own\n"
+      "  if it is not running. It posts a banner when it starts and whenever\n"
+      "  warmth or the max changes.\n"
+      "\n"
+      "  A banner's Options menu, or its arrow, has Set Max and Set Time.\n"
+      "  They do the same as nightshift max and nightshift ramp. For banners\n"
+      "  that stay on screen, choose Alerts in System Settings >\n"
+      "  Notifications > Nightshift.\n"
+      "\n"
+      "Files, in ~/Library/Application Support/nightshift:\n"
+      "  max               The saved max\n"
+      "  full              The ramp time\n"
+      "  nightshiftd.sock  How the command talks to Nightshift.app\n");
 }
 
 static BOOL parseValue(const char *s, long min, long max, long *out) {
@@ -130,22 +250,19 @@ int main(int argc, const char *argv[]) {
   @autoreleasepool {
     if (argc == 1) {
       char reply[64];
-      int sent = talk("status\n", reply, sizeof(reply));
+      int sent = ask("status\n", reply, sizeof(reply));
       if (sent == 0) {
         printStatus(reply);
         return 0;
       }
-      CBBlueLightClient *client = makeClient();
-      if (client == nil) {
-        fprintf(stderr, "Night Shift is unavailable\n");
-        return 1;
-      }
-      long stored = 0;
-      if (!readStrength(client, &stored)) {
-        fprintf(stderr, "failed to read Night Shift\n");
-        return 1;
-      }
-      printf("%ld\n", stored);
+      fprintf(stderr, "failed to reach nightshiftd\n");
+      return 1;
+    }
+
+    if (argc == 2 &&
+        (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0 ||
+         strcmp(argv[1], "help") == 0)) {
+      help();
       return 0;
     }
 
@@ -158,13 +275,13 @@ int main(int argc, const char *argv[]) {
       char line[32];
       char reply[64];
       snprintf(line, sizeof(line), "max %ld\n", value);
-      int sent = talk(line, reply, sizeof(reply));
+      int sent = ask(line, reply, sizeof(reply));
       if (sent == 0) {
         printf("max %s\n", reply);
         return 0;
       }
       if (sent < 0) {
-        fprintf(stderr, "nightshift max needs nightshiftd running\n");
+        fprintf(stderr, "failed to reach nightshiftd\n");
         return 1;
       }
       fprintf(stderr, "failed to set max\n");
@@ -188,7 +305,7 @@ int main(int argc, const char *argv[]) {
       char line[32];
       char reply[64];
       snprintf(line, sizeof(line), "ramp %d\n", minute);
-      int sent = talk(line, reply, sizeof(reply));
+      int sent = ask(line, reply, sizeof(reply));
       if (sent == 0) {
         long saved = 0;
         if (parseValue(reply, 0, 1439, &saved) && saved == minute) {
@@ -197,7 +314,7 @@ int main(int argc, const char *argv[]) {
         }
       }
       if (sent < 0) {
-        fprintf(stderr, "nightshift ramp needs nightshiftd running\n");
+        fprintf(stderr, "failed to reach nightshiftd\n");
         return 1;
       }
       fprintf(stderr, "failed to set the time\n");
@@ -217,28 +334,14 @@ int main(int argc, const char *argv[]) {
     char line[16];
     char reply[64];
     snprintf(line, sizeof(line), "%ld\n", value);
-    int sent = talk(line, reply, sizeof(reply));
+    int sent = ask(line, reply, sizeof(reply));
     if (sent == 0) {
       printf("%s\n", reply);
       return 0;
     }
-    if (sent == 1) {
-      fprintf(stderr, "failed to set Night Shift\n");
-      return 1;
-    }
-
-    CBBlueLightClient *client = makeClient();
-    if (client == nil) {
-      fprintf(stderr, "Night Shift is unavailable\n");
-      return 1;
-    }
-    long stored = 0;
-    if (!applyStrength(client, value, &stored)) {
-      fprintf(stderr, value == 0 ? "failed to disable Night Shift\n"
-                                 : "failed to set Night Shift\n");
-      return 1;
-    }
-    printf("%ld\n", stored);
+    fprintf(stderr, sent < 0 ? "failed to reach nightshiftd\n"
+                             : "failed to set Night Shift\n");
+    return 1;
   }
   return 0;
 }

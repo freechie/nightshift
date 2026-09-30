@@ -25,6 +25,11 @@
 #import <time.h>
 #import <unistd.h>
 
+@interface UNMutableNotificationContent (NightshiftBanner)
+- (void)setShouldDisplayActionsInline:(BOOL)display;
+- (void)setShouldPreventNotificationDismissalAfterDefaultAction:(BOOL)prevent;
+@end
+
 static const int kModeCustom = 2;
 static const int kRampMinutes = 120;
 static const int kGlideMinutes = 30;
@@ -53,7 +58,7 @@ static BOOL gSuspended = NO;
 static BOOL gLoggedSchedule = NO;
 static NSString *const kSetMaxAction = @"set-max";
 static NSString *const kFullAtAction = @"full-at";
-static NSString *const kCategory = @"warmth";
+static NSString *const kCategory = @"controls";
 
 static void clearRamp(void) {
   gFromMinute = -1;
@@ -238,7 +243,13 @@ static void sendBanner(NSString *body) {
   content.title = @"Night Shift";
   content.body = body;
   content.categoryIdentifier = kCategory;
-  UNNotificationRequest *request =
+  if ([content respondsToSelector:@selector(setShouldDisplayActionsInline:)]) {
+    [content setShouldDisplayActionsInline:YES];
+  }
+  if ([content respondsToSelector:@selector
+               (setShouldPreventNotificationDismissalAfterDefaultAction:)]) {
+    [content setShouldPreventNotificationDismissalAfterDefaultAction:YES];
+  }  UNNotificationRequest *request =
       [UNNotificationRequest requestWithIdentifier:@"ramp"
                                            content:content
                                            trigger:nil];
@@ -520,7 +531,7 @@ static void noteMax(long value) {
     retarget(now, current, end);
     return;
   }
-  notify([NSString stringWithFormat:@"Max set to %ld", value]);
+  notify([NSString stringWithFormat:@"Max set to %ld%%", value]);
 }
 
 static void setMax(long value, int fd) {
@@ -809,7 +820,7 @@ int main(void) {
         textInputPlaceholder:@"1–100"];
     UNTextInputNotificationAction *fullAction = [UNTextInputNotificationAction
         actionWithIdentifier:kFullAtAction
-                       title:@"Full at"
+                       title:@"Set Time"
                      options:UNNotificationActionOptionNone
         textInputButtonTitle:@"Set"
         textInputPlaceholder:@"8:30 PM"];
