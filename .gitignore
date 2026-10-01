@@ -1,5 +1,6 @@
 nightshift
 nightshiftd
+nightshift-tests
 Nightshift.app/
 .DS_Store
 .cursor/

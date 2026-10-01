@@ -14,6 +14,7 @@
 // limitations under the License.
 
 #import "NightShift.h"
+#import <AppKit/AppKit.h>
 #import <UserNotifications/UserNotifications.h>
 #import <errno.h>
 #import <fcntl.h>
@@ -76,18 +77,6 @@ static int minutesNow(void) {
     return -1;
   }
   return local.tm_hour * 60 + local.tm_min;
-}
-
-static int minutesBetween(int from, int to) {
-  return (to - from + 1440) % 1440;
-}
-
-static BOOL insideWindow(int start, int end, int now) {
-  int length = minutesBetween(start, end);
-  if (length == 0) {
-    return NO;
-  }
-  return minutesBetween(start, now) < length;
 }
 
 static BOOL readMax(long *value) {
@@ -190,22 +179,7 @@ static void raiseMax(long value) {
 }
 
 static long glideValue(int now) {
-  if (gFromMinute < 0 || gToMinute < 0) {
-    return -1;
-  }
-  int span = minutesBetween(gFromMinute, gToMinute);
-  int elapsed = minutesBetween(gFromMinute, now);
-  if (span == 0 || elapsed >= span) {
-    return gMax;
-  }
-  long value = gFromValue + (gMax - gFromValue) * elapsed / span;
-  if (value < 1) {
-    return 1;
-  }
-  if (value > 100) {
-    return 100;
-  }
-  return value;
+  return glideWarmth(gFromMinute, gToMinute, gFromValue, gMax, now);
 }
 
 static int glideStage(int now) {
@@ -498,23 +472,49 @@ static BOOL scheduleNow(int *start, int *end, int *now, BOOL *inWindow,
   return YES;
 }
 
-static void writeStatus(int fd) {
-  BLStatus status;
+static BOOL warmthStatus(long *now, long *maxv, const char **state, int *full) {
   long current = 0;
   if (!readStrength(gClient, &current)) {
+    return NO;
+  }
+  BLStatus status;
+  const char *name = "idle";
+  int arrival = -1;
+  if (!readStatus(gClient, &status) || !status.enabled) {
+    name = "off";
+  } else if (gFromMinute >= 0) {
+    int minute = minutesNow();
+    name = minute >= 0 && glideStage(minute) >= 3 ? "holding" : "ramping";
+    arrival = gToMinute;
+  }
+  *now = current;
+  *maxv = gMaxKnown ? gMax : -1L;
+  *state = name;
+  *full = arrival;
+  return YES;
+}
+
+static void writeStatus(int fd) {
+  long now = 0;
+  long maxv = 0;
+  const char *state = "idle";
+  int full = -1;
+  if (!warmthStatus(&now, &maxv, &state, &full)) {
     dprintf(fd, "failed\n");
     return;
   }
+  dprintf(fd, "%ld %ld %s %d\n", now, maxv, state, full);
+}
+
+static NSString *currentSentence(void) {
+  long now = 0;
+  long maxv = 0;
   const char *state = "idle";
   int full = -1;
-  if (!readStatus(gClient, &status) || !status.enabled) {
-    state = "off";
-  } else if (gFromMinute >= 0) {
-    int now = minutesNow();
-    state = now >= 0 && glideStage(now) >= 3 ? "holding" : "ramping";
-    full = gToMinute;
+  if (!warmthStatus(&now, &maxv, &state, &full)) {
+    return @"Night Shift is unavailable";
   }
-  dprintf(fd, "%ld %ld %s %d\n", current, gMaxKnown ? gMax : -1L, state, full);
+  return warmthSentence(now, maxv, state, full);
 }
 
 static void noteMax(long value) {
@@ -534,13 +534,51 @@ static void noteMax(long value) {
   notify([NSString stringWithFormat:@"Max set to %ld%%", value]);
 }
 
-static void setMax(long value, int fd) {
+static BOOL commitMax(long value) {
   if (!rememberMax(value)) {
+    return NO;
+  }
+  noteMax(value);
+  return YES;
+}
+
+static void setMax(long value, int fd) {
+  if (!commitMax(value)) {
     dprintf(fd, "failed\n");
     return;
   }
-  noteMax(value);
   dprintf(fd, "%ld\n", gMax);
+}
+
+static BOOL applyWarmth(long value, long *storedOut) {
+  long stored = 0;
+  if (!applyStrength(gClient, value, &stored)) {
+    return NO;
+  }
+  if (storedOut != NULL) {
+    *storedOut = stored;
+  }
+  int start = 0;
+  int end = 0;
+  int now = 0;
+  BOOL inWindow = NO;
+  BOOL scheduled = scheduleNow(&start, &end, &now, &inWindow, NULL);
+  if (value == 0) {
+    gApplied = -1;
+    gSuspended = scheduled && inWindow;
+    reportWarmth(0);
+    return YES;
+  }
+  raiseMax(value);
+  if (scheduled && inWindow) {
+    ensureFullAt(start, end);
+    retarget(now, stored, end);
+  } else {
+    reportWarmth(stored);
+  }
+  gApplied = stored;
+  gSuspended = NO;
+  return YES;
 }
 
 static BOOL setRampClock(int minute) {
@@ -619,33 +657,10 @@ static void handleLine(const char *buf, int fd) {
 
   long value = 0;
   long stored = 0;
-  if (!parseNumber(buf, 0, 100, &value) ||
-      !applyStrength(gClient, value, &stored)) {
+  if (!parseNumber(buf, 0, 100, &value) || !applyWarmth(value, &stored)) {
     dprintf(fd, "failed\n");
     return;
   }
-
-  int start = 0;
-  int end = 0;
-  int now = 0;
-  BOOL inWindow = NO;
-  BOOL scheduled = scheduleNow(&start, &end, &now, &inWindow, NULL);
-  if (value == 0) {
-    gApplied = -1;
-    gSuspended = scheduled && inWindow;
-    reportWarmth(0);
-    dprintf(fd, "%ld\n", stored);
-    return;
-  }
-  raiseMax(value);
-  if (scheduled && inWindow) {
-    ensureFullAt(start, end);
-    retarget(now, stored, end);
-  } else {
-    reportWarmth(stored);
-  }
-  gApplied = stored;
-  gSuspended = NO;
   dprintf(fd, "%ld\n", stored);
 }
 
@@ -703,6 +718,609 @@ static void handleLine(const char *buf, int fd) {
 static RampDelegate *gDelegate = nil;
 static dispatch_source_t gTimer = nil;
 static dispatch_source_t gListener = nil;
+
+static BOOL sliderSettled(void) {
+  NSEvent *event = NSApp.currentEvent;
+  if (event == nil) {
+    return YES;
+  }
+  return event.type == NSEventTypeLeftMouseUp || event.type == NSEventTypeKeyDown;
+}
+
+static BOOL customSchedule(void) {
+  BLStatus status;
+  return readStatus(gClient, &status) && status.mode == kModeCustom;
+}
+
+static NSArray<NSString *> *numberLabels(int start, int count, BOOL pad) {
+  NSMutableArray<NSString *> *labels = [NSMutableArray arrayWithCapacity:count];
+  for (int i = 0; i < count; i++) {
+    int value = start + i;
+    [labels addObject:pad ? [NSString stringWithFormat:@"%02d", value]
+                          : [NSString stringWithFormat:@"%d", value]];
+  }
+  return labels;
+}
+
+@interface WheelColumn : NSView
+@property(nonatomic, copy) NSArray<NSString *> *labels;
+@property(nonatomic) NSInteger index;
+@property(nonatomic, getter=isEnabled) BOOL enabled;
+@property(nonatomic) BOOL wraps;
+@property(nonatomic) CGFloat carry;
+@property(nonatomic) CGFloat dragStart;
+@property(nonatomic) NSInteger dragIndex;
+@property(nonatomic, copy) void (^changed)(WheelColumn *column);
+@end
+
+@implementation WheelColumn
+- (instancetype)initWithFrame:(NSRect)frame {
+  self = [super initWithFrame:frame];
+  if (self == nil) {
+    return nil;
+  }
+  self.enabled = YES;
+  self.wraps = YES;
+  self.clipsToBounds = YES;
+  return self;
+}
+
+- (BOOL)isFlipped {
+  return YES;
+}
+
+- (NSSize)intrinsicContentSize {
+  return NSMakeSize(72, 76);
+}
+
+- (NSInteger)wrap:(NSInteger)value {
+  NSInteger count = (NSInteger)self.labels.count;
+  if (count <= 0) {
+    return 0;
+  }
+  if (!self.wraps) {
+    if (value < 0) {
+      return 0;
+    }
+    if (value >= count) {
+      return count - 1;
+    }
+    return value;
+  }
+  NSInteger wrapped = value % count;
+  if (wrapped < 0) {
+    wrapped += count;
+  }
+  return wrapped;
+}
+
+- (NSString *)labelAt:(NSInteger)offset {
+  if (self.labels.count == 0) {
+    return @"";
+  }
+  NSInteger index = self.index + offset;
+  if (!self.wraps && (index < 0 || index >= (NSInteger)self.labels.count)) {
+    return @"";
+  }
+  return self.labels[[self wrap:index]];
+}
+
+- (void)setIndex:(NSInteger)index {
+  _index = [self wrap:index];
+  self.needsDisplay = YES;
+}
+
+- (void)setLabels:(NSArray<NSString *> *)labels {
+  _labels = [labels copy];
+  _index = [self wrap:_index];
+  self.needsDisplay = YES;
+}
+
+- (void)step:(NSInteger)delta {
+  if (!self.enabled || self.labels.count == 0 || delta == 0) {
+    return;
+  }
+  NSInteger next = self.index + delta;
+  if (!self.wraps && (next < 0 || next >= (NSInteger)self.labels.count)) {
+    return;
+  }
+  self.index = next;
+  if (self.changed != nil) {
+    self.changed(self);
+  }
+}
+
+- (void)scrollWheel:(NSEvent *)event {
+  if (!self.enabled) {
+    return;
+  }
+  self.carry += event.scrollingDeltaY;
+  while (self.carry > 24) {
+    self.carry -= 24;
+    [self step:-1];
+  }
+  while (self.carry < -24) {
+    self.carry += 24;
+    [self step:1];
+  }
+}
+
+- (void)mouseDown:(NSEvent *)event {
+  self.dragStart = [self convertPoint:event.locationInWindow fromView:nil].y;
+  self.dragIndex = self.index;
+}
+
+- (void)mouseDragged:(NSEvent *)event {
+  if (!self.enabled) {
+    return;
+  }
+  CGFloat y = [self convertPoint:event.locationInWindow fromView:nil].y;
+  NSInteger steps = (NSInteger)llround((y - self.dragStart) / 22.0);
+  NSInteger next = [self wrap:self.dragIndex - steps];
+  if (next == self.index) {
+    return;
+  }
+  self.index = next;
+  if (self.changed != nil) {
+    self.changed(self);
+  }
+}
+
+- (void)drawRect:(NSRect)dirty {
+  (void)dirty;
+  NSRect bounds = self.bounds;
+  NSRect band = NSMakeRect(2, NSMidY(bounds) - 12, bounds.size.width - 4, 24);
+  NSBezierPath *path = [NSBezierPath bezierPathWithRoundedRect:band
+                                                        xRadius:6
+                                                        yRadius:6];
+  [[NSColor.quaternaryLabelColor colorWithAlphaComponent:0.45] setFill];
+  [path fill];
+  NSDictionary *centerAttrs = @{
+    NSFontAttributeName : [NSFont monospacedDigitSystemFontOfSize:16
+                                                            weight:NSFontWeightSemibold],
+    NSForegroundColorAttributeName : NSColor.labelColor,
+  };
+  NSDictionary *sideAttrs = @{
+    NSFontAttributeName : [NSFont monospacedDigitSystemFontOfSize:13
+                                                           weight:NSFontWeightRegular],
+    NSForegroundColorAttributeName : NSColor.secondaryLabelColor,
+  };
+  CGFloat mid = NSMidY(bounds);
+  [self drawText:[self labelAt:0] centerY:mid attributes:centerAttrs];
+  [self drawText:[self labelAt:-1] centerY:mid - 22 attributes:sideAttrs];
+  [self drawText:[self labelAt:1] centerY:mid + 22 attributes:sideAttrs];
+}
+
+- (void)drawText:(NSString *)text
+         centerY:(CGFloat)centerY
+      attributes:(NSDictionary *)attributes {
+  NSSize size = [text sizeWithAttributes:attributes];
+  NSPoint origin = NSMakePoint(NSMidX(self.bounds) - size.width / 2,
+                               centerY - size.height / 2);
+  [text drawAtPoint:origin withAttributes:attributes];
+}
+@end
+
+@interface StatusPanel : NSViewController
+@property(nonatomic, strong) NSTextField *label;
+@property(nonatomic, strong) NSSlider *nowSlider;
+@property(nonatomic, strong) NSSlider *maxSlider;
+@property(nonatomic, strong) NSTextField *nowValue;
+@property(nonatomic, strong) NSTextField *maxValue;
+@property(nonatomic) long savedMax;
+@property(nonatomic, strong) WheelColumn *hourWheel;
+@property(nonatomic, strong) WheelColumn *minuteWheel;
+@property(nonatomic, strong) WheelColumn *ampmWheel;
+@property(nonatomic, strong) NSButton *cycleSwitch;
+@property(nonatomic, strong) NSStackView *wheels;
+- (void)setSentence:(NSString *)sentence;
+- (void)syncSliders;
+- (void)syncWheels;
+- (void)previewMax:(long)value;
+- (int)clockMinute;
+@end
+
+@implementation StatusPanel
+- (NSTextField *)valueLabel {
+  NSTextField *value = [NSTextField labelWithString:@"0%"];
+  value.font = [NSFont monospacedDigitSystemFontOfSize:NSFont.systemFontSize
+                                                 weight:NSFontWeightRegular];
+  value.alignment = NSTextAlignmentRight;
+  [value setContentHuggingPriority:NSLayoutPriorityRequired
+                    forOrientation:NSLayoutConstraintOrientationHorizontal];
+  [value.widthAnchor constraintEqualToConstant:40].active = YES;
+  return value;
+}
+
+- (NSStackView *)sliderRowTitled:(NSString *)title
+                          slider:(NSSlider *)slider
+                           value:(NSTextField *)value {
+  NSTextField *name = [NSTextField labelWithString:title];
+  name.font = [NSFont systemFontOfSize:NSFont.systemFontSize];
+  [name setContentHuggingPriority:NSLayoutPriorityRequired
+                   forOrientation:NSLayoutConstraintOrientationHorizontal];
+  [name.widthAnchor constraintEqualToConstant:36].active = YES;
+  [slider setContentHuggingPriority:NSLayoutPriorityDefaultLow
+                     forOrientation:NSLayoutConstraintOrientationHorizontal];
+  NSStackView *row = [NSStackView stackViewWithViews:@[ name, slider, value ]];
+  row.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+  row.spacing = 8;
+  [row setCustomSpacing:4 afterView:slider];
+  row.alignment = NSLayoutAttributeCenterY;
+  [row.widthAnchor constraintEqualToConstant:248].active = YES;
+  return row;
+}
+
+- (NSTextField *)sectionLabel:(NSString *)title {
+  NSTextField *label = [NSTextField labelWithString:title];
+  label.font = [NSFont systemFontOfSize:17 weight:NSFontWeightSemibold];
+  label.textColor = NSColor.secondaryLabelColor;
+  return label;
+}
+
+- (void)loadView {
+  NSTextField *label = [NSTextField wrappingLabelWithString:@"Nightshift"];
+  label.font = [NSFont systemFontOfSize:NSFont.systemFontSize];
+  label.preferredMaxLayoutWidth = 248;
+  self.label = label;
+
+  self.nowSlider = [NSSlider sliderWithValue:0 minValue:0 maxValue:100 target:nil action:NULL];
+  self.maxSlider = [NSSlider sliderWithValue:1 minValue:1 maxValue:100 target:nil action:NULL];
+  self.nowSlider.continuous = YES;
+  self.maxSlider.continuous = YES;
+  self.nowSlider.accessibilityLabel = @"Warmth";
+  self.maxSlider.accessibilityLabel = @"Max";
+  self.nowValue = [self valueLabel];
+  self.maxValue = [self valueLabel];
+
+  self.hourWheel = [[WheelColumn alloc] initWithFrame:NSZeroRect];
+  self.minuteWheel = [[WheelColumn alloc] initWithFrame:NSZeroRect];
+  self.ampmWheel = [[WheelColumn alloc] initWithFrame:NSZeroRect];
+  self.hourWheel.accessibilityLabel = @"Hour";
+  self.minuteWheel.accessibilityLabel = @"Minute";
+  self.ampmWheel.accessibilityLabel = @"AM or PM";
+  self.ampmWheel.wraps = NO;
+  self.cycleSwitch = [NSButton checkboxWithTitle:@"24-hour" target:nil action:NULL];
+  self.cycleSwitch.controlSize = NSControlSizeSmall;
+  self.cycleSwitch.font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize];
+
+  NSTextField *fullTitle = [self sectionLabel:@"Full at"];
+  NSBox *rule = [[NSBox alloc] initWithFrame:NSZeroRect];
+  rule.boxType = NSBoxSeparator;
+  rule.translatesAutoresizingMaskIntoConstraints = NO;
+  [rule.widthAnchor constraintEqualToConstant:248].active = YES;
+
+  self.wheels = [NSStackView stackViewWithViews:@[
+    self.hourWheel, self.minuteWheel, self.ampmWheel
+  ]];
+  self.wheels.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+  self.wheels.spacing = 8;
+  self.wheels.alignment = NSLayoutAttributeCenterY;
+  self.wheels.translatesAutoresizingMaskIntoConstraints = NO;
+  NSView *wheelWell = [[NSView alloc] initWithFrame:NSZeroRect];
+  [wheelWell.widthAnchor constraintEqualToConstant:248].active = YES;
+  [wheelWell addSubview:self.wheels];
+  [NSLayoutConstraint activateConstraints:@[
+    [self.wheels.centerXAnchor constraintEqualToAnchor:wheelWell.centerXAnchor],
+    [self.wheels.topAnchor constraintEqualToAnchor:wheelWell.topAnchor],
+    [self.wheels.bottomAnchor constraintEqualToAnchor:wheelWell.bottomAnchor],
+  ]];
+
+  NSStackView *cycleRow = [[NSStackView alloc] initWithFrame:NSZeroRect];
+  cycleRow.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+  [cycleRow.widthAnchor constraintEqualToConstant:248].active = YES;
+  [cycleRow addView:self.cycleSwitch inGravity:NSStackViewGravityCenter];
+
+  NSStackView *nowRow =
+      [self sliderRowTitled:@"Now" slider:self.nowSlider value:self.nowValue];
+  NSStackView *maxRow =
+      [self sliderRowTitled:@"Max" slider:self.maxSlider value:self.maxValue];
+  NSStackView *stack = [NSStackView stackViewWithViews:@[
+    label, [self sectionLabel:@"Intensity"], nowRow, maxRow, rule, fullTitle,
+    wheelWell, cycleRow
+  ]];
+  stack.orientation = NSUserInterfaceLayoutOrientationVertical;
+  stack.alignment = NSLayoutAttributeLeading;
+  stack.spacing = 8;
+  stack.edgeInsets = NSEdgeInsetsMake(12, 14, 4, 14);
+  stack.translatesAutoresizingMaskIntoConstraints = NO;
+  [stack setCustomSpacing:14 afterView:label];
+  [stack setCustomSpacing:16 afterView:maxRow];
+  [stack setCustomSpacing:10 afterView:rule];
+  [stack setCustomSpacing:2 afterView:wheelWell];
+
+  NSView *root = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 276, 280)];
+  [root addSubview:stack];
+  [NSLayoutConstraint activateConstraints:@[
+    [stack.leadingAnchor constraintEqualToAnchor:root.leadingAnchor],
+    [stack.trailingAnchor constraintEqualToAnchor:root.trailingAnchor],
+    [stack.topAnchor constraintEqualToAnchor:root.topAnchor],
+    [stack.bottomAnchor constraintEqualToAnchor:root.bottomAnchor],
+    [root.widthAnchor constraintEqualToConstant:276],
+  ]];
+  self.view = root;
+}
+
+- (void)setSentence:(NSString *)sentence {
+  (void)self.view;
+  self.label.stringValue = sentence.length > 0 ? sentence : @"Nightshift";
+}
+
+- (void)syncSliders {
+  long now = 0;
+  long maxv = 0;
+  const char *state = NULL;
+  int full = -1;
+  if (!warmthStatus(&now, &maxv, &state, &full)) {
+    return;
+  }
+  self.savedMax = maxv;
+  self.nowSlider.doubleValue = now < 0 ? 0 : (now > 100 ? 100 : now);
+  self.nowValue.stringValue = [NSString stringWithFormat:@"%ld%%", now];
+  if (maxv >= 1) {
+    self.maxSlider.doubleValue = maxv;
+    self.maxValue.stringValue = [NSString stringWithFormat:@"%ld%%", maxv];
+  } else {
+    long shown = now >= 1 && now <= 100 ? now : 50;
+    self.maxSlider.doubleValue = shown;
+    self.maxValue.stringValue = @"—";
+  }
+}
+
+- (void)previewMax:(long)value {
+  self.maxSlider.doubleValue = value;
+  self.maxValue.stringValue = [NSString stringWithFormat:@"%ld%%", value];
+}
+
+- (void)syncWheels {
+  BOOL h24 = hourCycleIs24();
+  self.cycleSwitch.state =
+      h24 ? NSControlStateValueOn : NSControlStateValueOff;
+  self.hourWheel.labels = numberLabels(h24 ? 0 : 1, h24 ? 24 : 12, h24);
+  self.minuteWheel.labels = numberLabels(0, 60, YES);
+  self.ampmWheel.labels = @[ @"AM", @"PM" ];
+  self.ampmWheel.hidden = h24;
+  self.wheels.spacing = h24 ? 12 : 8;
+  int minute = gRampClock >= 0 ? gRampClock : gFullAt;
+  if (minute < 0) {
+    minute = minutesNow();
+  }
+  if (minute < 0) {
+    minute = 0;
+  }
+  int hour = 0;
+  int min = 0;
+  BOOL pm = NO;
+  splitClock(minute, h24, &hour, &min, &pm);
+  self.hourWheel.index = h24 ? hour : hour - 1;
+  self.minuteWheel.index = min;
+  self.ampmWheel.index = pm ? 1 : 0;
+  BOOL on = customSchedule();
+  for (WheelColumn *wheel in
+       @[ self.hourWheel, self.minuteWheel, self.ampmWheel ]) {
+    wheel.enabled = on;
+    wheel.alphaValue = on ? 1 : 0.4;
+  }
+}
+
+- (int)clockMinute {
+  BOOL h24 = hourCycleIs24();
+  int hour = h24 ? (int)self.hourWheel.index : (int)self.hourWheel.index + 1;
+  return joinClock(h24, hour, (int)self.minuteWheel.index,
+                   self.ampmWheel.index == 1);
+}
+@end
+
+@interface MenuBar : NSObject <NSMenuDelegate>
+@property(nonatomic, strong) NSStatusItem *item;
+@property(nonatomic, strong) NSMenu *menu;
+@property(nonatomic, strong) StatusPanel *panel;
+@property(nonatomic) NSInteger wheelToken;
+@property(nonatomic) BOOL tracking;
+@property(nonatomic) BOOL menuOpen;
+- (void)refresh;
+@end
+
+@implementation MenuBar
+- (instancetype)init {
+  self = [super init];
+  if (self == nil) {
+    return nil;
+  }
+  NSImageSymbolConfiguration *symbol = [NSImageSymbolConfiguration
+      configurationWithPointSize:16
+                          weight:NSFontWeightRegular];
+  NSImage *image = [[NSImage imageWithSystemSymbolName:@"sun.horizon"
+                              accessibilityDescription:@"Nightshift"]
+      imageWithSymbolConfiguration:symbol];
+  self.item = [[NSStatusBar systemStatusBar]
+      statusItemWithLength:NSSquareStatusItemLength];
+  self.item.autosaveName = @"nightshift";
+  self.item.button.toolTip = @"Nightshift";
+  if (image != nil) {
+    image.template = YES;
+    self.item.button.image = image;
+  } else {
+    self.item.button.title = @"NS";
+  }
+
+  self.panel = [[StatusPanel alloc] initWithNibName:nil bundle:nil];
+  (void)self.panel.view;
+  self.panel.nowSlider.target = self;
+  self.panel.nowSlider.action = @selector(nowMoved:);
+  self.panel.maxSlider.target = self;
+  self.panel.maxSlider.action = @selector(maxMoved:);
+  self.panel.cycleSwitch.target = self;
+  self.panel.cycleSwitch.action = @selector(toggleCycle:);
+  __weak MenuBar *menu = self;
+  void (^moved)(WheelColumn *) = ^(WheelColumn *column) {
+    (void)column;
+    [menu wheelMoved];
+  };
+  self.panel.hourWheel.changed = moved;
+  self.panel.minuteWheel.changed = moved;
+  self.panel.ampmWheel.changed = moved;
+  [self refresh];
+  [self sizeMenuView];
+  self.menu = [[NSMenu alloc] init];
+  self.menu.autoenablesItems = NO;
+  self.menu.delegate = self;
+  NSMenuItem *content = [[NSMenuItem alloc] init];
+  content.view = self.panel.view;
+  [self.menu addItem:content];
+  self.item.menu = self.menu;
+  return self;
+}
+
+- (void)sizeMenuView {
+  [self.panel.view layoutSubtreeIfNeeded];
+  NSSize fit = self.panel.view.fittingSize;
+  if (fit.width < 260) {
+    fit.width = 276;
+  }
+  if (fit.height < 40) {
+    fit.height = 240;
+  }
+  self.panel.view.frame = NSMakeRect(0, 0, fit.width, fit.height);
+}
+
+- (void)menuWillOpen:(NSMenu *)menu {
+  (void)menu;
+  self.menuOpen = YES;
+  self.tracking = NO;
+  [self refresh];
+}
+
+- (void)menuDidClose:(NSMenu *)menu {
+  (void)menu;
+  self.menuOpen = NO;
+  self.tracking = NO;
+  self.wheelToken += 1;
+}
+
+- (void)refresh {
+  if (self.tracking) {
+    return;
+  }
+  [self.panel setSentence:currentSentence()];
+  [self.panel syncSliders];
+  [self.panel syncWheels];
+  [self sizeMenuView];
+}
+
+- (void)nowMoved:(NSSlider *)slider {
+  long value = (long)llround(slider.doubleValue);
+  self.panel.nowValue.stringValue = [NSString stringWithFormat:@"%ld%%", value];
+  long saved = self.panel.savedMax;
+  if (saved >= 1 && value > saved) {
+    [self.panel previewMax:value];
+  } else if (saved >= 1) {
+    [self.panel previewMax:saved];
+  }
+  if (!sliderSettled()) {
+    self.tracking = YES;
+    return;
+  }
+  self.tracking = NO;
+  long live = 0;
+  long maxv = 0;
+  const char *state = NULL;
+  int full = -1;
+  if (!warmthStatus(&live, &maxv, &state, &full)) {
+    [self refresh];
+    return;
+  }
+  BOOL raise = maxv >= 1 && value > maxv;
+  if (value == live && !raise) {
+    [self refresh];
+    return;
+  }
+  if (!applyWarmth(value, NULL)) {
+    [self refresh];
+    return;
+  }
+  [self refresh];
+}
+
+- (void)maxMoved:(NSSlider *)slider {
+  long value = (long)llround(slider.doubleValue);
+  self.panel.maxValue.stringValue = [NSString stringWithFormat:@"%ld%%", value];
+  if (!sliderSettled()) {
+    self.tracking = YES;
+    return;
+  }
+  self.tracking = NO;
+  if (value == self.panel.savedMax) {
+    [self refresh];
+    return;
+  }
+  if (!commitMax(value)) {
+    [self refresh];
+    return;
+  }
+  [self refresh];
+}
+
+- (void)wheelMoved {
+  self.tracking = YES;
+  self.wheelToken += 1;
+  NSInteger token = self.wheelToken;
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(300 * NSEC_PER_MSEC)),
+                 dispatch_get_main_queue(), ^{
+                   if (token != self.wheelToken) {
+                     return;
+                   }
+                   [self commitWheels];
+                 });
+}
+
+- (void)commitWheels {
+  self.tracking = NO;
+  if (!customSchedule()) {
+    [self refresh];
+    return;
+  }
+  int minute = [self.panel clockMinute];
+  if (minute == gRampClock) {
+    [self refresh];
+    return;
+  }
+  if (!setRampClock(minute)) {
+    [self refresh];
+    return;
+  }
+  [self refresh];
+}
+
+- (void)toggleCycle:(NSButton *)button {
+  (void)button;
+  self.wheelToken += 1;
+  self.tracking = NO;
+  int cycle = hourCycleIs24() ? 12 : 24;
+  if (!writeHourCycle(cycle)) {
+    [self refresh];
+    return;
+  }
+  [self refresh];
+}
+
+@end
+
+static MenuBar *gMenu = nil;
+
+static void refreshMenu(void) {
+  if (gMenu == nil || !gMenu.menuOpen) {
+    return;
+  }
+  [gMenu refresh];
+}
+
+static void installMenu(void) {
+  [NSApplication sharedApplication];
+  [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
+  gMenu = [[MenuBar alloc] init];
+  [gMenu refresh];
+}
 
 static char gSockPath[sizeof(((struct sockaddr_un *)0)->sun_path)];
 
@@ -871,6 +1489,7 @@ int main(void) {
     if (readRampClock(&savedClock)) {
       gRampClock = savedClock;
     }
+    readHourCycle();
 
     NSString *sock = [dir stringByAppendingPathComponent:@"nightshiftd.sock"];
     int server = listenSocket(sock.fileSystemRepresentation);
@@ -902,6 +1521,7 @@ int main(void) {
                               60 * NSEC_PER_SEC, NSEC_PER_SEC);
     dispatch_source_set_event_handler(gTimer, ^{
       rampTick();
+      refreshMenu();
     });
     dispatch_resume(gTimer);
 
@@ -935,10 +1555,12 @@ int main(void) {
         return;
       }
       handleLine(buf, connection);
+      refreshMenu();
       close(connection);
     });
     dispatch_resume(gListener);
-    dispatch_main();
+    installMenu();
+    [NSApp run];
   }
   return 0;
 }

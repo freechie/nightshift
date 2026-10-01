@@ -168,17 +168,134 @@ BOOL parseClockText(NSString *text, int *out) {
   return YES;
 }
 
+int minutesBetween(int from, int to) {
+  return (to - from + 1440) % 1440;
+}
+
+BOOL insideWindow(int start, int end, int now) {
+  int length = minutesBetween(start, end);
+  if (length == 0) {
+    return NO;
+  }
+  return minutesBetween(start, now) < length;
+}
+
+long glideWarmth(int fromMinute, int toMinute, long fromValue, long maxv,
+                 int now) {
+  if (fromMinute < 0 || toMinute < 0) {
+    return -1;
+  }
+  int span = minutesBetween(fromMinute, toMinute);
+  int elapsed = minutesBetween(fromMinute, now);
+  if (span == 0 || elapsed >= span) {
+    return maxv;
+  }
+  long value = fromValue + (maxv - fromValue) * elapsed / span;
+  if (value < 1) {
+    return 1;
+  }
+  if (value > 100) {
+    return 100;
+  }
+  return value;
+}
+
+void splitClock(int minute, BOOL h24, int *hour, int *min, BOOL *pm) {
+  int h = minute / 60;
+  *min = minute % 60;
+  *pm = h >= 12;
+  if (h24) {
+    *hour = h;
+    return;
+  }
+  int hr = h % 12;
+  *hour = hr == 0 ? 12 : hr;
+}
+
+int joinClock(BOOL h24, int hour, int min, BOOL pm) {
+  if (h24) {
+    return hour * 60 + min;
+  }
+  int h = hour % 12;
+  if (pm) {
+    h += 12;
+  }
+  return h * 60 + min;
+}
+
+static int gHourCycle = 0;
+
+static NSString *clockPath(void) {
+  return [[NSHomeDirectory()
+      stringByAppendingPathComponent:@"Library/Application Support/nightshift"]
+      stringByAppendingPathComponent:@"clock"];
+}
+
+static BOOL macUses24Hour(void) {
+  NSString *format =
+      [NSDateFormatter dateFormatFromTemplate:@"j"
+                                      options:0
+                                       locale:[NSLocale currentLocale]];
+  return [format rangeOfString:@"a"].location == NSNotFound;
+}
+
+BOOL hourCycleIs24(void) {
+  if (gHourCycle == 24) {
+    return YES;
+  }
+  if (gHourCycle == 12) {
+    return NO;
+  }
+  return macUses24Hour();
+}
+
+void readHourCycle(void) {
+  NSString *text = [NSString stringWithContentsOfFile:clockPath()
+                                              encoding:NSUTF8StringEncoding
+                                                 error:NULL];
+  if ([text hasPrefix:@"24"]) {
+    gHourCycle = 24;
+  } else if ([text hasPrefix:@"12"]) {
+    gHourCycle = 12;
+  } else {
+    gHourCycle = 0;
+  }
+}
+
+BOOL writeHourCycle(int cycle) {
+  if (cycle != 12 && cycle != 24) {
+    return NO;
+  }
+  NSString *text = [NSString stringWithFormat:@"%d\n", cycle];
+  if (![text writeToFile:clockPath()
+               atomically:YES
+                 encoding:NSUTF8StringEncoding
+                    error:NULL]) {
+    return NO;
+  }
+  [[NSFileManager defaultManager]
+      setAttributes:@{NSFilePosixPermissions : @0600}
+           ofItemAtPath:clockPath()
+                  error:NULL];
+  gHourCycle = cycle;
+  return YES;
+}
+
 NSString *clockString(int minute) {
   if (minute < 0 || minute >= 1440) {
     return @"";
   }
-  static NSDateFormatter *fmt = nil;
-  static dispatch_once_t once;
-  dispatch_once(&once, ^{
-    fmt = [[NSDateFormatter alloc] init];
+  NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
+  if (gHourCycle == 24) {
+    fmt.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+    fmt.dateFormat = @"HH:mm";
+  } else if (gHourCycle == 12) {
+    fmt.locale = [NSLocale currentLocale];
+    fmt.dateFormat = @"h:mm a";
+  } else {
     fmt.timeStyle = NSDateFormatterShortStyle;
     fmt.dateStyle = NSDateFormatterNoStyle;
-  });
+  }
   NSDateComponents *parts = [[NSDateComponents alloc] init];
   parts.year = 2026;
   parts.month = 1;
@@ -190,4 +307,23 @@ NSString *clockString(int minute) {
     return @"";
   }
   return [fmt stringFromDate:date];
+}
+
+NSString *warmthSentence(long now, long maxv, const char *state, int full) {
+  if (maxv < 0) {
+    return [NSString stringWithFormat:@"%ld, no max set", now];
+  }
+  if (state != NULL && strcmp(state, "off") == 0) {
+    return [NSString stringWithFormat:@"off, max %ld", maxv];
+  }
+  if (now == maxv) {
+    return [NSString stringWithFormat:@"Warmth is at %ld%%", now];
+  }
+  if (full >= 0 && state != NULL && strcmp(state, "ramping") == 0) {
+    return [NSString
+        stringWithFormat:@"Warmth is at %ld%%, reaching %ld%% at %@", now,
+                         maxv, clockString(full)];
+  }
+  return [NSString stringWithFormat:@"Warmth is at %ld%%, max %ld%%", now,
+                                    maxv];
 }

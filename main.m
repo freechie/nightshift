@@ -171,24 +171,7 @@ static void printStatus(const char *reply) {
     fprintf(stderr, "unexpected reply\n");
     return;
   }
-  if (maxv < 0) {
-    printf("%ld, no max set\n", now);
-    return;
-  }
-  if (strcmp(state, "off") == 0) {
-    printf("off, max %ld\n", maxv);
-    return;
-  }
-  if (now == maxv) {
-    printf("Warmth is at %ld%%\n", now);
-    return;
-  }
-  if (full >= 0 && strcmp(state, "ramping") == 0) {
-    printf("Warmth is at %ld%%, reaching %ld%% at %s\n", now, maxv,
-           clockString((int)full).UTF8String);
-    return;
-  }
-  printf("Warmth is at %ld%%, max %ld%%\n", now, maxv);
+  printf("%s\n", warmthSentence(now, maxv, state, (int)full).UTF8String);
 }
 
 static void usage(void) {
@@ -220,6 +203,11 @@ static void help(void) {
       "  nightshift 0 pauses the ramp until you set a warmth or the next\n"
       "  evening starts.\n"
       "\n"
+      "Menu bar:\n"
+      "  Nightshift.app keeps an icon in the menu bar. Release Now or Max to\n"
+      "  set warmth or the max. Full at is hour, minute, and AM/PM columns.\n"
+      "  24-hour hides AM/PM. The warmth line matches this command.\n"
+      "\n"
       "Notifications:\n"
       "  Every command goes through Nightshift.app, which starts on its own\n"
       "  if it is not running. It posts a banner when it starts and whenever\n"
@@ -248,6 +236,7 @@ static BOOL parseValue(const char *s, long min, long max, long *out) {
 
 int main(int argc, const char *argv[]) {
   @autoreleasepool {
+    readHourCycle();
     if (argc == 1) {
       char reply[64];
       int sent = ask("status\n", reply, sizeof(reply));

@@ -8,11 +8,18 @@ BUNDLED := $(APP)/Contents/MacOS/nightshiftd
 
 all: nightshift nightshiftd $(BUNDLED)
 
+test: nightshift nightshift-tests
+	./nightshift-tests
+	sh tests/cli.sh
+
 nightshift: main.m $(SHARED)
 	clang $(CFLAGS) $(LDLIBS) -o $@ main.m NightShift.m
 
 nightshiftd: nightshiftd.m $(SHARED)
-	clang $(CFLAGS) $(LDLIBS) -framework UserNotifications -o $@ nightshiftd.m NightShift.m
+	clang $(CFLAGS) $(LDLIBS) -framework AppKit -framework UserNotifications -o $@ nightshiftd.m NightShift.m
+
+nightshift-tests: tests/check.m $(SHARED)
+	clang $(CFLAGS) -I. $(LDLIBS) -o $@ tests/check.m NightShift.m
 
 $(BUNDLED): nightshiftd Info.plist
 	mkdir -p $(dir $@)
@@ -27,6 +34,6 @@ install: all
 	cp -R Nightshift.app $(PREFIX)/Nightshift.app
 
 clean:
-	rm -rf nightshift nightshiftd $(APP)
+	rm -rf nightshift nightshiftd nightshift-tests $(APP)
 
-.PHONY: all install clean
+.PHONY: all test install clean
