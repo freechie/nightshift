@@ -239,6 +239,12 @@ static BOOL macUses24Hour(void) {
   return [format rangeOfString:@"a"].location == NSNotFound;
 }
 
+void useHourCycleForTests(int cycle) {
+  if (cycle == 0 || cycle == 12 || cycle == 24) {
+    gHourCycle = cycle;
+  }
+}
+
 BOOL hourCycleIs24(void) {
   if (gHourCycle == 24) {
     return YES;

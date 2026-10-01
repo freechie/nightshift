@@ -2,9 +2,13 @@ SDK := $(shell xcrun --show-sdk-path)
 CFLAGS := -fobjc-arc -Wall -Wextra -F$(SDK)/System/Library/PrivateFrameworks
 LDLIBS := -framework Foundation -framework CoreBrightness
 PREFIX ?= /usr/local
+VERSION := $(shell /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Info.plist)
 SHARED := NightShift.m NightShift.h CBBlueLightClient.h
 APP := Nightshift.app
 BUNDLED := $(APP)/Contents/MacOS/nightshiftd
+DIST := dist
+STAGE := $(DIST)/root
+ZIP := $(DIST)/Nightshift.zip
 
 all: nightshift nightshiftd $(BUNDLED)
 
@@ -33,7 +37,17 @@ install: all
 	rm -rf $(PREFIX)/Nightshift.app
 	cp -R Nightshift.app $(PREFIX)/Nightshift.app
 
-clean:
-	rm -rf nightshift nightshiftd nightshift-tests $(APP)
+package: all
+	rm -rf $(STAGE) $(ZIP)
+	mkdir -p $(STAGE)/bin
+	install -m 755 nightshift $(STAGE)/bin/nightshift
+	cp -R $(APP) $(STAGE)/
+	codesign --force --sign - $(STAGE)/bin/nightshift
+	ditto -c -k --norsrc $(STAGE) $(ZIP)
+	rm -rf $(STAGE)
+	@echo $(ZIP) $(VERSION)
 
-.PHONY: all test install clean
+clean:
+	rm -rf nightshift nightshiftd nightshift-tests $(APP) $(DIST)
+
+.PHONY: all test install package clean

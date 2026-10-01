@@ -33,3 +33,4 @@ NSString *warmthSentence(long now, long maxv, const char *state, int full);
 void readHourCycle(void);
 BOOL writeHourCycle(int cycle);
 BOOL hourCycleIs24(void);
+void useHourCycleForTests(int cycle);

@@ -142,24 +142,7 @@ static void checkMath(void) {
 }
 
 static void checkSentences(void) {
-  char home[] = "/tmp/nightshift-test-XXXXXX";
-  if (mkdtemp(home) == NULL) {
-    fail(@"temp home", @"mkdtemp");
-    return;
-  }
-  setenv("HOME", home, 1);
-  NSString *dir = [NSHomeDirectory()
-      stringByAppendingPathComponent:@"Library/Application Support/nightshift"];
-  NSError *error = nil;
-  if (![[NSFileManager defaultManager] createDirectoryAtPath:dir
-                                 withIntermediateDirectories:YES
-                                                  attributes:nil
-                                                       error:&error]) {
-    fail(@"temp dir", error.localizedDescription);
-    return;
-  }
-
-  readHourCycle();
+  useHourCycleForTests(0);
   expectBool(@"cycle follows mac", hourCycleIs24(),
              [[NSDateFormatter dateFormatFromTemplate:@"j"
                                               options:0
@@ -168,14 +151,14 @@ static void checkSentences(void) {
                      .location == NSNotFound);
   expectBool(@"clock string present", clockString(22 * 60).length > 0, YES);
 
-  expectBool(@"write 24", writeHourCycle(24), YES);
+  useHourCycleForTests(24);
   expectBool(@"cycle is 24", hourCycleIs24(), YES);
   expectText(@"clock 22:00", clockString(22 * 60), @"22:00");
   expectText(@"ramping sentence",
              warmthSentence(40, 90, "ramping", 22 * 60),
              @"Warmth is at 40%, reaching 90% at 22:00");
 
-  expectBool(@"write 12", writeHourCycle(12), YES);
+  useHourCycleForTests(12);
   expectBool(@"cycle is 12", hourCycleIs24(), NO);
   expectText(@"clock 10:00 PM", plainSpaces(clockString(22 * 60)), @"10:00 PM");
 
@@ -186,8 +169,6 @@ static void checkSentences(void) {
              @"Warmth is at 90%");
   expectText(@"holding", warmthSentence(40, 90, "holding", 22 * 60),
              @"Warmth is at 40%, max 90%");
-
-  [[NSFileManager defaultManager] removeItemAtPath:@(home) error:NULL];
 }
 
 int main(void) {
