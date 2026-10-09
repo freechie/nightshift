@@ -29,7 +29,7 @@ $(BUNDLED): nightshiftd Info.plist
 	mkdir -p $(dir $@)
 	cp Info.plist $(APP)/Contents/
 	cp nightshiftd $@
-	codesign --force --sign - $(APP)
+	sh scripts/dev-sign.sh $(APP)
 
 install: all
 	install -d $(PREFIX)/bin

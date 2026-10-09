@@ -849,7 +849,6 @@ int rampBeginPurchase(NSString **openURL, BOOL *portal, NSString **stdoutLine,
     }
     return 2;
   }
-  BOOL renew = NO;
   if (status == 200 && token != nil) {
     if (datedCannotReplaceForever(token)) {
       if (stdoutLine != NULL) {
@@ -868,13 +867,10 @@ int rampBeginPurchase(NSString **openURL, BOOL *portal, NSString **stdoutLine,
       return 2;
     }
     if (rampLicenseAllows(token) && rampSaveNewerLicense(token)) {
-      renew = rampLicenseRenewingSoon();
-      if (!renew) {
-        if (stdoutLine != NULL) {
-          *stdoutLine = unlockedLine();
-        }
-        return 0;
+      if (stdoutLine != NULL) {
+        *stdoutLine = unlockedLine();
       }
+      return 0;
     } else if (rampLicensed() && rampLicenseAllows(token)) {
       if (stderrLine != NULL) {
         *stderrLine = @"could not save the license";
