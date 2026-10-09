@@ -14,6 +14,7 @@
 // limitations under the License.
 
 #import "NightShift.h"
+#import <mach-o/dyld.h>
 #import <stdio.h>
 #import <stdlib.h>
 #import <unistd.h>
@@ -107,6 +108,12 @@ static void checkMath(void) {
   expectBool(@"window inside", insideWindow(22 * 60, 6 * 60, 23 * 60), YES);
   expectBool(@"window end", insideWindow(22 * 60, 6 * 60, 6 * 60), NO);
   expectBool(@"window empty", insideWindow(10 * 60, 10 * 60, 10 * 60), NO);
+  expectBool(@"before full at", holdingFullAt(18 * 60, 8 * 60, 22 * 60, 21 * 60), NO);
+  expectBool(@"at full at", holdingFullAt(18 * 60, 8 * 60, 22 * 60, 22 * 60), YES);
+  expectBool(@"after full at", holdingFullAt(18 * 60, 8 * 60, 22 * 60, 23 * 60 + 30), YES);
+  expectBool(@"holding next morning", holdingFullAt(18 * 60, 8 * 60, 22 * 60, 7 * 60), YES);
+  expectBool(@"holding outside", holdingFullAt(18 * 60, 8 * 60, 22 * 60, 12 * 60), NO);
+  expectBool(@"full at outside", holdingFullAt(18 * 60, 8 * 60, 10 * 60, 23 * 60), NO);
 
   expectLong(@"glide unset", glideWarmth(-1, 120, 1, 90, 0), -1);
   expectLong(@"glide done", glideWarmth(0, 0, 1, 90, 0), 90);
@@ -114,6 +121,11 @@ static void checkMath(void) {
   expectLong(@"glide down", glideWarmth(0, 90, 60, 40, 30), 54);
   expectLong(@"glide floor", glideWarmth(0, 10, 0, 5, 0), 1);
   expectLong(@"glide cap", glideWarmth(0, 2, 100, 200, 1), 100);
+  expectLong(@"now stays below max", warmthCappedByMax(40, 90), 40);
+  expectLong(@"now stays at max", warmthCappedByMax(90, 90), 90);
+  expectLong(@"now follows max down", warmthCappedByMax(70, 40), 40);
+  expectLong(@"off stays off", warmthCappedByMax(0, 1), 0);
+  expectLong(@"now follows max to 1", warmthCappedByMax(100, 1), 1);
 
   int hour = 0;
   int min = 0;
@@ -171,11 +183,107 @@ static void checkSentences(void) {
              @"Warmth is at 40%, max 90%");
 }
 
+static NSString *tokenFor(NSString *payload, const uint8_t *sig) {
+  NSString *body = [[payload dataUsingEncoding:NSUTF8StringEncoding]
+      base64EncodedStringWithOptions:0];
+  NSString *signature = [[NSData dataWithBytes:sig length:64]
+      base64EncodedStringWithOptions:0];
+  return [NSString stringWithFormat:@"%@.%@", body, signature];
+}
+
+static void checkLicense(void) {
+  static const uint8_t key[32] = {
+      0xcd, 0xc9, 0x09, 0x4f, 0xd8, 0xad, 0x92, 0x37, 0xbf, 0xf1, 0xb4,
+      0x45, 0xbc, 0x5a, 0x7b, 0x42, 0x61, 0x98, 0x8b, 0x45, 0xff, 0x00,
+      0x07, 0x7d, 0x22, 0x34, 0x11, 0x43, 0xce, 0x35, 0x7c, 0x32};
+  static const uint8_t forever[64] = {
+      0x68, 0xb2, 0xdb, 0x5f, 0x9d, 0x86, 0x3a, 0x86, 0x8c, 0xb5, 0x8f,
+      0x0b, 0x56, 0x73, 0x67, 0xd8, 0xee, 0x09, 0x0b, 0x7f, 0xeb, 0x1d,
+      0x8f, 0x7b, 0xdb, 0x7d, 0x4d, 0x8a, 0xef, 0xe5, 0x72, 0xb7, 0x42,
+      0x66, 0xdc, 0x8e, 0x4f, 0xc7, 0x96, 0x2b, 0xfd, 0x46, 0x8d, 0xc2,
+      0xa5, 0x6b, 0xf4, 0x3b, 0x15, 0x94, 0x7f, 0x14, 0xf0, 0xb7, 0xae,
+      0x59, 0x3a, 0xec, 0xd0, 0x3c, 0x77, 0x48, 0x2f, 0x06};
+  static const uint8_t later[64] = {
+      0xc7, 0x35, 0xfa, 0x71, 0xb8, 0x1d, 0xa1, 0x70, 0xf1, 0xef, 0x50,
+      0xe8, 0x28, 0xe8, 0xa1, 0xe0, 0x96, 0x2e, 0xf7, 0x0d, 0x7d, 0x85,
+      0xf7, 0x55, 0xde, 0xea, 0x88, 0x9c, 0xb6, 0xd5, 0xc5, 0x8d, 0x06,
+      0x88, 0x6f, 0xd3, 0xe0, 0x98, 0xc8, 0x05, 0xfa, 0x27, 0xc7, 0xc2,
+      0x6c, 0x01, 0x16, 0xd6, 0x5a, 0xb3, 0x37, 0xe6, 0x6c, 0x16, 0xa6,
+      0xf0, 0x05, 0x3f, 0x85, 0x85, 0xc0, 0x52, 0xa0, 0x0c};
+  static const uint8_t earlier[64] = {
+      0x00, 0x75, 0x24, 0xf9, 0x4a, 0xb4, 0x37, 0x8f, 0xa4, 0x98, 0x0f,
+      0x68, 0xbf, 0x3e, 0x5b, 0xe3, 0x62, 0xbd, 0x36, 0x80, 0x58, 0xd0,
+      0xa3, 0xef, 0xec, 0xd3, 0xbc, 0xce, 0xd0, 0x1f, 0x67, 0x72, 0xfe,
+      0xfd, 0xcb, 0xd3, 0xf6, 0x4c, 0xdd, 0x34, 0x76, 0x50, 0x81, 0xf1,
+      0x37, 0x1e, 0xe3, 0x43, 0x65, 0x0d, 0xb9, 0x72, 0x5a, 0xae, 0x9d,
+      0x2d, 0x60, 0x51, 0xd4, 0x16, 0x37, 0x56, 0x1c, 0x04};
+  useRampPublicKeyForTests(key);
+  expectBool(@"ramp token", rampLicenseAllows(tokenFor(@"ramp", forever)), YES);
+  expectBool(@"dated ramp token",
+             rampLicenseAllows(tokenFor(@"ramp:2099-01-01", later)), YES);
+  expectText(@"ramp until",
+             rampLicenseUntilToken(tokenFor(@"ramp:2099-01-01", later)),
+             @"2099-01-01");
+  expectBool(@"forever has no until",
+             rampLicenseUntilToken(tokenFor(@"ramp", forever)) == nil, YES);
+  expectBool(@"expired ramp token",
+             rampLicenseAllows(tokenFor(@"ramp:2020-01-01", earlier)), NO);
+  expectBool(@"reject empty license", rampLicenseAllows(@""), NO);
+  expectBool(@"reject tampered license",
+             rampLicenseAllows(tokenFor(@"ramp-extra", forever)), NO);
+
+  NSString *home = [NSHomeDirectory() stringByStandardizingPath];
+  if (home == nil || ![home hasPrefix:@"/tmp/nslic"]) {
+    fail(@"license save home", home ?: @"nil");
+    useRampPublicKeyForTests(NULL);
+    return;
+  }
+  NSString *foreverToken = tokenFor(@"ramp", forever);
+  NSString *laterToken = tokenFor(@"ramp:2099-01-01", later);
+  NSString *earlierToken = tokenFor(@"ramp:2020-01-01", earlier);
+  expectBool(@"save dated license", rampSaveNewerLicense(laterToken), YES);
+  expectText(@"dated license until", rampLicenseUntil(), @"2099-01-01");
+  expectBool(@"forever replaces dated", rampSaveNewerLicense(foreverToken), YES);
+  expectBool(@"forever has no saved until", rampLicenseUntil() == nil, YES);
+  expectBool(@"dated does not replace forever", rampSaveNewerLicense(laterToken), NO);
+  expectBool(@"forever still has no until", rampLicenseUntil() == nil, YES);
+  expectBool(@"expired does not replace forever",
+             rampSaveNewerLicense(earlierToken), NO);
+  expectBool(@"forever remains licensed", rampLicensed(), YES);
+  useRampPublicKeyForTests(NULL);
+}
+
+static void isolateHome(void) {
+  if (getenv("NIGHTSHIFT_LICENSE_TEST") != NULL) {
+    return;
+  }
+  char templ[] = "/tmp/nslicXXXXXX";
+  if (mkdtemp(templ) == NULL) {
+    fprintf(stderr, "fail license home: mkdtemp\n");
+    exit(1);
+  }
+  setenv("HOME", templ, 1);
+  setenv("CFFIXED_USER_HOME", templ, 1);
+  setenv("NIGHTSHIFT_LICENSE_TEST", "1", 1);
+  char path[4096];
+  uint32_t size = sizeof(path);
+  if (_NSGetExecutablePath(path, &size) != 0) {
+    fprintf(stderr, "fail license home: executable path\n");
+    exit(1);
+  }
+  char *argv[] = {path, NULL};
+  execv(path, argv);
+  fprintf(stderr, "fail license home: exec\n");
+  exit(1);
+}
+
 int main(void) {
+  isolateHome();
   @autoreleasepool {
     checkParsers();
     checkMath();
     checkSentences();
+    checkLicense();
     if (gFailed != 0) {
       fprintf(stderr, "%d failed\n", gFailed);
       return 1;

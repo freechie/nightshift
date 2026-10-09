@@ -16,5 +16,16 @@
   <string>2</string>
   <key>LSUIElement</key>
   <true/>
+  <key>CFBundleURLTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleURLName</key>
+      <string>io.github.freechie.nightshift</string>
+      <key>CFBundleURLSchemes</key>
+      <array>
+        <string>nightshift</string>
+      </array>
+    </dict>
+  </array>
 </dict>
 </plist>

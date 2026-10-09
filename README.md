@@ -36,6 +36,8 @@ nightshift -h         # explain the commands, the ramp, and the notifications
 
 A warmth is a whole number from `0` to `100`. A max is from `1` to `100`.
 
+Setting a warmth is free. The evening ramp is a year at a time. `nightshift buy` opens checkout and saves the token. The menu button does the same. `nightshift license` prints the date it runs through. `nightshift license <token>` saves a token you already have.
+
 ## Menu bar
 
 `Nightshift.app` keeps an icon in the menu bar. The first line is the same sentence `nightshift` prints. Release Now or Max to set the warmth or the max. Full at is hour, minute, and AM/PM columns. 24-hour hides AM/PM. That choice is saved in `clock`, beside `max` and `full`.

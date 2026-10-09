@@ -88,6 +88,12 @@ reject "max" "usage: nightshift" max
 reject "max 0" "usage: nightshift" max 0
 reject "max 101" "usage: nightshift" max 101
 reject "max 60%" "usage: nightshift" max 60%
+reject "schedule nope" "use off, custom, or sunset" schedule nope
+reject "clock 13" "use 12 or 24" clock 13
+reject "login maybe" "use on or off" login maybe
+reject "dark maybe" "use on or off" dark maybe
+reject "tone maybe" "use on or off" tone maybe
+reject "brightness 3" "usage: nightshift" brightness 3
 
 out=$(mktemp)
 err=$(mktemp)

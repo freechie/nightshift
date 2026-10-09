@@ -82,7 +82,7 @@ static BOOL startDaemon(void) {
   return rc == 0;
 }
 
-static int talk(const char *line, char *reply, size_t cap) {
+static int talk(const char *line, char *reply, size_t cap, BOOL whole) {
   NSString *sock = [[NSHomeDirectory()
       stringByAppendingPathComponent:@"Library/Application Support/nightshift"]
       stringByAppendingPathComponent:@"nightshiftd.sock"];
@@ -122,30 +122,41 @@ static int talk(const char *line, char *reply, size_t cap) {
     return 1;
   }
 
-  ssize_t n;
-  do {
-    n = read(fd, reply, cap - 1);
-  } while (n < 0 && errno == EINTR);
-  if (n <= 0) {
-    close(fd);
+  size_t used = 0;
+  while (used + 1 < cap) {
+    ssize_t n;
+    do {
+      n = read(fd, reply + used, cap - 1 - used);
+    } while (n < 0 && errno == EINTR);
+    if (n <= 0) {
+      break;
+    }
+    used += (size_t)n;
+    if (!whole) {
+      break;
+    }
+  }
+  close(fd);
+  if (used == 0) {
     return 1;
   }
-  reply[n] = '\0';
+  reply[used] = '\0';
   char *nl = strchr(reply, '\n');
   if (nl == NULL) {
-    close(fd);
     return 1;
   }
-  *nl = '\0';
-  close(fd);
-  if (reply[0] == '\0' || strcmp(reply, "failed") == 0) {
+  if (!whole) {
+    *nl = '\0';
+  }
+  if (reply[0] == '\0' || strcmp(reply, "failed") == 0 ||
+      strncmp(reply, "failed\n", 7) == 0) {
     return 1;
   }
   return 0;
 }
 
-static int ask(const char *line, char *reply, size_t cap) {
-  int sent = talk(line, reply, cap);
+static int askMode(const char *line, char *reply, size_t cap, BOOL whole) {
+  int sent = talk(line, reply, cap, whole);
   if (sent != -1) {
     return sent;
   }
@@ -154,12 +165,60 @@ static int ask(const char *line, char *reply, size_t cap) {
   }
   for (int i = 0; i < 50; i++) {
     usleep(100000);
-    sent = talk(line, reply, cap);
+    sent = talk(line, reply, cap, whole);
     if (sent != -1) {
       return sent;
     }
   }
   return -1;
+}
+
+static int ask(const char *line, char *reply, size_t cap) {
+  return askMode(line, reply, cap, NO);
+}
+
+static int askAll(const char *line, char *reply, size_t cap) {
+  return askMode(line, reply, cap, YES);
+}
+
+static void printReply(const char *reply) {
+  size_t len = strlen(reply);
+  if (len > 0 && reply[len - 1] == '\n') {
+    fputs(reply, stdout);
+    return;
+  }
+  printf("%s\n", reply);
+}
+
+static int finishReply(int sent, const char *reply, const char *failText, BOOL setting) {
+  if (sent == 0 && setting && strcmp(reply, "unsupported") == 0) {
+    fprintf(stderr, "True Tone is unavailable\n");
+    return 1;
+  }
+  if (sent == 0 && strcmp(reply, "approval") == 0) {
+    fprintf(stderr, "Allow Nightshift in Login Items\n");
+    return 1;
+  }
+  if (sent == 0) {
+    printReply(reply);
+    return 0;
+  }
+  if (sent < 0) {
+    fprintf(stderr, "failed to reach nightshiftd\n");
+    return 1;
+  }
+  fprintf(stderr, "%s\n", failText);
+  return 1;
+}
+
+static int openSettings(const char *url) {
+  pid_t opened = 0;
+  char *argv[] = {"/usr/bin/open", (char *)url, NULL};
+  if (posix_spawn(&opened, "/usr/bin/open", NULL, NULL, argv, environ) != 0) {
+    fprintf(stderr, "could not open System Settings\n");
+    return 1;
+  }
+  return 0;
 }
 
 static void printStatus(const char *reply) {
@@ -174,8 +233,19 @@ static void printStatus(const char *reply) {
   printf("%s\n", warmthSentence(now, maxv, state, (int)full).UTF8String);
 }
 
+static BOOL paidReply(const char *reply) {
+  if (strcmp(reply, "locked") != 0) {
+    return NO;
+  }
+  fprintf(stderr, "%s\n", rampOffer().UTF8String);
+  return YES;
+}
+
 static void usage(void) {
-  fprintf(stderr, "usage: nightshift [0-100 | max 1-100 | ramp 8:30pm | -h]\n");
+  fprintf(stderr,
+          "usage: nightshift [0-100 | max 1-100 | ramp 8:30pm | schedule | "
+          "clock | login | dark | tone | brightness | keys | notifications | "
+          "license | buy | -h]\n");
 }
 
 static void help(void) {
@@ -189,11 +259,37 @@ static void help(void) {
       "  nightshift 0           Turn Night Shift off\n"
       "  nightshift max 60      Set the warmth the evening ramp climbs to\n"
       "  nightshift ramp 8:30pm Reach the max at 8:30 PM\n"
+      "  nightshift license     Show whether the ramp is unlocked\n"
+      "  nightshift buy         Pay for a year of the ramp\n"
+      "  nightshift schedule    Show off, custom, or sunset\n"
+      "  nightshift schedule custom\n"
+      "                         Use a Custom schedule\n"
+      "  nightshift clock       Show 12 or 24\n"
+      "  nightshift clock 24    Use 24-hour Full at\n"
+      "  nightshift login       Show whether Nightshift opens at login\n"
+      "  nightshift login on    Open Nightshift at login\n"
+      "  nightshift dark        Show whether Dark mode is on\n"
+      "  nightshift dark on     Turn Dark mode on\n"
+      "  nightshift tone        Show True Tone, or unsupported\n"
+      "  nightshift tone off    Turn True Tone off\n"
+      "  nightshift brightness  List each display's id, name, percent, and\n"
+      "                         backlight or picture\n"
+      "  nightshift brightness 3 40\n"
+      "                         Set display 3 to 40%%\n"
+      "  nightshift keys        Show whether the brightness keys are allowed\n"
+      "  nightshift notifications\n"
+      "                         Open Notification settings\n"
       "  nightshift -h          Show this help\n"
       "\n"
+      "License:\n"
+      "  Setting a warmth is free. The evening ramp is paid: nightshift max,\n"
+      "  nightshift ramp, and the climb to the max. nightshift buy opens\n"
+      "  checkout and saves the token. nightshift license <token> saves one\n"
+      "  you already have.\n"
+      "\n"
       "Evening ramp:\n"
-      "  With a Custom schedule in System Settings > Displays > Night Shift,\n"
-      "  warmth starts at 1 when the schedule begins and climbs to the max\n"
+      "  With a Custom schedule (nightshift schedule custom), warmth starts\n"
+      "  at 1 when the schedule begins and climbs to the max\n"
       "  over two hours, or by the ramp time. It holds the max until the\n"
       "  schedule ends. Sunset to Sunrise is left alone.\n"
       "\n"
@@ -204,9 +300,12 @@ static void help(void) {
       "  evening starts.\n"
       "\n"
       "Menu bar:\n"
-      "  Nightshift.app keeps an icon in the menu bar. Release Now or Max to\n"
-      "  set warmth or the max. Full at is hour, minute, and AM/PM columns.\n"
-      "  24-hour hides AM/PM. The warmth line matches this command.\n"
+      "  Nightshift.app keeps an icon in the menu bar. Release Current or Max to\n"
+      "  set warmth or the max. Type the Full at time, hour then minute.\n"
+      "  24-hour hides AM/PM. The menu also has Dark mode, True Tone,\n"
+      "  display brightness, Night Shift Off, Custom, or Sunset, and Quit.\n"
+      "  Settings opens General, Displays, and Nightshift Pro. The same\n"
+      "  controls are available from the nightshift command.\n"
       "\n"
       "Notifications:\n"
       "  Every command goes through Nightshift.app, which starts on its own\n"
@@ -255,6 +354,84 @@ int main(int argc, const char *argv[]) {
       return 0;
     }
 
+    if ((argc == 2 || argc == 3) && strcmp(argv[1], "license") == 0) {
+      if (argc == 3) {
+        NSString *token = [@(argv[2]) stringByTrimmingCharactersInSet:
+                                      [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        NSString *out = nil;
+        NSString *err = nil;
+        int saved = rampInstallReported(token, &out, &err);
+        if (out != nil) {
+          printf("%s\n", out.UTF8String);
+        }
+        if (err != nil) {
+          fprintf(stderr, "%s\n", err.UTF8String);
+        }
+        return saved;
+      }
+      if (rampLicensed()) {
+        NSString *until = rampLicenseUntil();
+        if (until != nil) {
+          printf("Ramp is unlocked through %s\n", until.UTF8String);
+        } else {
+          printf("Ramp is unlocked\n");
+        }
+        return 0;
+      }
+      fprintf(stderr, "%s\n", rampOffer().UTF8String);
+      return 1;
+    }
+
+    if (argc == 2 && strcmp(argv[1], "buy") == 0) {
+      NSString *url = nil;
+      BOOL portal = NO;
+      NSString *out = nil;
+      NSString *err = nil;
+      int step = rampBeginPurchase(&url, &portal, &out, &err);
+      if (step == 0) {
+        if (out != nil) {
+          printf("%s\n", out.UTF8String);
+        }
+        if (err != nil) {
+          fprintf(stderr, "%s\n", err.UTF8String);
+        }
+        return 0;
+      }
+      if (step != 1 || url == nil) {
+        fprintf(stderr, "%s\n", (err != nil ? err : @"could not open checkout").UTF8String);
+        return 1;
+      }
+      printf("%s\n", url.UTF8String);
+      pid_t opened = 0;
+      char *openArgv[] = {"/usr/bin/open", (char *)url.UTF8String, NULL};
+      if (posix_spawn(&opened, "/usr/bin/open", NULL, NULL, openArgv, environ) != 0) {
+        fprintf(stderr, "could not open checkout\n");
+        return 1;
+      }
+      if (portal) {
+        return 0;
+      }
+      for (int i = 0; i < 90; i++) {
+        sleep(2);
+        int got = rampTakeLicenseUpdate(&out, &err);
+        if (got == 0) {
+          if (out != nil) {
+            printf("%s\n", out.UTF8String);
+          }
+          if (err != nil) {
+            fprintf(stderr, "%s\n", err.UTF8String);
+          }
+          return 0;
+        }
+        if (got == 2) {
+          fprintf(stderr, "%s\n", (err != nil ? err : @"could not save the license").UTF8String);
+          return 1;
+        }
+      }
+      fprintf(stderr, "checkout did not finish\n");
+      return 1;
+    }
+
     if (argc == 3 && strcmp(argv[1], "max") == 0) {
       long value = 0;
       if (!parseValue(argv[2], 1, 100, &value)) {
@@ -265,6 +442,9 @@ int main(int argc, const char *argv[]) {
       char reply[64];
       snprintf(line, sizeof(line), "max %ld\n", value);
       int sent = ask(line, reply, sizeof(reply));
+      if (sent == 0 && paidReply(reply)) {
+        return 1;
+      }
       if (sent == 0) {
         printf("max %s\n", reply);
         return 0;
@@ -295,6 +475,9 @@ int main(int argc, const char *argv[]) {
       char reply[64];
       snprintf(line, sizeof(line), "ramp %d\n", minute);
       int sent = ask(line, reply, sizeof(reply));
+      if (sent == 0 && paidReply(reply)) {
+        return 1;
+      }
       if (sent == 0) {
         long saved = 0;
         if (parseValue(reply, 0, 1439, &saved) && saved == minute) {
@@ -308,6 +491,111 @@ int main(int argc, const char *argv[]) {
       }
       fprintf(stderr, "failed to set the time\n");
       return 1;
+    }
+
+    if (argc == 2 && strcmp(argv[1], "notifications") == 0) {
+      printf("Notifications for Nightshift\n");
+      return openSettings(
+          "x-apple.systempreferences:com.apple.Notifications-Settings.extension");
+    }
+
+    if ((argc == 2 || argc == 3) && strcmp(argv[1], "schedule") == 0) {
+      if (argc == 3 && strcmp(argv[2], "off") != 0 &&
+          strcmp(argv[2], "custom") != 0 && strcmp(argv[2], "sunset") != 0) {
+        fprintf(stderr, "use off, custom, or sunset\n");
+        return 1;
+      }
+      char line[32];
+      char reply[32];
+      snprintf(line, sizeof(line), argc == 2 ? "schedule\n" : "schedule %s\n",
+               argc == 2 ? "" : argv[2]);
+      return finishReply(ask(line, reply, sizeof(reply)), reply,
+                         "failed to set the schedule", argc == 3);
+    }
+
+    if ((argc == 2 || argc == 3) && strcmp(argv[1], "clock") == 0) {
+      if (argc == 3 && strcmp(argv[2], "12") != 0 && strcmp(argv[2], "24") != 0) {
+        fprintf(stderr, "use 12 or 24\n");
+        return 1;
+      }
+      char line[16];
+      char reply[16];
+      snprintf(line, sizeof(line), argc == 2 ? "clock\n" : "clock %s\n",
+               argc == 2 ? "" : argv[2]);
+      return finishReply(ask(line, reply, sizeof(reply)), reply,
+                         "failed to set the clock", argc == 3);
+    }
+
+    if ((argc == 2 || argc == 3) && strcmp(argv[1], "login") == 0) {
+      if (argc == 3 && strcmp(argv[2], "on") != 0 && strcmp(argv[2], "off") != 0) {
+        fprintf(stderr, "use on or off\n");
+        return 1;
+      }
+      char line[16];
+      char reply[16];
+      snprintf(line, sizeof(line), argc == 2 ? "login\n" : "login %s\n",
+               argc == 2 ? "" : argv[2]);
+      return finishReply(ask(line, reply, sizeof(reply)), reply,
+                         "failed to set login", argc == 3);
+    }
+
+    if ((argc == 2 || argc == 3) && strcmp(argv[1], "dark") == 0) {
+      if (argc == 3 && strcmp(argv[2], "on") != 0 && strcmp(argv[2], "off") != 0) {
+        fprintf(stderr, "use on or off\n");
+        return 1;
+      }
+      char line[16];
+      char reply[16];
+      snprintf(line, sizeof(line), argc == 2 ? "dark\n" : "dark %s\n",
+               argc == 2 ? "" : argv[2]);
+      return finishReply(ask(line, reply, sizeof(reply)), reply,
+                         "failed to set Dark mode", argc == 3);
+    }
+
+    if ((argc == 2 || argc == 3) && strcmp(argv[1], "tone") == 0) {
+      if (argc == 3 && strcmp(argv[2], "on") != 0 && strcmp(argv[2], "off") != 0) {
+        fprintf(stderr, "use on or off\n");
+        return 1;
+      }
+      char line[16];
+      char reply[16];
+      snprintf(line, sizeof(line), argc == 2 ? "tone\n" : "tone %s\n",
+               argc == 2 ? "" : argv[2]);
+      return finishReply(ask(line, reply, sizeof(reply)), reply,
+                         "failed to set True Tone", argc == 3);
+    }
+
+    if (argc == 2 && strcmp(argv[1], "brightness") == 0) {
+      char reply[2048];
+      return finishReply(askAll("brightness\n", reply, sizeof(reply)), reply,
+                         "failed to list displays", NO);
+    }
+
+    if (argc == 4 && strcmp(argv[1], "brightness") == 0) {
+      unsigned display = 0;
+      long percent = 0;
+      char extra = 0;
+      if (sscanf(argv[2], "%u%c", &display, &extra) != 1 ||
+          !parseValue(argv[3], 0, 100, &percent)) {
+        usage();
+        return 1;
+      }
+      char line[64];
+      char reply[64];
+      snprintf(line, sizeof(line), "brightness %u %ld\n", display, percent);
+      return finishReply(ask(line, reply, sizeof(reply)), reply,
+                         "failed to set brightness", YES);
+    }
+
+    if (argc == 2 && strcmp(argv[1], "keys") == 0) {
+      char reply[16];
+      int sent = ask("keys\n", reply, sizeof(reply));
+      int code = finishReply(sent, reply, "failed to read the brightness keys", NO);
+      if (code == 0 && strcmp(reply, "off") == 0) {
+        openSettings("x-apple.systempreferences:com.apple.settings."
+                     "PrivacySecurity.extension?Privacy_Accessibility");
+      }
+      return code;
     }
 
     if (argc != 2) {

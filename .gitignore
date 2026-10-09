@@ -3,5 +3,9 @@ nightshiftd
 nightshift-tests
 Nightshift.app/
 dist/
+license.pem
+server/node_modules/
+server/data/
+server/.env
 .DS_Store
 .cursor/

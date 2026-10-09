@@ -1,6 +1,6 @@
 SDK := $(shell xcrun --show-sdk-path)
 CFLAGS := -fobjc-arc -Wall -Wextra -F$(SDK)/System/Library/PrivateFrameworks
-LDLIBS := -framework Foundation -framework CoreBrightness
+LDLIBS := -framework Foundation -framework CoreBrightness -framework Security
 PREFIX ?= /usr/local
 VERSION := $(shell /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Info.plist)
 SHARED := NightShift.m NightShift.h CBBlueLightClient.h
@@ -20,7 +20,7 @@ nightshift: main.m $(SHARED)
 	clang $(CFLAGS) $(LDLIBS) -o $@ main.m NightShift.m
 
 nightshiftd: nightshiftd.m $(SHARED)
-	clang $(CFLAGS) $(LDLIBS) -framework AppKit -framework UserNotifications -o $@ nightshiftd.m NightShift.m
+	clang $(CFLAGS) $(LDLIBS) -framework AppKit -framework UserNotifications -framework ServiceManagement -framework CoreGraphics -framework IOKit -framework DisplayServices -framework SkyLight -o $@ nightshiftd.m NightShift.m
 
 nightshift-tests: tests/check.m $(SHARED)
 	clang $(CFLAGS) -I. $(LDLIBS) -o $@ tests/check.m NightShift.m
@@ -50,4 +50,7 @@ package: all
 clean:
 	rm -rf nightshift nightshiftd nightshift-tests $(APP) $(DIST)
 
-.PHONY: all test install package clean
+icon-lab:
+	open prototype/icon/index.html
+
+.PHONY: all test install package clean icon-lab
