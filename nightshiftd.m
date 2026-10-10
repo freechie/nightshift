@@ -16,6 +16,7 @@
 #import "NightShift.h"
 #import <AppKit/AppKit.h>
 #import <ApplicationServices/ApplicationServices.h>
+#import <dlfcn.h>
 #import <IOKit/IOKitLib.h>
 #import <ServiceManagement/ServiceManagement.h>
 #import <UserNotifications/UserNotifications.h>
@@ -35,6 +36,11 @@ extern IOReturn IOAVServiceWriteI2C(IOAVServiceRef service, uint32_t chip,
                                     uint32_t address, void *buffer, uint32_t length);
 
 static BOOL brightnessKeysReady(void);
+static long readPercent(uint32_t display);
+static BOOL ddcReportsCombined(uint32_t display);
+static long ddcShownPercent(uint32_t display);
+static void noteCursorBrightness(uint32_t display, long percent);
+static void noteCursorDisplaysOffline(void);
 static void startBrightnessKeys(void);
 static BOOL handleControl(const char *buf, int fd);
 extern int SLSGetAppearanceThemeLegacy(void);
@@ -994,6 +1000,7 @@ static int orderedDisplays(uint32_t *ids, int cap) {
 
 static NSMutableDictionary<NSNumber *, NSNumber *> *gSoftwareBrightness;
 static NSMutableDictionary<NSString *, NSNumber *> *gBrightnessSaved;
+static NSMutableSet<NSString *> *gCombinedBrightness;
 static NSScreen *screenForDisplay(uint32_t display);
 
 static NSString *displayBrightnessKey(uint32_t display) {
@@ -1004,6 +1011,7 @@ static NSString *displayBrightnessKey(uint32_t display) {
 
 static void loadBrightness(void) {
   gBrightnessSaved = [NSMutableDictionary dictionary];
+  gCombinedBrightness = [NSMutableSet set];
   if (gBrightnessPath == nil) {
     return;
   }
@@ -1018,7 +1026,10 @@ static void loadBrightness(void) {
     unsigned model = 0;
     unsigned serial = 0;
     int percent = 0;
-    if (sscanf(line.UTF8String, "%u %u %u %d", &vendor, &model, &serial, &percent) != 4) {
+    char kind[16] = "";
+    int count = sscanf(line.UTF8String, "%u %u %u %d %15s", &vendor, &model, &serial, &percent,
+                        kind);
+    if (count < 4) {
       continue;
     }
     if (percent < 0 || percent > 100) {
@@ -1026,6 +1037,9 @@ static void loadBrightness(void) {
     }
     NSString *key = [NSString stringWithFormat:@"%u %u %u", vendor, model, serial];
     gBrightnessSaved[key] = @(percent / 100.0);
+    if (count >= 5 && strcmp(kind, "combined") == 0) {
+      [gCombinedBrightness addObject:key];
+    }
   }
 }
 
@@ -1036,7 +1050,11 @@ static BOOL saveBrightness(void) {
   NSMutableString *text = [NSMutableString string];
   for (NSString *key in gBrightnessSaved) {
     long percent = lround(gBrightnessSaved[key].doubleValue * 100.0);
-    [text appendFormat:@"%@ %ld\n", key, percent];
+    if (gCombinedBrightness != nil && [gCombinedBrightness containsObject:key]) {
+      [text appendFormat:@"%@ %ld combined\n", key, percent];
+    } else {
+      [text appendFormat:@"%@ %ld\n", key, percent];
+    }
   }
   if (![text writeToFile:gBrightnessPath
                atomically:YES
@@ -1061,12 +1079,20 @@ static BOOL noteBrightness(uint32_t display, long percent) {
     gSoftwareBrightness = [NSMutableDictionary dictionary];
   }
   NSNumber *level = @(percent / 100.0);
-  gBrightnessSaved[displayBrightnessKey(display)] = level;
+  NSString *key = displayBrightnessKey(display);
+  gBrightnessSaved[key] = level;
   gSoftwareBrightness[@(display)] = level;
+  if (ddcReportsCombined(display)) {
+    if (gCombinedBrightness == nil) {
+      gCombinedBrightness = [NSMutableSet set];
+    }
+    [gCombinedBrightness addObject:key];
+  }
   return saveBrightness();
 }
 
 static BOOL finishBrightness(uint32_t display, long percent) {
+  noteCursorBrightness(display, percent);
   if (noteBrightness(display, percent)) {
     return YES;
   }
@@ -1150,6 +1176,8 @@ typedef struct {
   uint32_t display;
   int max;
   int current;
+  int floorRaw;
+  int combined;
   IOAVServiceRef service;
 } DDCSlot;
 
@@ -1232,18 +1260,25 @@ static IOAVServiceRef serviceMatching(uint32_t model, uint32_t serial) {
 
 static BOOL ddcReadOnce(IOAVServiceRef service, int *current, int *max) {
   uint8_t request[4] = {0x82, 0x01, 0x10, 0};
-  request[3] = ddcChecksum(request, 3);
+  request[3] = (uint8_t)(0x6E ^ request[0] ^ request[1] ^ request[2]);
   if (IOAVServiceWriteI2C(service, 0x37, 0x51, request, 4) != 0) {
     return NO;
   }
   usleep(50000);
-  uint8_t reply[12];
+  uint8_t reply[11];
   memset(reply, 0, sizeof(reply));
-  if (IOAVServiceReadI2C(service, 0x37, 0x51, reply, 12) != 0) {
+  if (IOAVServiceReadI2C(service, 0x37, 0, reply, 11) != 0) {
     return NO;
   }
   if ((reply[0] != 0x6E && reply[0] != 0x6e) || reply[2] != 0x02 || reply[3] != 0x00 ||
       reply[4] != 0x10) {
+    return NO;
+  }
+  uint8_t sum = 0x50;
+  for (int i = 0; i < 10; i++) {
+    sum ^= reply[i];
+  }
+  if (sum != reply[10]) {
     return NO;
   }
   int maxValue = (reply[6] << 8) | reply[7];
@@ -1262,6 +1297,8 @@ static void clearDDCSlot(int i) {
   gDDC[i].service = NULL;
   gDDC[i].display = 0;
   gDDC[i].current = 0;
+  gDDC[i].floorRaw = -1;
+  gDDC[i].combined = -1;
   if (service != NULL) {
     CFRelease(service);
   }
@@ -1274,6 +1311,10 @@ static void publishDDC(uint32_t display, IOAVServiceRef service, int current, in
     }
     if (gDDC[i].service != NULL && gDDC[i].service != service) {
       CFRelease(gDDC[i].service);
+    }
+    if (gDDC[i].display != display) {
+      gDDC[i].floorRaw = -1;
+      gDDC[i].combined = -1;
     }
     gDDC[i].display = display;
     gDDC[i].service = service;
@@ -1306,11 +1347,30 @@ static BOOL ddcFailed(uint32_t display) {
   return NO;
 }
 
+static BOOL ddcUnconfirmed(uint32_t display) {
+  for (int i = 0; i < 8; i++) {
+    if (gDDC[i].display == display && gDDC[i].service != NULL &&
+        __atomic_load_n(&gDDC[i].max, __ATOMIC_ACQUIRE) <= 0) {
+      return YES;
+    }
+  }
+  return NO;
+}
+
+static BOOL ddcHasService(uint32_t display) {
+  for (int i = 0; i < 8; i++) {
+    if (gDDC[i].display == display && gDDC[i].service != NULL) {
+      return YES;
+    }
+  }
+  return NO;
+}
+
 static BOOL ddcPending(uint32_t display) {
   if (display == 0 || CGDisplayIsBuiltin(display)) {
     return NO;
   }
-  return !ddcReady(display) && !ddcFailed(display);
+  return !ddcReady(display) && !ddcFailed(display) && !ddcUnconfirmed(display);
 }
 
 static BOOL ddcNeedsProbe(void) {
@@ -1389,14 +1449,14 @@ static void probeDDC(void) {
       }
       results[i].display = targets[i];
       results[i].current = ok ? current : 0;
-      results[i].max = ok ? max : -1;
-      results[i].service = ok ? service : NULL;
-      if (service != NULL && !ok) {
-        CFRelease(service);
-      }
+      results[i].max = ok ? max : (service != NULL ? 0 : -1);
+      results[i].service = service;
     }
     dispatch_async(dispatch_get_main_queue(), ^{
       for (int i = 0; i < pending; i++) {
+        if (results[i].service == NULL && ddcHasService(results[i].display)) {
+          continue;
+        }
         publishDDC(results[i].display, results[i].service, results[i].current,
                    results[i].max);
       }
@@ -1431,47 +1491,267 @@ static BOOL ddcCached(uint32_t display, float *level) {
   return NO;
 }
 
-static BOOL ddcSet(uint32_t display, long percent) {
+static const int kDDCAssumeScale = 100;
+
+static int ddcScale(int storedMax) {
+  return storedMax > 0 ? storedMax : kDDCAssumeScale;
+}
+
+static int ddcValue(long percent, int scale) {
+  int value = (int)llround((percent / 100.0) * scale);
+  if (value < 0) {
+    value = 0;
+  }
+  if (value > scale) {
+    value = scale;
+  }
+  return value;
+}
+
+static BOOL ddcNear(int got, int want, int scale) {
+  int tol = scale / 20;
+  if (tol < 2) {
+    tol = 2;
+  }
+  int diff = got - want;
+  if (diff < 0) {
+    diff = -diff;
+  }
+  return diff <= tol;
+}
+
+static BOOL ddcWriteOnce(IOAVServiceRef service, int value) {
+  uint8_t request[6] = {0x84, 0x03, 0x10, (uint8_t)((value >> 8) & 0xFF),
+                        (uint8_t)(value & 0xFF), 0};
+  request[5] = ddcChecksum(request, 5);
+  BOOL wrote = NO;
+  for (int cycle = 0; cycle < 2; cycle++) {
+    usleep(10000);
+    if (IOAVServiceWriteI2C(service, 0x37, 0x51, request, 6) == 0) {
+      wrote = YES;
+    }
+  }
+  return wrote;
+}
+
+static BOOL ddcCommit(DDCSlot *slot, int current, int max) {
+  slot->current = current;
+  __atomic_store_n(&slot->max, max, __ATOMIC_RELEASE);
+  return YES;
+}
+
+static DDCSlot *ddcSlot(uint32_t display) {
   for (int i = 0; i < 8; i++) {
-    if (gDDC[i].display != display || gDDC[i].service == NULL) {
-      continue;
+    if (gDDC[i].display == display && gDDC[i].service != NULL) {
+      return &gDDC[i];
     }
-    int max = __atomic_load_n(&gDDC[i].max, __ATOMIC_ACQUIRE);
-    if (max <= 0) {
-      return NO;
+  }
+  return NULL;
+}
+
+static long ddcRawPercent(int raw, int scale) {
+  if (scale <= 0) {
+    return 0;
+  }
+  long percent = (long)llround((raw * 100.0) / (double)scale);
+  if (percent < 0) {
+    return 0;
+  }
+  if (percent > 100) {
+    return 100;
+  }
+  return percent;
+}
+
+static void ddcNoteMove(DDCSlot *slot, int before, int wanted, int landed, int scale,
+                        long percent) {
+  int tol = scale / 20;
+  if (tol < 2) {
+    tol = 2;
+  }
+  if (percent <= 0 && landed > 0 && wanted < before) {
+    if (slot->floorRaw < 0 || landed < slot->floorRaw) {
+      slot->floorRaw = landed;
     }
-    int value = (int)llround((percent / 100.0) * max);
-    if (value < 0) {
-      value = 0;
+    return;
+  }
+  if (landed > wanted + tol) {
+    int far = (scale * 15) / 100;
+    if (far < tol + 1) {
+      far = tol + 1;
     }
-    if (value > max) {
-      value = max;
+    BOOL movedDown = before - landed > tol;
+    BOOL askedFar = wanted < before && landed - wanted > far;
+    if (movedDown || askedFar || slot->floorRaw == landed) {
+      if (slot->floorRaw < 0 || landed < slot->floorRaw) {
+        slot->floorRaw = landed;
+      }
     }
-    uint8_t request[6] = {0x84, 0x03, 0x10, (uint8_t)((value >> 8) & 0xFF),
-                          (uint8_t)(value & 0xFF), 0};
-    request[5] = ddcChecksum(request, 5);
-    if (IOAVServiceWriteI2C(gDDC[i].service, 0x37, 0x51, request, 6) != 0) {
-      clearDDCSlot(i);
-      return NO;
+    return;
+  }
+  if (slot->floorRaw > landed) {
+    slot->floorRaw = wanted <= tol ? 0 : -1;
+  }
+}
+
+static long ddcFloorPercent(uint32_t display) {
+  DDCSlot *slot = ddcSlot(display);
+  if (slot == NULL || slot->floorRaw < 0) {
+    return -1;
+  }
+  if (slot->floorRaw == 0) {
+    return 0;
+  }
+  int scale = ddcScale(__atomic_load_n(&slot->max, __ATOMIC_ACQUIRE));
+  return ddcRawPercent(slot->floorRaw, scale);
+}
+
+static const long kCombinedSwitch = 50;
+
+static long lampToCombined(long lamp, long floor) {
+  if (floor < 0) {
+    floor = 0;
+  }
+  if (lamp < floor) {
+    lamp = floor;
+  }
+  if (lamp > 100) {
+    lamp = 100;
+  }
+  long room = 100 - floor;
+  if (room <= 0) {
+    return kCombinedSwitch;
+  }
+  return kCombinedSwitch + ((lamp - floor) * (100 - kCombinedSwitch)) / room;
+}
+
+static void combinedLevels(long percent, long floor, long *hardware, long *software) {
+  if (floor < 0) {
+    floor = 0;
+  }
+  if (floor > 99) {
+    floor = 99;
+  }
+  if (percent >= kCombinedSwitch) {
+    long rise = percent - kCombinedSwitch;
+    *hardware = floor + ((100 - floor) * rise) / (100 - kCombinedSwitch);
+    *software = 100;
+    return;
+  }
+  *hardware = floor;
+  *software = (percent * 100) / kCombinedSwitch;
+}
+
+static long ddcShownPercent(uint32_t display) {
+  DDCSlot *slot = ddcSlot(display);
+  if (slot == NULL) {
+    return -1;
+  }
+  if (slot->combined >= 0 && slot->combined <= 100) {
+    return slot->combined;
+  }
+  int max = __atomic_load_n(&slot->max, __ATOMIC_ACQUIRE);
+  if (max <= 0) {
+    return -1;
+  }
+  long floor = slot->floorRaw > 0 ? ddcRawPercent(slot->floorRaw, max) : 0;
+  return lampToCombined(ddcRawPercent(slot->current, max), floor);
+}
+
+static void ddcRememberCombined(uint32_t display, long percent) {
+  DDCSlot *slot = ddcSlot(display);
+  if (slot == NULL) {
+    return;
+  }
+  slot->combined = (int)percent;
+}
+
+static BOOL ddcReportsCombined(uint32_t display) {
+  DDCSlot *slot = ddcSlot(display);
+  return slot != NULL && slot->combined >= 0;
+}
+
+static BOOL ddcSet(uint32_t display, long percent, long *landedPercent) {
+  DDCSlot *slot = ddcSlot(display);
+  if (slot == NULL) {
+    return NO;
+  }
+  int scale = ddcScale(__atomic_load_n(&slot->max, __ATOMIC_ACQUIRE));
+  int before = slot->current;
+  int value = ddcValue(percent, scale);
+  if (!ddcWriteOnce(slot->service, value)) {
+    return NO;
+  }
+  int readCurrent = 0;
+  int readMax = 0;
+  if (!ddcReadOnce(slot->service, &readCurrent, &readMax) || readMax <= 0) {
+    ddcCommit(slot, value, scale);
+    if (landedPercent != NULL) {
+      *landedPercent = percent;
     }
-    gDDC[i].current = value;
     return YES;
   }
-  return NO;
+  int wanted = ddcValue(percent, readMax);
+  if (wanted != value && ddcNear(readCurrent, value, readMax) &&
+      ddcWriteOnce(slot->service, wanted)) {
+    int corrected = 0;
+    int correctedMax = 0;
+    if (ddcReadOnce(slot->service, &corrected, &correctedMax) && correctedMax > 0) {
+      readCurrent = corrected;
+      readMax = correctedMax;
+      wanted = ddcValue(percent, readMax);
+    } else {
+      ddcCommit(slot, wanted, readMax);
+      if (landedPercent != NULL) {
+        *landedPercent = percent;
+      }
+      return YES;
+    }
+  }
+  ddcCommit(slot, readCurrent, readMax);
+  ddcNoteMove(slot, before, wanted, readCurrent, readMax, percent);
+  if (landedPercent != NULL) {
+    *landedPercent = ddcRawPercent(readCurrent, readMax);
+  }
+  return YES;
 }
 
 static BOOL externalNeedsDDC(void) {
   for (int i = 0; i < 8; i++) {
-    if (gDDC[i].display != 0 &&
-        __atomic_load_n(&gDDC[i].max, __ATOMIC_ACQUIRE) < 0) {
+    if (gDDC[i].display == 0) {
+      continue;
+    }
+    int max = __atomic_load_n(&gDDC[i].max, __ATOMIC_ACQUIRE);
+    if (max < 0 || (gDDC[i].service != NULL && max <= 0)) {
       return YES;
     }
   }
   return NO;
 }
 
+static BOOL shadeLogical(uint32_t display, float *level);
+
 static BOOL readDisplayBrightness(uint32_t display, float *level, BOOL *writable) {
   float value = 0;
+  long shown = ddcShownPercent(display);
+  if (shown >= 0) {
+    if (level != NULL) {
+      *level = (float)shown / 100.0f;
+    }
+    if (writable != NULL) {
+      *writable = YES;
+    }
+    return YES;
+  }
+  if (!DisplayServicesCanChangeBrightness(display) && shadeLogical(display, &value)) {
+    if (level != NULL) {
+      *level = value;
+    }
+    if (writable != NULL) {
+      *writable = YES;
+    }
+    return YES;
+  }
   if (DisplayServicesGetBrightness(display, &value) == 0) {
     if (level != NULL) {
       *level = value;
@@ -1499,7 +1779,8 @@ static BOOL readDisplayBrightness(uint32_t display, float *level, BOOL *writable
     }
     return YES;
   }
-  if (ddcFailed(display) && screenForDisplay(display) != nil) {
+  if ((ddcFailed(display) || ddcUnconfirmed(display)) &&
+      screenForDisplay(display) != nil) {
     NSNumber *saved = gSoftwareBrightness[@(display)];
     if (level != NULL) {
       *level = saved == nil ? 1.0f : saved.floatValue;
@@ -1578,10 +1859,33 @@ static void applyDim(uint32_t display, long percent) {
   }
   [shade setFrame:screen.frame display:NO];
   shade.level = kCGMaximumWindowLevel;
-  shade.alphaValue = (CGFloat)(100 - percent) / 100.0;
+  CGFloat alpha = (CGFloat)(100 - percent) / 100.0;
+  if (shade.isVisible) {
+    [NSAnimationContext runAnimationGroup:^(NSAnimationContext *context) {
+      context.duration = 0.12;
+      shade.animator.alphaValue = alpha;
+    }];
+  } else {
+    shade.alphaValue = alpha;
+  }
   [shade orderFront:nil];
   gSoftwareBrightness[key] = @((float)percent / 100.0f);
   liftBrightnessHUD();
+}
+
+static BOOL shadeLogical(uint32_t display, float *level) {
+  NSWindow *shade = gShades[@(display)];
+  if (shade == nil || !shade.isVisible) {
+    return NO;
+  }
+  NSNumber *saved = gSoftwareBrightness[@(display)];
+  if (saved == nil) {
+    return NO;
+  }
+  if (level != NULL) {
+    *level = saved.floatValue;
+  }
+  return YES;
 }
 
 static const long kSoftwareDimFloor = 10;
@@ -1621,17 +1925,35 @@ static BOOL setDisplayBrightness(uint32_t display, long percent) {
       return finishBrightness(display, percent);
     }
   }
-  if (ddcSet(display, percent)) {
+  long floor = ddcFloorPercent(display);
+  long hardware = percent;
+  long software = 100;
+  combinedLevels(percent, floor, &hardware, &software);
+  long landed = hardware;
+  if (ddcSet(display, hardware, &landed)) {
     restoreGamma(display);
-    applyDim(display, 100);
+    long learned = ddcFloorPercent(display);
+    if (learned != floor) {
+      combinedLevels(percent, learned, &hardware, &software);
+      if (hardware != landed && !ddcSet(display, hardware, &landed)) {
+        return NO;
+      }
+    }
+    ddcRememberCombined(display, percent);
+    applyDim(display, software);
     return finishBrightness(display, percent);
   }
   if (ddcReady(display)) {
     return NO;
   }
-  if (ddcFailed(display) && screenForDisplay(display) != nil) {
+  if ((ddcFailed(display) || ddcUnconfirmed(display)) &&
+      screenForDisplay(display) != nil) {
     restoreGamma(display);
-    percent = softwareDimPercent(display, percent);
+    if (ddcUnconfirmed(display) && percent < kSoftwareDimFloor) {
+      percent = kSoftwareDimFloor;
+    } else {
+      percent = softwareDimPercent(display, percent);
+    }
     applyDim(display, percent);
     return finishBrightness(display, percent);
   }
@@ -1708,6 +2030,7 @@ static void forgetOfflineDisplays(void) {
     [gSoftwareBrightness removeObjectForKey:key];
   }
   liftBrightnessHUD();
+  noteCursorDisplaysOffline();
 }
 
 static void refitDimWindows(void) {
@@ -1744,6 +2067,10 @@ static void restoreSavedBrightness(void) {
     }
     gSoftwareBrightness[@(ids[i])] = saved;
     long percent = lround(saved.doubleValue * 100.0);
+    NSString *savedKey = displayBrightnessKey(ids[i]);
+    if (gCombinedBrightness == nil || ![gCombinedBrightness containsObject:savedKey]) {
+      percent = lampToCombined(percent, 0);
+    }
     if (percent >= 100) {
       markDisplayRestored(ids[i]);
       continue;
@@ -2359,8 +2686,12 @@ static BOOL handleControl(const char *buf, int fd) {
       dprintf(fd, "failed\n");
       return YES;
     }
-    showBrightnessHUD(display, softwareDimPercent(display, percent));
-    dprintf(fd, "%u %ld\n", display, softwareDimPercent(display, percent));
+    long shown = readPercent(display);
+    if (shown < 0) {
+      shown = softwareDimPercent(display, percent);
+    }
+    showBrightnessHUD(display, shown);
+    dprintf(fd, "%u %ld\n", display, shown);
     return YES;
   }
   if (strcmp(buf, "keys") == 0) {
@@ -3709,8 +4040,9 @@ static void openBrightnessKeyAccess(void) {
   NSView *displays = [self pageWithViews:@[
     [self heading:@"Brightness keys"], self.keysStatus, self.keysButton, keysBody,
     [self heading:@"External displays"],
-    [self bodyLabel:@"When a monitor does not answer brightness commands, Nightshift dims "
-                    @"the picture. Turn on DDC/CI in the monitor menu to change the backlight."]
+    [self bodyLabel:@"The lower half of the range dims the picture after the backlight "
+                    @"is as low as it will go. Turn on DDC/CI in the monitor menu to change "
+                    @"the backlight."]
   ]];
   NSStackView *displaysStack = displays.subviews.firstObject;
   [displaysStack setCustomSpacing:18 afterView:keysBody];
@@ -4482,6 +4814,16 @@ static void openBrightnessKeyAccess(void) {
     return;
   }
   if (sliderSettled()) {
+    long shown = readPercent(display);
+    if (shown >= 0) {
+      slider.doubleValue = shown;
+      for (DisplayRow *row in self.panel.displayRows) {
+        if (row.display == display) {
+          row.valueLabel.stringValue = [NSString stringWithFormat:@"%ld%%", shown];
+          break;
+        }
+      }
+    }
     self.panel.trackingDisplay = 0;
   }
 }
@@ -4643,6 +4985,187 @@ static uint32_t builtinDisplay(void) {
   return 0;
 }
 
+static uint32_t gCursorHiddenDisplay = 0;
+static uint32_t gBlackCursorDisplay = 0;
+static NSTimer *gCursorHideTimer = nil;
+static id gCursorMonitor = nil;
+static CFMachPortRef gCursorTap = NULL;
+
+static void allowBackgroundCursor(void) {
+  static BOOL ready = NO;
+  if (ready) {
+    return;
+  }
+  typedef int (*SetProp)(int, int, CFStringRef, CFTypeRef);
+  typedef int (*Conn)(void);
+  SetProp setp = dlsym(RTLD_DEFAULT, "SLSSetConnectionProperty");
+  Conn conn = dlsym(RTLD_DEFAULT, "_SLSDefaultConnection");
+  if (setp == NULL || conn == NULL) {
+    return;
+  }
+  int cid = conn();
+  if (setp(cid, cid, CFSTR("SetsCursorInBackground"), kCFBooleanTrue) == 0) {
+    ready = YES;
+  }
+}
+
+static void showHiddenCursor(void) {
+  if (gCursorHiddenDisplay == 0) {
+    return;
+  }
+  allowBackgroundCursor();
+  CGDisplayShowCursor(gCursorHiddenDisplay);
+  gCursorHiddenDisplay = 0;
+}
+
+static void hideCursorOn(uint32_t display) {
+  if (display == 0 || gCursorHiddenDisplay == display) {
+    return;
+  }
+  showHiddenCursor();
+  allowBackgroundCursor();
+  if (CGDisplayHideCursor(display) != kCGErrorSuccess) {
+    return;
+  }
+  gCursorHiddenDisplay = display;
+}
+
+static void cancelCursorHide(void) {
+  [gCursorHideTimer invalidate];
+  gCursorHideTimer = nil;
+}
+
+static BOOL displayIsBlack(uint32_t display) {
+  return display != 0 && display == gBlackCursorDisplay && !CGDisplayIsBuiltin(display) &&
+         readPercent(display) == 0;
+}
+
+static void scheduleCursorHide(void) {
+  if (gCursorHideTimer != nil) {
+    [gCursorHideTimer setFireDate:[NSDate dateWithTimeIntervalSinceNow:1]];
+    return;
+  }
+  gCursorHideTimer = [NSTimer scheduledTimerWithTimeInterval:1
+                                                      repeats:NO
+                                                        block:^(NSTimer *timer) {
+                                                          (void)timer;
+                                                          gCursorHideTimer = nil;
+                                                          uint32_t under = displayUnderPointer();
+                                                          if (displayIsBlack(under)) {
+                                                            hideCursorOn(under);
+                                                          }
+                                                        }];
+}
+
+static void pokeCursor(void) {
+  if (gBlackCursorDisplay == 0 && gCursorHiddenDisplay == 0) {
+    return;
+  }
+  uint32_t under = displayUnderPointer();
+  if (!displayIsBlack(under)) {
+    cancelCursorHide();
+    showHiddenCursor();
+    return;
+  }
+  showHiddenCursor();
+  scheduleCursorHide();
+}
+
+static CGEventRef cursorTapEvent(CGEventTapProxy proxy, CGEventType type, CGEventRef event,
+                                 void *user) {
+  (void)proxy;
+  (void)user;
+  if (type == kCGEventTapDisabledByTimeout || type == kCGEventTapDisabledByUserInput) {
+    if (gCursorTap != NULL) {
+      CGEventTapEnable(gCursorTap, true);
+    }
+    return event;
+  }
+  if (gBlackCursorDisplay != 0 || gCursorHiddenDisplay != 0) {
+    pokeCursor();
+  }
+  return event;
+}
+
+static void watchCursor(void) {
+  if (gCursorTap == NULL) {
+    CGEventMask moved = CGEventMaskBit(kCGEventMouseMoved) | CGEventMaskBit(kCGEventLeftMouseDragged) |
+                        CGEventMaskBit(kCGEventRightMouseDragged) |
+                        CGEventMaskBit(kCGEventOtherMouseDragged) | CGEventMaskBit(kCGEventLeftMouseDown) |
+                        CGEventMaskBit(kCGEventRightMouseDown) | CGEventMaskBit(kCGEventOtherMouseDown) |
+                        CGEventMaskBit(kCGEventScrollWheel);
+    CGEventTapLocation places[2] = {kCGHIDEventTap, kCGSessionEventTap};
+    for (int i = 0; i < 2 && gCursorTap == NULL; i++) {
+      gCursorTap = CGEventTapCreate(places[i], kCGHeadInsertEventTap, kCGEventTapOptionListenOnly,
+                                    moved, cursorTapEvent, NULL);
+    }
+    if (gCursorTap != NULL) {
+      CFRunLoopSourceRef source =
+          CFMachPortCreateRunLoopSource(kCFAllocatorDefault, gCursorTap, 0);
+      CFRunLoopAddSource(CFRunLoopGetMain(), source, kCFRunLoopCommonModes);
+      CFRelease(source);
+      CGEventTapEnable(gCursorTap, true);
+    }
+  }
+  if (gCursorMonitor != nil) {
+    return;
+  }
+  NSEventMask mask = NSEventMaskMouseMoved | NSEventMaskLeftMouseDragged |
+                     NSEventMaskRightMouseDragged | NSEventMaskOtherMouseDragged |
+                     NSEventMaskLeftMouseDown | NSEventMaskRightMouseDown |
+                     NSEventMaskOtherMouseDown | NSEventMaskScrollWheel;
+  gCursorMonitor = [NSEvent addGlobalMonitorForEventsMatchingMask:mask
+                                                          handler:^(NSEvent *event) {
+                                                            (void)event;
+                                                            pokeCursor();
+                                                          }];
+}
+
+static void noteCursorBrightness(uint32_t display, long percent) {
+  if (![NSThread isMainThread]) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+      noteCursorBrightness(display, percent);
+    });
+    return;
+  }
+  if (display == 0 || CGDisplayIsBuiltin(display)) {
+    return;
+  }
+  if (percent <= 0) {
+    gBlackCursorDisplay = display;
+    watchCursor();
+    cancelCursorHide();
+    if (displayUnderPointer() == display) {
+      hideCursorOn(display);
+    }
+    return;
+  }
+  if (gBlackCursorDisplay == display) {
+    gBlackCursorDisplay = 0;
+    cancelCursorHide();
+    showHiddenCursor();
+  }
+}
+
+static void noteCursorDisplaysOffline(void) {
+  if (gBlackCursorDisplay == 0 && gCursorHiddenDisplay == 0) {
+    return;
+  }
+  BOOL online = NO;
+  uint32_t watched = gBlackCursorDisplay != 0 ? gBlackCursorDisplay : gCursorHiddenDisplay;
+  for (NSScreen *screen in NSScreen.screens) {
+    if ([screen.deviceDescription[@"NSScreenNumber"] unsignedIntValue] == watched) {
+      online = YES;
+      break;
+    }
+  }
+  if (!online) {
+    gBlackCursorDisplay = 0;
+    cancelCursorHide();
+    showHiddenCursor();
+  }
+}
+
 static long readPercent(uint32_t display) {
   float level = 0;
   BOOL writable = NO;
@@ -4653,8 +5176,7 @@ static long readPercent(uint32_t display) {
   return (long)llround(level * 100.0);
 }
 
-static long steppedPercent(long percent, int direction) {
-  const long stops = 32;
+static long steppedPercent(long percent, int direction, long stops) {
   long steps = (percent * stops + stops / 2) / 100 + direction;
   if (steps < 0) {
     steps = 0;
@@ -4707,12 +5229,20 @@ static BOOL stepActiveBrightness(int direction) {
     }
     return NO;
   }
-  long next = softwareDimPercent(display, steppedPercent(percent, direction));
+  long next = ddcReady(display) ? steppedPercent(percent, direction, 16)
+                               : softwareDimPercent(display, steppedPercent(percent, direction, 32));
   if (next != percent && !setDisplayBrightness(display, next)) {
     return NO;
   }
+  long shown = next;
+  if (next != percent) {
+    long landed = readPercent(display);
+    if (landed >= 0) {
+      shown = landed;
+    }
+  }
   rememberBuiltin();
-  showBrightnessHUD(display, next);
+  showBrightnessHUD(display, shown);
   if (gMenu != nil && gMenu.menuOpen && !gMenu.tracking) {
     [gMenu refresh];
   }
@@ -4902,6 +5432,10 @@ static char gSockPath[sizeof(((struct sockaddr_un *)0)->sun_path)];
 
 static void stopDaemon(int sig) {
   (void)sig;
+  if (gCursorHiddenDisplay != 0) {
+    CGDisplayShowCursor(gCursorHiddenDisplay);
+    gCursorHiddenDisplay = 0;
+  }
   if (gSockPath[0] != '\0') {
     unlink(gSockPath);
   }
