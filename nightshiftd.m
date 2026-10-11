@@ -37,10 +37,10 @@ extern IOReturn IOAVServiceWriteI2C(IOAVServiceRef service, uint32_t chip,
 
 static BOOL brightnessKeysReady(void);
 static long readPercent(uint32_t display);
-static BOOL ddcReportsCombined(uint32_t display);
 static long ddcShownPercent(uint32_t display);
 static void noteCursorBrightness(uint32_t display, long percent);
 static void noteCursorDisplaysOffline(void);
+static void teardownDaemon(void);
 static void startBrightnessKeys(void);
 static BOOL handleControl(const char *buf, int fd);
 extern int SLSGetAppearanceThemeLegacy(void);
@@ -90,6 +90,7 @@ static NSString *gRampPath = nil;
 static NSString *gBrightnessPath = nil;
 static int gRampClock = -1;
 static NSString *gPending = nil;
+static BOOL gPendingPlain = NO;
 static long gMax = 50;
 static BOOL gMaxKnown = NO;
 static BOOL gBannerReady = NO;
@@ -262,12 +263,14 @@ static int glideEnd(int now, int scheduleEnd) {
   return (now + kGlideMinutes) % 1440;
 }
 
-static void sendBanner(NSString *body) {
+static void sendBanner(NSString *body, BOOL controls) {
   UNMutableNotificationContent *content =
       [[UNMutableNotificationContent alloc] init];
   content.title = @"Night Shift";
   content.body = body;
-  content.categoryIdentifier = kCategory;
+  if (controls) {
+    content.categoryIdentifier = kCategory;
+  }
   if ([content respondsToSelector:@selector(setShouldDisplayActionsInline:)]) {
     [content setShouldDisplayActionsInline:YES];
   }
@@ -288,16 +291,23 @@ static void sendBanner(NSString *body) {
        }];
 }
 
-static void notify(NSString *body) {
+static void postBanner(NSString *body, BOOL controls) {
   fprintf(stderr, "%s\n", body.UTF8String);
   if (gBannerReady) {
-    sendBanner(body);
+    sendBanner(body, controls);
     return;
   }
   if (NSBundle.mainBundle.bundleIdentifier != nil && !gBannerDenied) {
     gPending = body;
+    gPendingPlain = !controls;
   }
 }
+
+static void notify(NSString *body) { postBanner(body, YES); }
+
+// For banners that ask the user to do something elsewhere, such as granting
+// a permission, where Set Max and Set Time make no sense.
+static void notifyPlain(NSString *body) { postBanner(body, NO); }
 
 static void reportWarmth(long warmth) {
   gSeenWarmth = warmth;
@@ -710,7 +720,7 @@ static BOOL setRampClock(int minute) {
   BOOL scheduled = scheduleNow(&start, &end, &now, &inWindow, &enabled);
   if (scheduled && aheadOfTurnOn(now, start, minute)) {
     if (!rememberRampClock(minute)) {
-      notify(@"Could not save the time");
+      notifyPlain(@"Could not save the time");
       return NO;
     }
     long current = 0;
@@ -733,7 +743,7 @@ static BOOL setRampClock(int minute) {
     return NO;
   }
   if (!rememberRampClock(minute)) {
-    notify(@"Could not save the time");
+    notifyPlain(@"Could not save the time");
     return NO;
   }
   if (!scheduled || !inWindow || !enabled) {
@@ -843,7 +853,7 @@ static void handleLine(const char *buf, int fd) {
   }
   dispatch_async(dispatch_get_main_queue(), ^{
     if (!rampLicensed()) {
-      notify(rampOffer());
+      notifyPlain(rampOffer());
       completionHandler();
       return;
     }
@@ -852,7 +862,7 @@ static void handleLine(const char *buf, int fd) {
       if (text == nil || !parseMaxText(text, &value)) {
         notify(@"Enter a number from 1 to 100");
       } else if (!rememberMax(value)) {
-        notify(@"Could not save the max");
+        notifyPlain(@"Could not save the max");
       } else {
         noteMax(value);
       }
@@ -1001,6 +1011,55 @@ static int orderedDisplays(uint32_t *ids, int cap) {
 static NSMutableDictionary<NSNumber *, NSNumber *> *gSoftwareBrightness;
 static NSMutableDictionary<NSString *, NSNumber *> *gBrightnessSaved;
 static NSMutableSet<NSString *> *gCombinedBrightness;
+
+// Newest percent per display, for a few displays. Main thread only.
+typedef struct {
+  uint32_t display[8];
+  long percent[8];
+  int count;
+} DisplayPercents;
+
+static BOOL putDisplayPercent(DisplayPercents *table, uint32_t display, long percent) {
+  for (int i = 0; i < table->count; i++) {
+    if (table->display[i] == display) {
+      table->percent[i] = percent;
+      return YES;
+    }
+  }
+  if (table->count >= 8) {
+    return NO;
+  }
+  table->display[table->count] = display;
+  table->percent[table->count] = percent;
+  table->count++;
+  return YES;
+}
+
+static void dropDisplayPercent(DisplayPercents *table, uint32_t display) {
+  for (int i = 0; i < table->count; i++) {
+    if (table->display[i] != display) {
+      continue;
+    }
+    table->count--;
+    table->display[i] = table->display[table->count];
+    table->percent[i] = table->percent[table->count];
+    return;
+  }
+}
+
+// How finishBrightness treats a change. A drag holds each tick in memory and
+// saves once on release. A release on a live DDC channel saves only once the
+// worker reports the lamp write went through (ddcLanded).
+typedef enum {
+  kSaveNow,
+  kSaveHeld,
+  kSaveWhenLanded,
+} BrightnessSaving;
+
+static BrightnessSaving gBrightnessSaving = kSaveNow;
+// Values a drag has applied but not saved yet, kept for teardown.
+static DisplayPercents gHeldBrightness;
+static void forgetLandedSave(uint32_t display);
 static NSScreen *screenForDisplay(uint32_t display);
 
 static NSString *displayBrightnessKey(uint32_t display) {
@@ -1082,21 +1141,32 @@ static BOOL noteBrightness(uint32_t display, long percent) {
   NSString *key = displayBrightnessKey(display);
   gBrightnessSaved[key] = level;
   gSoftwareBrightness[@(display)] = level;
-  if (ddcReportsCombined(display)) {
-    if (gCombinedBrightness == nil) {
-      gCombinedBrightness = [NSMutableSet set];
-    }
-    [gCombinedBrightness addObject:key];
+  // Every save is the percent the user asked for. An unmarked line is a lamp
+  // percent from before that split, and restore must not convert it twice.
+  if (gCombinedBrightness == nil) {
+    gCombinedBrightness = [NSMutableSet set];
   }
+  [gCombinedBrightness addObject:key];
   return saveBrightness();
 }
 
 static BOOL finishBrightness(uint32_t display, long percent) {
   noteCursorBrightness(display, percent);
+  // Anything newer replaces a release still waiting on its lamp write.
+  forgetLandedSave(display);
+  if (gBrightnessSaving == kSaveHeld) {
+    if (gSoftwareBrightness == nil) {
+      gSoftwareBrightness = [NSMutableDictionary dictionary];
+    }
+    gSoftwareBrightness[@(display)] = @(percent / 100.0);
+    putDisplayPercent(&gHeldBrightness, display, percent);
+    return YES;
+  }
+  dropDisplayPercent(&gHeldBrightness, display);
   if (noteBrightness(display, percent)) {
     return YES;
   }
-  notify(@"Could not save brightness");
+  notifyPlain(@"Could not save brightness");
   return NO;
 }
 
@@ -1179,9 +1249,47 @@ typedef struct {
   int floorRaw;
   int combined;
   IOAVServiceRef service;
+  // Main thread owns every field. The worker only reads seq (atomically) to
+  // learn that a newer target has replaced the one it holds.
+  int posted;       // raw lamp value last handed to the worker, -1 unknown
+  unsigned seq;     // bumped for each new target; stale work is dropped
+  unsigned settled; // seq whose readback last landed in this slot
+  int retries;      // corrective writes since the user last moved
+  long postFloor;   // floor the shade was predicted from
+  BOOL saveWaiting; // a drag's release waits on the lamp write to save
+  long savePercent; // the percent that release saves
 } DDCSlot;
 
 static DDCSlot gDDC[8];
+
+// Every I2C transaction (probe reads, lamp writes, readbacks) runs on this
+// one serial queue, so they never interleave on the bus and the main thread
+// never sleeps on the monitor.
+static dispatch_queue_t ddcQueue(void) {
+  static dispatch_queue_t queue = nil;
+  static dispatch_once_t once;
+  dispatch_once(&once, ^{
+    queue = dispatch_queue_create(
+        "nightshift.ddc", dispatch_queue_attr_make_with_qos_class(
+                              DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, 0));
+  });
+  return queue;
+}
+
+// One lamp target in flight. The job holds its own retain on service so a
+// slot can be cleared or replaced while the worker is still using it.
+typedef struct {
+  uint32_t display;
+  IOAVServiceRef service;
+  unsigned seq;
+  long percent;
+  int scale;
+  int value;
+  BOOL wrote;
+  BOOL read;
+  int landed;
+  int max;
+} DDCJob;
 static BOOL gDDCBusy = NO;
 static BOOL gDDCAgain = NO;
 static CFAbsoluteTime gDDCLast = 0;
@@ -1197,18 +1305,201 @@ static uint8_t ddcChecksum(const uint8_t *bytes, int count) {
   return sum;
 }
 
-static IOAVServiceRef serviceMatching(uint32_t model, uint32_t serial) {
+// One DCPAVServiceProxy that might belong to a display.
+typedef struct {
+  uint32_t vendor;   // EDID bytes 8-9, big-endian PNP ID, as CGDisplayVendorNumber
+  uint32_t product;  // EDID bytes 10-11
+  uint32_t serial;   // EDID bytes 12-15, 0 when the monitor leaves it unset
+  BOOL external;     // "Location" is "External", or the property is missing
+  char port[32];     // "dispext0" from the parent "dispext0:dcpav-service-epic:0"
+} DDCCandidate;
+
+// What CoreGraphics knows about the display being matched.
+typedef struct {
+  uint32_t vendor;
+  uint32_t model;
+  uint32_t serial;
+  char port[32];      // "dispext0" from CoreDisplay's IODisplayLocation, "" if unknown
+  int twins;          // online displays with this vendor and model, this one included
+  BOOL serialShared;  // another of those twins reports the same nonzero serial
+} DDCTarget;
+
+// Copies the part of name before stop ("dispext0" from "dispext0@88000000").
+static BOOL ddcPortName(const char *name, char stop, char *out, size_t cap) {
+  size_t length = 0;
+  while (name[length] != '\0' && name[length] != stop) {
+    length++;
+  }
+  if (length == 0 || length >= cap || strncmp(name, "disp", 4) != 0) {
+    out[0] = '\0';
+    return NO;
+  }
+  memcpy(out, name, length);
+  out[length] = '\0';
+  return YES;
+}
+
+// The index of the one candidate that is certainly this display, or -1 when it is
+// ambiguous and the shade should be used. Never trades a known brand for a guess.
+static int ddcPickCandidate(const DDCCandidate *candidates, int count, const DDCTarget *target) {
+  BOOL vendorKnown = target->vendor != 0 && target->vendor != 0xFFFFFFFFu;
+  int sameModel = 0;
+  int lastModel = -1;
+  int samePort = 0;
+  int lastPort = -1;
+  int sameSerial = 0;
+  int lastSerial = -1;
+  for (int i = 0; i < count; i++) {
+    const DDCCandidate *c = &candidates[i];
+    if (!c->external || c->product != target->model ||
+        (vendorKnown && c->vendor != target->vendor)) {
+      continue;
+    }
+    sameModel++;
+    lastModel = i;
+    if (target->port[0] != '\0' && strcmp(c->port, target->port) == 0) {
+      samePort++;
+      lastPort = i;
+    }
+    if (target->serial != 0 && c->serial == target->serial) {
+      sameSerial++;
+      lastSerial = i;
+    }
+  }
+  if (samePort == 1) {
+    const DDCCandidate *c = &candidates[lastPort];
+    if (target->serial != 0 && c->serial != 0 && c->serial != target->serial) {
+      return -1;
+    }
+    return lastPort;
+  }
+  if (sameSerial == 1 && !target->serialShared) {
+    return lastSerial;
+  }
+  if (sameModel == 1 && target->twins <= 1) {
+    return lastModel;
+  }
+  return -1;
+}
+
+typedef CFDictionaryRef (*DisplayInfoFn)(CGDirectDisplayID display);
+
+// Checks the framebuffer's DisplayAttributes against CG's vendor and product.
+// Missing attributes are not a disagreement.
+static BOOL framebufferAgrees(io_registry_entry_t framebuffer, uint32_t vendor, uint32_t model) {
+  CFTypeRef attributes =
+      IORegistryEntryCreateCFProperty(framebuffer, CFSTR("DisplayAttributes"), kCFAllocatorDefault, 0);
+  if (attributes == NULL) {
+    return YES;
+  }
+  BOOL agrees = YES;
+  if (CFGetTypeID(attributes) == CFDictionaryGetTypeID()) {
+    CFTypeRef product = CFDictionaryGetValue(attributes, CFSTR("ProductAttributes"));
+    if (product != NULL && CFGetTypeID(product) == CFDictionaryGetTypeID()) {
+      CFTypeRef legacy = CFDictionaryGetValue(product, CFSTR("LegacyManufacturerID"));
+      CFTypeRef productID = CFDictionaryGetValue(product, CFSTR("ProductID"));
+      int64_t value = 0;
+      if (legacy != NULL && CFGetTypeID(legacy) == CFNumberGetTypeID() &&
+          CFNumberGetValue(legacy, kCFNumberSInt64Type, &value) && vendor != 0 &&
+          vendor != 0xFFFFFFFFu && (uint32_t)value != vendor) {
+        agrees = NO;
+      }
+      if (productID != NULL && CFGetTypeID(productID) == CFNumberGetTypeID() &&
+          CFNumberGetValue(productID, kCFNumberSInt64Type, &value) && (uint32_t)value != model) {
+        agrees = NO;
+      }
+    }
+  }
+  CFRelease(attributes);
+  return agrees;
+}
+
+// Finds which display pipe ("dispext0") drives this display, through the private
+// CoreDisplay info dictionary that MonitorControl also relies on. Leaves out empty
+// when anything is missing or doesn't line up, so matching falls back to EDID data.
+static void displayPort(CGDirectDisplayID display, uint32_t vendor, uint32_t model, char *out,
+                        size_t cap) {
+  static DisplayInfoFn info = NULL;
+  static dispatch_once_t once;
+  out[0] = '\0';
+  dispatch_once(&once, ^{
+    info = (DisplayInfoFn)dlsym(RTLD_DEFAULT, "CoreDisplay_DisplayCreateInfoDictionary");
+    if (info == NULL) {
+      void *lib = dlopen("/System/Library/Frameworks/CoreDisplay.framework/CoreDisplay", RTLD_LAZY);
+      if (lib != NULL) {
+        info = (DisplayInfoFn)dlsym(lib, "CoreDisplay_DisplayCreateInfoDictionary");
+      }
+    }
+  });
+  if (info == NULL) {
+    return;
+  }
+  CFDictionaryRef dict = info(display);
+  if (dict == NULL) {
+    return;
+  }
+  char path[512];
+  CFTypeRef location = CFDictionaryGetValue(dict, CFSTR("IODisplayLocation"));
+  BOOL ok = location != NULL && CFGetTypeID(location) == CFStringGetTypeID() &&
+            CFStringGetCString(location, path, sizeof(path), kCFStringEncodingUTF8);
+  CFRelease(dict);
+  if (!ok) {
+    return;
+  }
+  io_registry_entry_t framebuffer = IORegistryEntryFromPath(kIOMainPortDefault, path);
+  if (framebuffer != MACH_PORT_NULL) {
+    ok = framebufferAgrees(framebuffer, vendor, model);
+    IOObjectRelease(framebuffer);
+    if (!ok) {
+      return;
+    }
+  }
+  // ".../AppleT600xIO/dispext0@88000000/AppleCLCD2" -> "dispext0"
+  char *last = strrchr(path, '/');
+  if (last == NULL || last == path ||
+      (strncmp(last + 1, "AppleCLCD2", 10) != 0 &&
+       strncmp(last + 1, "IOMobileFramebufferShim", 23) != 0)) {
+    return;
+  }
+  *last = '\0';
+  char *pipe = strrchr(path, '/');
+  ddcPortName(pipe != NULL ? pipe + 1 : path, '@', out, cap);
+}
+
+static IOAVServiceRef serviceMatching(const DDCTarget *target) {
   io_iterator_t iter = 0;
   if (IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("DCPAVServiceProxy"),
                                    &iter) != KERN_SUCCESS) {
     return NULL;
   }
   io_service_t service;
-  IOAVServiceRef exact = NULL;
-  IOAVServiceRef modelOnly = NULL;
-  int modelHits = 0;
+  IOAVServiceRef services[8];
+  DDCCandidate candidates[8];
+  int count = 0;
   while ((service = IOIteratorNext(iter))) {
-    IOAVServiceRef av = IOAVServiceCreateWithService(kCFAllocatorDefault, service);
+    DDCCandidate c;
+    memset(&c, 0, sizeof(c));
+    c.external = YES;
+    CFTypeRef location =
+        IORegistryEntryCreateCFProperty(service, CFSTR("Location"), kCFAllocatorDefault, 0);
+    if (location != NULL) {
+      if (CFGetTypeID(location) == CFStringGetTypeID()) {
+        c.external = CFEqual(location, CFSTR("External"));
+      }
+      CFRelease(location);
+    }
+    io_registry_entry_t parent = MACH_PORT_NULL;
+    if (IORegistryEntryGetParentEntry(service, kIOServicePlane, &parent) == KERN_SUCCESS) {
+      io_name_t name;
+      if (IORegistryEntryGetName(parent, name) == KERN_SUCCESS) {
+        ddcPortName(name, ':', c.port, sizeof(c.port));
+      }
+      IOObjectRelease(parent);
+    }
+    IOAVServiceRef av = NULL;
+    if (c.external && count < 8) {
+      av = IOAVServiceCreateWithService(kCFAllocatorDefault, service);
+    }
     IOObjectRelease(service);
     if (av == NULL) {
       continue;
@@ -1223,39 +1514,23 @@ static IOAVServiceRef serviceMatching(uint32_t model, uint32_t serial) {
       continue;
     }
     const uint8_t *bytes = CFDataGetBytePtr(edid);
-    uint32_t product = (uint32_t)(bytes[10] | (bytes[11] << 8));
-    uint32_t edidSerial = (uint32_t)(bytes[12] | (bytes[13] << 8) | (bytes[14] << 16) |
-                                     (bytes[15] << 24));
-    BOOL sameModel = product == model;
-    BOOL sameSerial = serial != 0 && edidSerial == serial;
+    c.vendor = (uint32_t)((bytes[8] << 8) | bytes[9]);
+    c.product = (uint32_t)(bytes[10] | (bytes[11] << 8));
+    c.serial = (uint32_t)(bytes[12] | (bytes[13] << 8) | (bytes[14] << 16) |
+                          ((uint32_t)bytes[15] << 24));
     CFRelease(edid);
-    if (!sameModel) {
-      CFRelease(av);
-      continue;
-    }
-    modelHits++;
-    if (sameSerial && exact == NULL) {
-      exact = av;
-    } else if (modelOnly == NULL) {
-      modelOnly = av;
-    } else {
-      CFRelease(av);
-    }
+    services[count] = av;
+    candidates[count] = c;
+    count++;
   }
   IOObjectRelease(iter);
-  if (exact != NULL) {
-    if (modelOnly != NULL && modelOnly != exact) {
-      CFRelease(modelOnly);
+  int pick = ddcPickCandidate(candidates, count, target);
+  for (int i = 0; i < count; i++) {
+    if (i != pick) {
+      CFRelease(services[i]);
     }
-    return exact;
   }
-  if (modelHits == 1) {
-    return modelOnly;
-  }
-  if (modelOnly != NULL) {
-    CFRelease(modelOnly);
-  }
-  return NULL;
+  return pick >= 0 ? services[pick] : NULL;
 }
 
 static BOOL ddcReadOnce(IOAVServiceRef service, int *current, int *max) {
@@ -1299,6 +1574,11 @@ static void clearDDCSlot(int i) {
   gDDC[i].current = 0;
   gDDC[i].floorRaw = -1;
   gDDC[i].combined = -1;
+  gDDC[i].posted = -1;
+  gDDC[i].retries = 0;
+  gDDC[i].saveWaiting = NO;
+  // Queued work for the old channel sees a new seq and drops out.
+  gDDC[i].settled = __atomic_add_fetch(&gDDC[i].seq, 1, __ATOMIC_ACQ_REL);
   if (service != NULL) {
     CFRelease(service);
   }
@@ -1319,6 +1599,10 @@ static void publishDDC(uint32_t display, IOAVServiceRef service, int current, in
     gDDC[i].display = display;
     gDDC[i].service = service;
     gDDC[i].current = current;
+    gDDC[i].posted = max > 0 ? current : -1;
+    gDDC[i].retries = 0;
+    gDDC[i].saveWaiting = NO;
+    gDDC[i].settled = __atomic_add_fetch(&gDDC[i].seq, 1, __ATOMIC_ACQ_REL);
     __atomic_store_n(&gDDC[i].max, max, __ATOMIC_RELEASE);
     return;
   }
@@ -1366,6 +1650,52 @@ static BOOL ddcHasService(uint32_t display) {
   return NO;
 }
 
+// Main thread. The slots as they were when a probe was sent, so its results
+// can tell whether a write, a clear or a replug moved a slot on while the
+// reads were out. The worker reads only this copy, never gDDC.
+typedef struct {
+  uint32_t display[8];
+  unsigned seq[8];
+  int max[8];
+} DDCSnapshot;
+
+static DDCSnapshot ddcSnapshot(void) {
+  DDCSnapshot snap;
+  for (int i = 0; i < 8; i++) {
+    snap.display[i] = gDDC[i].display;
+    snap.seq[i] = __atomic_load_n(&gDDC[i].seq, __ATOMIC_ACQUIRE);
+    snap.max[i] = __atomic_load_n(&gDDC[i].max, __ATOMIC_ACQUIRE);
+  }
+  return snap;
+}
+
+static BOOL snapshotReady(const DDCSnapshot *snap, uint32_t display) {
+  for (int i = 0; i < 8; i++) {
+    if (snap->display[i] == display && snap->max[i] > 0) {
+      return YES;
+    }
+  }
+  return NO;
+}
+
+// Main thread. A probe result is older than any confirmation or seq bump
+// that happened after the snapshot, and must not be published over it.
+static BOOL ddcMovedSince(const DDCSnapshot *snap, uint32_t display) {
+  if (ddcReady(display)) {
+    return YES;
+  }
+  for (int i = 0; i < 8; i++) {
+    if (snap->display[i] != display) {
+      continue;
+    }
+    if (gDDC[i].display != display ||
+        __atomic_load_n(&gDDC[i].seq, __ATOMIC_ACQUIRE) != snap->seq[i]) {
+      return YES;
+    }
+  }
+  return NO;
+}
+
 static BOOL ddcPending(uint32_t display) {
   if (display == 0 || CGDisplayIsBuiltin(display)) {
     return NO;
@@ -1385,6 +1715,7 @@ static BOOL ddcNeedsProbe(void) {
 }
 
 static void restoreSavedBrightness(void);
+static void applyDeferredBrightness(void);
 static void refreshMenu(void);
 static BOOL stepActiveBrightness(int direction);
 
@@ -1414,20 +1745,35 @@ static void probeDDC(void) {
   }
   gDDCBusy = YES;
   gDDCLast = CFAbsoluteTimeGetCurrent();
-  dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+  DDCSnapshot seen = ddcSnapshot();
+  // On the DDC queue so probe reads can't overlap a lamp write.
+  dispatch_async(ddcQueue(), ^{
     uint32_t ids[16];
     int count = orderedDisplays(ids, 16);
     uint32_t targets[8];
-    uint32_t models[8];
-    uint32_t serials[8];
+    DDCTarget wanted[8];
     int pending = 0;
     for (int i = 0; i < count && pending < 8; i++) {
-      if (CGDisplayIsBuiltin(ids[i]) || ddcReady(ids[i])) {
+      if (CGDisplayIsBuiltin(ids[i]) || snapshotReady(&seen, ids[i])) {
         continue;
       }
+      DDCTarget *t = &wanted[pending];
+      memset(t, 0, sizeof(*t));
+      t->vendor = CGDisplayVendorNumber(ids[i]);
+      t->model = CGDisplayModelNumber(ids[i]);
+      t->serial = CGDisplaySerialNumber(ids[i]);
+      for (int j = 0; j < count; j++) {
+        if (CGDisplayIsBuiltin(ids[j]) || CGDisplayVendorNumber(ids[j]) != t->vendor ||
+            CGDisplayModelNumber(ids[j]) != t->model) {
+          continue;
+        }
+        t->twins++;
+        if (j != i && t->serial != 0 && CGDisplaySerialNumber(ids[j]) == t->serial) {
+          t->serialShared = YES;
+        }
+      }
+      displayPort(ids[i], t->vendor, t->model, t->port, sizeof(t->port));
       targets[pending] = ids[i];
-      models[pending] = CGDisplayModelNumber(ids[i]);
-      serials[pending] = CGDisplaySerialNumber(ids[i]);
       pending++;
     }
     typedef struct {
@@ -1438,7 +1784,7 @@ static void probeDDC(void) {
     } DDCResult;
     DDCResult *results = pending > 0 ? calloc((size_t)pending, sizeof(DDCResult)) : NULL;
     for (int i = 0; i < pending; i++) {
-      IOAVServiceRef service = serviceMatching(models[i], serials[i]);
+      IOAVServiceRef service = serviceMatching(&wanted[i]);
       int current = 0;
       int max = 0;
       BOOL ok = NO;
@@ -1454,6 +1800,21 @@ static void probeDDC(void) {
     }
     dispatch_async(dispatch_get_main_queue(), ^{
       for (int i = 0; i < pending; i++) {
+        // A write confirmed or moved this channel while the probe was out, so
+        // these reads are stale. Publishing them would reset current and
+        // posted and drop queued writes. The result owns its service.
+        if (ddcMovedSince(&seen, results[i].display)) {
+          if (results[i].service != NULL) {
+            CFRelease(results[i].service);
+          }
+          // A failed write left it unconfirmed: read it again now rather
+          // than at the next menu open.
+          if (ddcUnconfirmed(results[i].display)) {
+            gDDCAgain = YES;
+            gDDCLast = 0;
+          }
+          continue;
+        }
         if (results[i].service == NULL && ddcHasService(results[i].display)) {
           continue;
         }
@@ -1465,6 +1826,7 @@ static void probeDDC(void) {
       BOOL again = gDDCAgain;
       gDDCAgain = NO;
       restoreSavedBrightness();
+      applyDeferredBrightness();
       applyPendingBrightnessKeys();
       refreshMenu();
       if (again) {
@@ -1666,52 +2028,104 @@ static void ddcRememberCombined(uint32_t display, long percent) {
   slot->combined = (int)percent;
 }
 
-static BOOL ddcReportsCombined(uint32_t display) {
-  DDCSlot *slot = ddcSlot(display);
-  return slot != NULL && slot->combined >= 0;
+// The floor came from a raw readback. Reuse that raw value so a round trip
+// through percent can't miss it by one and force a write that changes nothing.
+static int ddcLampValue(DDCSlot *slot, long percent, long floor, int scale) {
+  if (floor > 0 && percent == floor && slot->floorRaw > 0 && slot->floorRaw <= scale) {
+    return slot->floorRaw;
+  }
+  return ddcValue(percent, scale);
 }
 
-static BOOL ddcSet(uint32_t display, long percent, long *landedPercent) {
+// Worker only. Reads back what the monitor applied and, when it reports a
+// different scale than the write assumed, makes the one corrective write.
+static void ddcConfirm(DDCJob *job) {
+  int current = 0;
+  int max = 0;
+  job->read = NO;
+  if (!ddcReadOnce(job->service, &current, &max) || max <= 0) {
+    return;
+  }
+  int wanted = ddcValue(job->percent, max);
+  if (wanted != job->value && ddcNear(current, job->value, max) &&
+      ddcWriteOnce(job->service, wanted)) {
+    job->value = wanted;
+    job->scale = max;
+    int corrected = 0;
+    int correctedMax = 0;
+    if (!ddcReadOnce(job->service, &corrected, &correctedMax) || correctedMax <= 0) {
+      return;
+    }
+    current = corrected;
+    max = correctedMax;
+  }
+  job->read = YES;
+  job->landed = current;
+  job->max = max;
+}
+
+// Main thread. Folds a finished job into the slot and returns the lamp
+// percent that landed. An unreadable monitor keeps the written value and
+// latches the assumed scale, as before.
+static long ddcSettle(DDCSlot *slot, const DDCJob *job) {
+  slot->settled = job->seq;
+  if (!job->read) {
+    ddcCommit(slot, job->value, job->scale);
+    slot->posted = job->value;
+    return job->percent;
+  }
+  int before = slot->current;
+  ddcCommit(slot, job->landed, job->max);
+  ddcNoteMove(slot, before, ddcValue(job->percent, job->max), job->landed, job->max,
+              job->percent);
+  slot->posted = job->landed;
+  return ddcRawPercent(job->landed, job->max);
+}
+
+// Main thread, blocking: write and confirm before returning. Used where the
+// caller must report the landed value (CLI) or a failed write must fall back
+// to the shade (unconfirmed channel). The I2C still runs on the DDC queue.
+static BOOL ddcSet(uint32_t display, long percent, long floor, long *landedPercent) {
   DDCSlot *slot = ddcSlot(display);
   if (slot == NULL) {
     return NO;
   }
-  int scale = ddcScale(__atomic_load_n(&slot->max, __ATOMIC_ACQUIRE));
-  int before = slot->current;
-  int value = ddcValue(percent, scale);
-  if (!ddcWriteOnce(slot->service, value)) {
-    return NO;
-  }
-  int readCurrent = 0;
-  int readMax = 0;
-  if (!ddcReadOnce(slot->service, &readCurrent, &readMax) || readMax <= 0) {
-    ddcCommit(slot, value, scale);
+  int max = __atomic_load_n(&slot->max, __ATOMIC_ACQUIRE);
+  int scale = ddcScale(max);
+  int value = ddcLampValue(slot, percent, floor, scale);
+  unsigned latest = __atomic_load_n(&slot->seq, __ATOMIC_ACQUIRE);
+  // The lamp is confirmed at this value and nothing newer is queued.
+  if (max > 0 && slot->settled == latest && value == slot->current &&
+      value == slot->posted) {
     if (landedPercent != NULL) {
-      *landedPercent = percent;
+      *landedPercent = ddcRawPercent(slot->current, max);
     }
     return YES;
   }
-  int wanted = ddcValue(percent, readMax);
-  if (wanted != value && ddcNear(readCurrent, value, readMax) &&
-      ddcWriteOnce(slot->service, wanted)) {
-    int corrected = 0;
-    int correctedMax = 0;
-    if (ddcReadOnce(slot->service, &corrected, &correctedMax) && correctedMax > 0) {
-      readCurrent = corrected;
-      readMax = correctedMax;
-      wanted = ddcValue(percent, readMax);
-    } else {
-      ddcCommit(slot, wanted, readMax);
-      if (landedPercent != NULL) {
-        *landedPercent = percent;
-      }
-      return YES;
+  // Supersede any queued live write so it can't land after this one.
+  __block DDCJob job = {0};
+  job.display = display;
+  job.service = CFRetain(slot->service);
+  job.seq = __atomic_add_fetch(&slot->seq, 1, __ATOMIC_ACQ_REL);
+  job.percent = percent;
+  job.scale = scale;
+  job.value = value;
+  dispatch_sync(ddcQueue(), ^{
+    job.wrote = ddcWriteOnce(job.service, job.value);
+    if (job.wrote) {
+      ddcConfirm(&job);
     }
+  });
+  CFRelease(job.service);
+  // Main was blocked, so the slot can't have been cleared meanwhile.
+  if (!job.wrote) {
+    slot->posted = -1;
+    slot->settled = job.seq;
+    return NO;
   }
-  ddcCommit(slot, readCurrent, readMax);
-  ddcNoteMove(slot, before, wanted, readCurrent, readMax, percent);
+  long landed = ddcSettle(slot, &job);
   if (landedPercent != NULL) {
-    *landedPercent = ddcRawPercent(readCurrent, readMax);
+    *landedPercent = landed;
   }
   return YES;
 }
@@ -1898,7 +2312,143 @@ static long softwareDimPercent(uint32_t display, long percent) {
   return percent;
 }
 
-static BOOL setDisplayBrightness(uint32_t display, long percent) {
+static void ddcPost(uint32_t display, DDCSlot *slot, long percent, long floor);
+
+static void forgetLandedSave(uint32_t display) {
+  DDCSlot *slot = ddcSlot(display);
+  if (slot != NULL) {
+    slot->saveWaiting = NO;
+  }
+}
+
+static void saveLandedBrightness(uint32_t display, DDCSlot *slot) {
+  if (!slot->saveWaiting) {
+    return;
+  }
+  slot->saveWaiting = NO;
+  if (!noteBrightness(display, slot->savePercent)) {
+    notifyPlain(@"Could not save brightness");
+  }
+}
+
+// Main thread. A drag released on a live DDC channel. The shade and number
+// already moved; the save waits for the lamp write, and a failed write leaves
+// the file at its value from before the drag.
+static void saveWhenLanded(uint32_t display, DDCSlot *slot, long percent) {
+  noteCursorBrightness(display, percent);
+  if (gSoftwareBrightness == nil) {
+    gSoftwareBrightness = [NSMutableDictionary dictionary];
+  }
+  gSoftwareBrightness[@(display)] = @(percent / 100.0);
+  dropDisplayPercent(&gHeldBrightness, display);
+  slot->saveWaiting = YES;
+  slot->savePercent = percent;
+  // Nothing in flight: the newest target already landed.
+  if (slot->posted >= 0 && slot->settled == __atomic_load_n(&slot->seq, __ATOMIC_ACQUIRE)) {
+    saveLandedBrightness(display, slot);
+  }
+}
+
+// Main thread. A live write's readback came in. Only the newest target's
+// result counts; anything older was superseded and its successor will settle.
+static void ddcLanded(DDCJob job) {
+  DDCSlot *slot = ddcSlot(job.display);
+  if (slot == NULL || slot->service != job.service ||
+      __atomic_load_n(&slot->seq, __ATOMIC_ACQUIRE) != job.seq) {
+    return;
+  }
+  if (!job.wrote) {
+    // Unknown lamp state: the next move must write rather than skip.
+    slot->posted = -1;
+    slot->settled = job.seq;
+    // The lamp refused a released drag. Keep the saved value.
+    slot->saveWaiting = NO;
+    return;
+  }
+  long floor = slot->postFloor;
+  ddcSettle(slot, &job);
+  saveLandedBrightness(job.display, slot);
+  if (slot->combined < 0 || slot->combined > 100) {
+    return;
+  }
+  long learned = ddcFloorPercent(job.display);
+  long hardware = 0;
+  long software = 100;
+  combinedLevels(slot->combined, learned, &hardware, &software);
+  int scale = ddcScale(__atomic_load_n(&slot->max, __ATOMIC_ACQUIRE));
+  int target = ddcLampValue(slot, hardware, learned, scale);
+  // A newly learned floor moves the split, so the shade follows it. Without
+  // one, a lamp well off target means the write didn't take.
+  BOOL off = learned != floor ? target != slot->current
+                              : !ddcNear(slot->current, target, scale);
+  if (learned != floor) {
+    slot->postFloor = learned;
+    applyDim(job.display, software);
+  }
+  if (off && slot->retries < 2) {
+    slot->retries++;
+    ddcPost(job.display, slot, hardware, learned);
+  }
+}
+
+static void ddcDeliver(DDCJob job) {
+  dispatch_async(dispatch_get_main_queue(), ^{
+    ddcLanded(job);
+    CFRelease(job.service);
+  });
+}
+
+static const int64_t kDDCSettleDelay = (int64_t)(150 * NSEC_PER_MSEC);
+
+// Main thread. Hands the newest lamp target to the worker and returns at once.
+// The worker drops any target that was replaced before it ran, writes the
+// rest, and reads back once the value has been idle for kDDCSettleDelay.
+static void ddcPost(uint32_t display, DDCSlot *slot, long percent, long floor) {
+  int scale = ddcScale(__atomic_load_n(&slot->max, __ATOMIC_ACQUIRE));
+  int value = ddcLampValue(slot, percent, floor, scale);
+  // Already there or already queued, e.g. a move inside the shade range.
+  if (value == slot->posted) {
+    return;
+  }
+  slot->posted = value;
+  unsigned *latest = &slot->seq;
+  DDCJob job = {0};
+  job.display = display;
+  job.service = CFRetain(slot->service);
+  job.seq = __atomic_add_fetch(latest, 1, __ATOMIC_ACQ_REL);
+  job.percent = percent;
+  job.scale = scale;
+  job.value = value;
+  dispatch_async(ddcQueue(), ^{
+    DDCJob work = job;
+    if (__atomic_load_n(latest, __ATOMIC_ACQUIRE) != work.seq) {
+      CFRelease(work.service);
+      return;
+    }
+    work.wrote = ddcWriteOnce(work.service, work.value);
+    if (!work.wrote) {
+      ddcDeliver(work);
+      return;
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, kDDCSettleDelay), ddcQueue(), ^{
+      DDCJob done = work;
+      if (__atomic_load_n(latest, __ATOMIC_ACQUIRE) != done.seq) {
+        CFRelease(done.service);
+        return;
+      }
+      ddcConfirm(&done);
+      ddcDeliver(done);
+    });
+  });
+}
+
+// Brightness asked for on an unconfirmed channel while a probe holds the DDC
+// queue. Writing it then would park the main thread, and the brightness-key
+// tap, behind the probe, so the newest value per display waits here and is
+// applied when the probe lands. Main thread only.
+static DisplayPercents gDeferredBrightness;
+
+static BOOL setDisplayBrightnessWaiting(uint32_t display, long percent, BOOL wait) {
   if (percent < 0) {
     percent = 0;
   }
@@ -1925,19 +2475,56 @@ static BOOL setDisplayBrightness(uint32_t display, long percent) {
       return finishBrightness(display, percent);
     }
   }
+  // Report the value now so the next key step builds on it. The CLI waits
+  // instead, since it prints what landed, and an older deferred value must
+  // not land after it.
+  if (wait) {
+    dropDisplayPercent(&gDeferredBrightness, display);
+  } else if (gDDCBusy && ddcUnconfirmed(display) && putDisplayPercent(&gDeferredBrightness, display, percent)) {
+    if (gSoftwareBrightness == nil) {
+      gSoftwareBrightness = [NSMutableDictionary dictionary];
+    }
+    gSoftwareBrightness[@(display)] = @((float)percent / 100.0f);
+    return YES;
+  }
   long floor = ddcFloorPercent(display);
   long hardware = percent;
   long software = 100;
   combinedLevels(percent, floor, &hardware, &software);
+  DDCSlot *slot = ddcSlot(display);
+  // A confirmed channel is optimistic: shade, number and save happen now and
+  // the worker brings the lamp along. An unconfirmed one still waits, since a
+  // failed write there falls back to the shade below.
+  if (!wait && slot != NULL && __atomic_load_n(&slot->max, __ATOMIC_ACQUIRE) > 0) {
+    slot->retries = 0;
+    slot->postFloor = floor;
+    ddcRememberCombined(display, percent);
+    ddcPost(display, slot, hardware, floor);
+    restoreGamma(display);
+    applyDim(display, software);
+    if (gBrightnessSaving == kSaveWhenLanded) {
+      saveWhenLanded(display, slot, percent);
+      return YES;
+    }
+    return finishBrightness(display, percent);
+  }
   long landed = hardware;
-  if (ddcSet(display, hardware, &landed)) {
+  if (ddcSet(display, hardware, floor, &landed)) {
     restoreGamma(display);
     long learned = ddcFloorPercent(display);
     if (learned != floor) {
-      combinedLevels(percent, learned, &hardware, &software);
-      if (hardware != landed && !ddcSet(display, hardware, &landed)) {
-        return NO;
+      long correctedHardware = hardware;
+      long correctedSoftware = software;
+      combinedLevels(percent, learned, &correctedHardware, &correctedSoftware);
+      // A failed correction leaves the lamp at the first write. Keep that shade.
+      if (correctedHardware == landed ||
+          ddcSet(display, correctedHardware, learned, &landed)) {
+        software = correctedSoftware;
       }
+    }
+    slot = ddcSlot(display);
+    if (slot != NULL) {
+      slot->postFloor = ddcFloorPercent(display);
     }
     ddcRememberCombined(display, percent);
     applyDim(display, software);
@@ -1964,6 +2551,39 @@ static BOOL setDisplayBrightness(uint32_t display, long percent) {
     return finishBrightness(display, percent);
   }
   return NO;
+}
+
+static BOOL setDisplayBrightness(uint32_t display, long percent) {
+  return setDisplayBrightnessWaiting(display, percent, NO);
+}
+
+// Main thread, once a probe has landed and gDDCBusy is clear, so nothing
+// defers again while this runs.
+static void applyDeferredBrightness(void) {
+  DisplayPercents deferred = gDeferredBrightness;
+  gDeferredBrightness.count = 0;
+  for (int i = 0; i < deferred.count; i++) {
+    setDisplayBrightness(deferred.display[i], deferred.percent[i]);
+  }
+}
+
+// Main thread. One tick of a slider or HUD drag: applied, held in memory,
+// not saved.
+static void holdBrightnessTick(uint32_t display, long percent) {
+  gBrightnessSaving = kSaveHeld;
+  setDisplayBrightness(display, percent);
+  gBrightnessSaving = kSaveNow;
+}
+
+// Main thread. A drag ended at percent, on release or when the menu closed
+// under it. This is its one save. A failed set saves nothing, so the file
+// keeps the value from before the drag.
+static BOOL endBrightnessDrag(uint32_t display, long percent) {
+  gBrightnessSaving = kSaveWhenLanded;
+  BOOL ok = setDisplayBrightness(display, percent);
+  gBrightnessSaving = kSaveNow;
+  dropDisplayPercent(&gHeldBrightness, display);
+  return ok;
 }
 
 static BOOL displayWasRestored(uint32_t display) {
@@ -2068,7 +2688,14 @@ static void restoreSavedBrightness(void) {
     gSoftwareBrightness[@(ids[i])] = saved;
     long percent = lround(saved.doubleValue * 100.0);
     NSString *savedKey = displayBrightnessKey(ids[i]);
-    if (gCombinedBrightness == nil || ![gCombinedBrightness containsObject:savedKey]) {
+    BOOL legacyLamp = gCombinedBrightness == nil ||
+                      ![gCombinedBrightness containsObject:savedKey];
+    // An unmarked line from an old file is a lamp percent only if the lamp
+    // takes it. Any DDC channel tries the one-time scale change, even one
+    // whose first readback failed. A shade has no channel and keeps its value.
+    long legacy = percent;
+    BOOL converting = legacyLamp && ddcHasService(ids[i]);
+    if (converting) {
       percent = lampToCombined(percent, 0);
     }
     if (percent >= 100) {
@@ -2086,6 +2713,13 @@ static void restoreSavedBrightness(void) {
       continue;
     }
     if (setDisplayBrightness(ids[i], percent)) {
+      // The write fell back to the shade, so the line was a shade percent
+      // all along. Put it back. Either save marks the line, so no later
+      // launch converts it again. This runs only once a probe has landed,
+      // with gDDCBusy clear, so the set above wrote instead of deferring.
+      if (converting && !ddcReady(ids[i]) && percent != legacy) {
+        setDisplayBrightness(ids[i], legacy);
+      }
       markDisplayRestored(ids[i]);
     }
   }
@@ -2097,6 +2731,29 @@ static BOOL loginItemOn(void) {
 
 static const CGFloat kBrightnessHUDWidth = 312;
 static const CGFloat kBrightnessHUDHeight = 80;
+
+// Text drawn on an accent fill: white, or near-black when the user's accent
+// is light (yellow, light graphite) so it stays readable. Call while drawing,
+// so the accent resolves for the view's appearance.
+static NSColor *textOnAccent(void) {
+  NSColor *accent = [NSColor.controlAccentColor colorUsingColorSpace:NSColorSpace.sRGBColorSpace];
+  if (accent == nil) {
+    return NSColor.whiteColor;
+  }
+  CGFloat r = 0;
+  CGFloat g = 0;
+  CGFloat b = 0;
+  CGFloat a = 0;
+  [accent getRed:&r green:&g blue:&b alpha:&a];
+  CGFloat luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+  return luma > 0.7 ? [NSColor colorWithWhite:0 alpha:0.85] : NSColor.whiteColor;
+}
+
+// Redraws a slider so its accent fill (AccentSliderCell) picks up the
+// current accent color.
+static void tintSlider(NSSlider *slider) {
+  slider.needsDisplay = YES;
+}
 
 @interface BrightnessMeter : NSView
 @property(nonatomic) long percent;
@@ -2197,7 +2854,7 @@ static const CGFloat kBrightnessHUDHeight = 80;
     fillWidth = knobSize / 2.0;
   }
   NSRect fill = NSMakeRect(track.origin.x, sliderY - 2.5, fillWidth, 5);
-  [label setFill];
+  [NSColor.controlAccentColor setFill];
   [[NSBezierPath bezierPathWithRoundedRect:fill xRadius:2.5 yRadius:2.5] fill];
 
   NSRect knobRect = NSMakeRect(fillX - knobSize / 2.0, sliderY - knobSize / 2.0, knobSize, knobSize);
@@ -2324,6 +2981,8 @@ static NSGlassEffectView *gBrightnessGlass = nil;
 static NSTimer *gBrightnessHide = nil;
 static int gBrightnessHUDGeneration = 0;
 static uint32_t gBrightnessDisplay = 0;
+static uint32_t gBrightnessScrubDisplay = 0;
+static long gBrightnessScrubPending = -1;
 static uint32_t gBrightnessAnchor = 0;
 
 static void liftBrightnessHUD(void) {
@@ -2393,6 +3052,8 @@ static void showBrightnessHUD(uint32_t display, long percent) {
     }
     gBrightnessGlass.contentView = gBrightnessMeter;
     gBrightnessMeter.onScrubBegan = ^{
+      gBrightnessScrubDisplay = gBrightnessDisplay;
+      gBrightnessScrubPending = -1;
       gBrightnessHUDGeneration++;
       if (gBrightnessPanel != nil) {
         gBrightnessPanel.alphaValue = 1;
@@ -2400,14 +3061,32 @@ static void showBrightnessHUD(uint32_t display, long percent) {
       [gBrightnessHide invalidate];
       gBrightnessHide = nil;
     };
+    // The scrub loop runs on the main thread. The built-in and a confirmed
+    // DDC external are live because the lamp write goes to the DDC worker,
+    // which keeps only the newest value. Ticks are held, not saved; release
+    // sets the last value again (a no-op if queued) and saves it once.
+    // Any other external still sets once on release, since its write blocks.
     gBrightnessMeter.onScrub = ^(long value) {
-      if (gBrightnessDisplay == 0) {
+      uint32_t display = gBrightnessScrubDisplay;
+      if (display == 0) {
         return;
       }
-      setDisplayBrightness(gBrightnessDisplay, value);
+      gBrightnessScrubPending = value;
+      if (!CGDisplayIsBuiltin(display) && !ddcReady(display)) {
+        return;
+      }
+      holdBrightnessTick(display, value);
       refreshMenu();
     };
     gBrightnessMeter.onScrubEnd = ^{
+      uint32_t display = gBrightnessScrubDisplay;
+      long pending = gBrightnessScrubPending;
+      gBrightnessScrubDisplay = 0;
+      gBrightnessScrubPending = -1;
+      if (display != 0 && pending >= 0) {
+        endBrightnessDrag(display, pending);
+        refreshMenu();
+      }
       scheduleBrightnessHide();
     };
     gBrightnessPanel = [[BrightnessPanel alloc]
@@ -2682,7 +3361,7 @@ static BOOL handleControl(const char *buf, int fd) {
     int consumed = 0;
     if (sscanf(buf + 11, "%u %ld%n", &display, &percent, &consumed) != 2 ||
         buf[11 + consumed] != '\0' || percent < 0 || percent > 100 ||
-        !knownDisplay(display) || !setDisplayBrightness(display, percent)) {
+        !knownDisplay(display) || !setDisplayBrightnessWaiting(display, percent, YES)) {
       dprintf(fd, "failed\n");
       return YES;
     }
@@ -2768,7 +3447,7 @@ static BOOL handleControl(const char *buf, int fd) {
   CGFloat column = 20 * 2 + 3;
   NSSize digit = [@"00" sizeWithAttributes:@{NSFontAttributeName : [self digitFont]}];
   CGFloat row = MAX(column, digit.height + 4);
-  return NSMakeSize(248, row + 32);
+  return NSMakeSize(272, row + 32);
 }
 
 - (BOOL)hasUnconfirmedEdit {
@@ -2922,11 +3601,12 @@ static BOOL handleControl(const char *buf, int fd) {
   self.needsDisplay = YES;
 }
 
-- (NSColor *)digitColor:(BOOL)placeholder {
+- (NSColor *)digitColor:(BOOL)placeholder selected:(BOOL)selected {
+  NSColor *color = selected ? textOnAccent() : NSColor.labelColor;
   if (placeholder) {
-    return [NSColor.labelColor colorWithAlphaComponent:0.35];
+    return [color colorWithAlphaComponent:selected ? 0.55 : 0.35];
   }
-  return NSColor.labelColor;
+  return color;
 }
 
 - (void)drawText:(NSString *)text
@@ -2948,7 +3628,7 @@ static BOOL handleControl(const char *buf, int fd) {
                                                         xRadius:radius
                                                         yRadius:radius];
   NSColor *color = selected
-                       ? NSColor.systemOrangeColor
+                       ? NSColor.controlAccentColor
                        : [NSColor.quaternaryLabelColor colorWithAlphaComponent:0.45];
   [color setFill];
   [path fill];
@@ -2957,7 +3637,7 @@ static BOOL handleControl(const char *buf, int fd) {
 - (void)drawPeriod:(NSString *)title rect:(NSRect)rect selected:(BOOL)selected {
   [self fillRound:rect radius:5 selected:selected];
   NSFont *font = [NSFont systemFontOfSize:12 weight:NSFontWeightSemibold];
-  NSColor *color = selected ? NSColor.labelColor : NSColor.secondaryLabelColor;
+  NSColor *color = selected ? textOnAccent() : NSColor.secondaryLabelColor;
   [self drawText:title inRect:rect color:color font:font];
 }
 
@@ -2965,20 +3645,22 @@ static BOOL handleControl(const char *buf, int fd) {
   (void)dirty;
   [self updateGeometry];
   NSFont *font = [self digitFont];
-  if (self.enabled && self.field == 0) {
+  BOOL hourSelected = self.enabled && self.field == 0;
+  BOOL minuteSelected = self.enabled && self.field == 1;
+  if (hourSelected) {
     [self fillRound:_hourRect radius:8 selected:YES];
   }
-  if (self.enabled && self.field == 1) {
+  if (minuteSelected) {
     [self fillRound:_minuteRect radius:8 selected:YES];
   }
   [self drawText:_hourString
           inRect:_hourRect
-           color:[self digitColor:_hourPlaceholder]
+           color:[self digitColor:_hourPlaceholder selected:hourSelected]
             font:font];
   [self drawText:@":" inRect:_colonRect color:NSColor.secondaryLabelColor font:font];
   [self drawText:_minuteString
           inRect:_minuteRect
-           color:[self digitColor:_minutePlaceholder]
+           color:[self digitColor:_minutePlaceholder selected:minuteSelected]
             font:font];
   [self drawPeriod:@"AM" rect:_amRect selected:!self.hour24 && !self.pm];
   [self drawPeriod:@"PM" rect:_pmRect selected:!self.hour24 && self.pm];
@@ -2992,12 +3674,13 @@ static BOOL handleControl(const char *buf, int fd) {
   NSColor *fill = [NSColor.quaternaryLabelColor colorWithAlphaComponent:0.45];
   NSColor *text = NSColor.secondaryLabelColor;
   if (_savedFlash) {
+    // Green stays: it reports success, not a selection.
     title = @"Saved";
     fill = NSColor.systemGreenColor;
     text = NSColor.whiteColor;
   } else if (pending) {
-    fill = NSColor.systemGreenColor;
-    text = NSColor.whiteColor;
+    fill = NSColor.controlAccentColor;
+    text = textOnAccent();
   }
   NSBezierPath *path = [NSBezierPath bezierPathWithRoundedRect:_confirmRect xRadius:6 yRadius:6];
   [fill setFill];
@@ -3369,10 +4052,62 @@ static BOOL handleControl(const char *buf, int fd) {
 }
 @end
 
+// Draws the bar like the stock Sound menu slider: a rounded grey track with
+// the accent filled from the minimum end to the knob's center. AppKit leaves
+// the fill out in menus (inactive windows), and trackFillColor and
+// tintProminence don't change that, so the bar is drawn here. The knob is
+// still AppKit's.
+@interface AccentSliderCell : NSSliderCell
+@end
+
+@implementation AccentSliderCell
+- (void)drawBarInside:(NSRect)rect flipped:(BOOL)flipped {
+  if (self.numberOfTickMarks > 0 || self.isVertical || self.sliderType != NSSliderTypeLinear) {
+    [super drawBarInside:rect flipped:flipped];
+    return;
+  }
+  // The stock macOS 26/27 bar is 6 pt thick (measured from the Sound menu).
+  // Its length and center line come from AppKit's bar rect.
+  CGFloat thickness = MIN(6, NSHeight(self.controlView.bounds));
+  NSRect track = NSMakeRect(NSMinX(rect), NSMidY(rect) - thickness / 2.0, NSWidth(rect), thickness);
+  CGFloat radius = thickness / 2.0;
+  NSBezierPath *trackPath = [NSBezierPath bezierPathWithRoundedRect:track
+                                                            xRadius:radius
+                                                            yRadius:radius];
+  [NSColor.quaternaryLabelColor setFill];
+  [trackPath fill];
+
+  NSRect knob = [self knobRectFlipped:flipped];
+  CGFloat end = MAX(NSMinX(track), MIN(NSMidX(knob), NSMaxX(track)));
+  NSRect filled = track;
+  filled.size.width = end - NSMinX(track);
+  if (filled.size.width > 0) {
+    NSColor *fill = self.enabled ? NSColor.controlAccentColor : NSColor.tertiaryLabelColor;
+    [NSGraphicsContext saveGraphicsState];
+    [trackPath addClip];
+    [fill setFill];
+    [NSBezierPath fillRect:filled];
+    [NSGraphicsContext restoreGraphicsState];
+  }
+
+  // A faint light rim, as on the stock bar.
+  NSBezierPath *rim = [NSBezierPath bezierPathWithRoundedRect:NSInsetRect(track, 0.5, 0.5)
+                                                      xRadius:radius - 0.5
+                                                      yRadius:radius - 0.5];
+  rim.lineWidth = 1;
+  [[NSColor.whiteColor colorWithAlphaComponent:0.14] setStroke];
+  [rim stroke];
+}
+@end
+
 @interface ReleaseSlider : NSSlider
 @end
 
 @implementation ReleaseSlider
++ (Class)cellClass {
+  return [AccentSliderCell class];
+}
+
 - (void)mouseDown:(NSEvent *)event {
   [super mouseDown:event];
   [self sendAction:self.action to:self.target];
@@ -3388,6 +4123,234 @@ static BOOL handleControl(const char *buf, int fd) {
 @implementation DisplayRow
 @end
 
+// Status menu layout, modelled on the stock Sound menu.
+static const CGFloat kMenuWidth = 300;
+static const CGFloat kMenuMargin = 14;
+static const CGFloat kMenuContentWidth = 272;  // kMenuWidth - 2 * kMenuMargin
+
+// Which menu sections are collapsed, one name per line, kept in the support
+// folder next to max, full and brightness.
+static NSString *sectionsPath(void) {
+  return [[NSHomeDirectory()
+      stringByAppendingPathComponent:@"Library/Application Support/nightshift"]
+      stringByAppendingPathComponent:@"sections"];
+}
+
+static NSMutableSet<NSString *> *readCollapsedSections(void) {
+  NSString *text = [NSString stringWithContentsOfFile:sectionsPath()
+                                             encoding:NSUTF8StringEncoding
+                                                error:NULL];
+  NSMutableSet<NSString *> *names = [NSMutableSet set];
+  for (NSString *line in [text componentsSeparatedByString:@"\n"]) {
+    NSString *name =
+        [line stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if (name.length > 0) {
+      [names addObject:name];
+    }
+  }
+  return names;
+}
+
+static void writeCollapsedSections(NSSet<NSString *> *names) {
+  NSArray<NSString *> *sorted = [names.allObjects sortedArrayUsingSelector:@selector(compare:)];
+  NSString *text = sorted.count == 0
+                       ? @""
+                       : [[sorted componentsJoinedByString:@"\n"] stringByAppendingString:@"\n"];
+  NSString *path = sectionsPath();
+  if (![text writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:NULL]) {
+    fprintf(stderr, "failed to save menu sections\n");
+    return;
+  }
+  chmod(path.fileSystemRepresentation, S_IRUSR | S_IWUSR);
+}
+
+static BOOL menuMotionAllowed(void) {
+  return !NSWorkspace.sharedWorkspace.accessibilityDisplayShouldReduceMotion;
+}
+
+// A section title that opens and closes on click, with a chevron that turns
+// from right to down. Clicks come through a gesture recognizer, as on the old
+// Full at row, so the menu stays open.
+@interface SectionHeader : NSView
+@property(nonatomic, strong) NSTextField *title;
+@property(nonatomic, strong) NSImageView *chevron;
+// Set it through setCollapsed:animated: so the chevron follows.
+@property(nonatomic) BOOL collapsed;
+@property(nonatomic, copy) void (^toggled)(SectionHeader *header);
+- (instancetype)initWithTitle:(NSTextField *)title
+                    accessory:(NSView *)accessory
+               chevronLeading:(BOOL)leading;
+- (void)setCollapsed:(BOOL)collapsed animated:(BOOL)animated;
+@end
+
+@implementation SectionHeader
+
+- (instancetype)initWithTitle:(NSTextField *)title
+                    accessory:(NSView *)accessory
+               chevronLeading:(BOOL)leading {
+  self = [super initWithFrame:NSZeroRect];
+  if (self == nil) {
+    return nil;
+  }
+  self.title = title;
+  self.translatesAutoresizingMaskIntoConstraints = NO;
+  // The chevron sits frame-based in a fixed box so Auto Layout never fights
+  // its rotation.
+  NSView *box = [[NSView alloc] initWithFrame:NSZeroRect];
+  box.translatesAutoresizingMaskIntoConstraints = NO;
+  [box.widthAnchor constraintEqualToConstant:12].active = YES;
+  [box.heightAnchor constraintEqualToConstant:12].active = YES;
+  NSImage *image = [NSImage imageWithSystemSymbolName:@"chevron.right"
+                             accessibilityDescription:nil];
+  NSImageSymbolConfiguration *config =
+      [NSImageSymbolConfiguration configurationWithPointSize:10 weight:NSFontWeightSemibold];
+  image = [image imageWithSymbolConfiguration:config];
+  image.template = YES;
+  NSImageView *chevron = [[NSImageView alloc] initWithFrame:NSMakeRect(0, 0, 12, 12)];
+  chevron.image = image;
+  chevron.imageScaling = NSImageScaleProportionallyDown;
+  chevron.contentTintColor = NSColor.secondaryLabelColor;
+  [box addSubview:chevron];
+  self.chevron = chevron;
+
+  NSMutableArray<NSView *> *views = [NSMutableArray array];
+  if (leading) {
+    [views addObject:box];
+  }
+  [views addObject:title];
+  if (accessory != nil) {
+    [views addObject:accessory];
+  }
+  NSStackView *row = [NSStackView stackViewWithViews:views];
+  row.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+  row.alignment = NSLayoutAttributeCenterY;
+  row.spacing = 6;
+  row.translatesAutoresizingMaskIntoConstraints = NO;
+  if (accessory != nil) {
+    [row setCustomSpacing:8 afterView:title];
+  }
+  [title setContentHuggingPriority:NSLayoutPriorityDefaultLow
+                    forOrientation:NSLayoutConstraintOrientationHorizontal];
+  [self addSubview:row];
+  [NSLayoutConstraint activateConstraints:@[
+    [row.leadingAnchor constraintEqualToAnchor:self.leadingAnchor],
+    [row.topAnchor constraintEqualToAnchor:self.topAnchor],
+    [row.bottomAnchor constraintEqualToAnchor:self.bottomAnchor],
+    [self.widthAnchor constraintEqualToConstant:kMenuContentWidth],
+  ]];
+  if (leading) {
+    [row.trailingAnchor constraintEqualToAnchor:self.trailingAnchor].active = YES;
+  } else {
+    // Trailing chevron, so titles line up on the left and the chevron lines
+    // up with the percent labels on the right.
+    [self addSubview:box];
+    [NSLayoutConstraint activateConstraints:@[
+      [row.trailingAnchor constraintLessThanOrEqualToAnchor:box.leadingAnchor constant:-6],
+      [box.trailingAnchor constraintEqualToAnchor:self.trailingAnchor],
+      [box.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
+    ]];
+  }
+  NSClickGestureRecognizer *click =
+      [[NSClickGestureRecognizer alloc] initWithTarget:self action:@selector(clicked:)];
+  [self addGestureRecognizer:click];
+  [self setCollapsed:NO animated:NO];
+  return self;
+}
+
+- (void)setCollapsed:(BOOL)collapsed animated:(BOOL)animated {
+  self.collapsed = collapsed;
+  CGFloat angle = collapsed ? 0 : -90;
+  NSImageView *chevron = self.chevron;
+  if (animated && menuMotionAllowed()) {
+    [NSAnimationContext runAnimationGroup:^(NSAnimationContext *context) {
+      context.duration = 0.2;
+      chevron.animator.frameCenterRotation = angle;
+    }];
+  } else {
+    chevron.frameCenterRotation = angle;
+  }
+}
+
+- (void)toggle {
+  if (self.hidden) {
+    return;
+  }
+  [self setCollapsed:!self.collapsed animated:YES];
+  if (self.toggled != nil) {
+    self.toggled(self);
+  }
+  NSAccessibilityPostNotification(self, NSAccessibilityLayoutChangedNotification);
+}
+
+- (void)clicked:(id)sender {
+  (void)sender;
+  [self toggle];
+}
+
+- (BOOL)isAccessibilityElement {
+  return YES;
+}
+
+- (NSAccessibilityRole)accessibilityRole {
+  return NSAccessibilityButtonRole;
+}
+
+- (NSString *)accessibilityLabel {
+  return [NSString stringWithFormat:@"%@, %@", self.title.stringValue,
+                                    self.collapsed ? @"collapsed" : @"expanded"];
+}
+
+- (BOOL)isAccessibilityExpanded {
+  return !self.collapsed;
+}
+
+- (BOOL)accessibilityPerformPress {
+  [self toggle];
+  return YES;
+}
+@end
+
+// Thin divider between menu sections, like the stock Sound menu's: one point
+// of the system separator color, inset to the content margins.
+@interface MenuHairline : NSView
+@end
+
+@implementation MenuHairline
+- (BOOL)wantsUpdateLayer {
+  return YES;
+}
+
+- (void)updateLayer {
+  [self.effectiveAppearance performAsCurrentDrawingAppearance:^{
+    self.layer.backgroundColor = NSColor.separatorColor.CGColor;
+  }];
+}
+
+- (void)viewDidChangeEffectiveAppearance {
+  [super viewDidChangeEffectiveAppearance];
+  self.needsDisplay = YES;
+}
+@end
+
+static NSView *menuHairline(void) {
+  MenuHairline *line = [[MenuHairline alloc] initWithFrame:NSZeroRect];
+  line.wantsLayer = YES;
+  line.translatesAutoresizingMaskIntoConstraints = NO;
+  [line.widthAnchor constraintEqualToConstant:kMenuContentWidth].active = YES;
+  [line.heightAnchor constraintEqualToConstant:1].active = YES;
+  return line;
+}
+
+static NSStackView *menuSection(NSArray<NSView *> *views, CGFloat spacing) {
+  NSStackView *stack = [NSStackView stackViewWithViews:views];
+  stack.orientation = NSUserInterfaceLayoutOrientationVertical;
+  stack.alignment = NSLayoutAttributeLeading;
+  stack.spacing = spacing;
+  stack.detachesHiddenViews = YES;
+  stack.translatesAutoresizingMaskIntoConstraints = NO;
+  return stack;
+}
+
 @interface StatusPanel : NSViewController
 @property(nonatomic, strong) NSSlider *nowSlider;
 @property(nonatomic, strong) NSSlider *maxSlider;
@@ -3396,19 +4359,24 @@ static BOOL handleControl(const char *buf, int fd) {
 @property(nonatomic) long savedMax;
 @property(nonatomic, strong) RampClock *rampClock;
 @property(nonatomic, strong) NSStackView *maxRow;
-@property(nonatomic, strong) NSStackView *fullRow;
-@property(nonatomic, strong) NSImageView *fullChevron;
+@property(nonatomic, strong) SectionHeader *fullRow;
 @property(nonatomic, strong) NSTextField *fullTime;
 @property(nonatomic) BOOL fullCollapsed;
-@property(nonatomic, copy) void (^fullToggled)(void);
-@property(nonatomic, strong) NSBox *rule;
+// Called after any section opens or closes, so the menu can resize.
+@property(nonatomic, copy) void (^sectionToggled)(void);
+@property(nonatomic, strong) SectionHeader *brightHeader;
+@property(nonatomic, strong) NSStackView *brightBody;
+@property(nonatomic, strong) NSView *brightSection;
+@property(nonatomic, strong) NSView *brightDivider;
+@property(nonatomic, strong) SectionHeader *appearanceHeader;
+@property(nonatomic, strong) NSStackView *appearanceBody;
+@property(nonatomic, strong) NSMutableSet<NSString *> *collapsedSections;
 @property(nonatomic, strong) NSView *clockWell;
 @property(nonatomic, strong) NSTextField *payLabel;
 @property(nonatomic, strong) NSButton *payButton;
 @property(nonatomic, strong) NSSegmentedControl *scheduleControl;
 @property(nonatomic, strong) NSButton *darkSwitch;
 @property(nonatomic, strong) NSButton *toneSwitch;
-@property(nonatomic, strong) NSTextField *brightTitle;
 @property(nonatomic, strong) NSStackView *brightRows;
 @property(nonatomic, strong) NSTextField *ddcNote;
 @property(nonatomic, strong) NSButton *keyButton;
@@ -3417,6 +4385,7 @@ static BOOL handleControl(const char *buf, int fd) {
 - (void)syncSliders;
 - (void)syncClock;
 - (void)syncDisplay;
+- (void)applyAccent;
 - (void)applyRampAccess;
 - (void)previewMax:(long)value;
 - (void)previewNow:(long)value;
@@ -3461,7 +4430,7 @@ static void openBrightnessKeyAccess(void) {
   button.imagePosition = NSImageLeading;
   button.alignment = NSTextAlignmentLeft;
   button.font = [NSFont systemFontOfSize:NSFont.systemFontSize];
-  [button.widthAnchor constraintEqualToConstant:248].active = YES;
+  [button.widthAnchor constraintEqualToConstant:kMenuContentWidth].active = YES;
   return button;
 }
 
@@ -3487,13 +4456,23 @@ static void openBrightnessKeyAccess(void) {
   row.spacing = 8;
   [row setCustomSpacing:4 afterView:slider];
   row.alignment = NSLayoutAttributeCenterY;
-  [row.widthAnchor constraintEqualToConstant:248].active = YES;
+  [row.widthAnchor constraintEqualToConstant:kMenuContentWidth].active = YES;
+  [row.heightAnchor constraintGreaterThanOrEqualToConstant:24].active = YES;
   return row;
 }
 
+// Section title, like "Sound" in the stock Sound menu.
 - (NSTextField *)sectionLabel:(NSString *)title {
   NSTextField *label = [NSTextField labelWithString:title];
-  label.font = [NSFont systemFontOfSize:17 weight:NSFontWeightSemibold];
+  label.font = [NSFont boldSystemFontOfSize:NSFont.systemFontSize];
+  label.textColor = NSColor.labelColor;
+  return label;
+}
+
+// Secondary heading inside a section, like "Output" in the Sound menu.
+- (NSTextField *)subsectionLabel:(NSString *)title {
+  NSTextField *label = [NSTextField labelWithString:title];
+  label.font = [NSFont systemFontOfSize:NSFont.systemFontSize weight:NSFontWeightSemibold];
   label.textColor = NSColor.secondaryLabelColor;
   return label;
 }
@@ -3509,6 +4488,8 @@ static void openBrightnessKeyAccess(void) {
   self.maxSlider.doubleValue = 1;
   self.nowSlider.continuous = YES;
   self.maxSlider.continuous = YES;
+  tintSlider(self.nowSlider);
+  tintSlider(self.maxSlider);
   self.nowSlider.accessibilityLabel = @"Current";
   self.maxSlider.accessibilityLabel = @"Max";
   self.nowValue = [self valueLabel];
@@ -3517,40 +4498,26 @@ static void openBrightnessKeyAccess(void) {
   self.rampClock = [[RampClock alloc] initWithFrame:NSZeroRect];
   self.rampClock.accessibilityLabel = @"Full at";
 
-  NSImageView *chevron = [NSImageView imageViewWithImage:[[NSImage alloc] init]];
-  chevron.imageScaling = NSImageScaleProportionallyUpOrDown;
-  chevron.translatesAutoresizingMaskIntoConstraints = NO;
-  [chevron.widthAnchor constraintEqualToConstant:11].active = YES;
-  [chevron.heightAnchor constraintEqualToConstant:11].active = YES;
-  self.fullChevron = chevron;
-  NSTextField *fullTitle = [self sectionLabel:@"Full at"];
+  __weak StatusPanel *panel = self;
+  NSTextField *fullTitle = [self subsectionLabel:@"Full at"];
   NSTextField *fullTime = [NSTextField labelWithString:@""];
-  fullTime.font = [NSFont monospacedDigitSystemFontOfSize:13 weight:NSFontWeightMedium];
+  fullTime.font = [NSFont monospacedDigitSystemFontOfSize:NSFont.systemFontSize
+                                                   weight:NSFontWeightRegular];
   fullTime.textColor = NSColor.secondaryLabelColor;
   [fullTime setContentHuggingPriority:NSLayoutPriorityRequired
                         forOrientation:NSLayoutConstraintOrientationHorizontal];
   self.fullTime = fullTime;
-  NSStackView *fullRow = [NSStackView stackViewWithViews:@[ chevron, fullTitle, fullTime ]];
-  fullRow.orientation = NSUserInterfaceLayoutOrientationHorizontal;
-  fullRow.alignment = NSLayoutAttributeCenterY;
-  fullRow.spacing = 6;
-  [fullRow setCustomSpacing:8 afterView:fullTitle];
-  [fullRow.widthAnchor constraintEqualToConstant:248].active = YES;
-  [fullTitle setContentHuggingPriority:NSLayoutPriorityDefaultLow
-                         forOrientation:NSLayoutConstraintOrientationHorizontal];
-  NSClickGestureRecognizer *fullClick =
-      [[NSClickGestureRecognizer alloc] initWithTarget:self action:@selector(toggleFullAt:)];
-  [fullRow addGestureRecognizer:fullClick];
+  SectionHeader *fullRow = [[SectionHeader alloc] initWithTitle:fullTitle
+                                                       accessory:fullTime
+                                                  chevronLeading:YES];
+  fullRow.toggled = ^(SectionHeader *header) {
+    [panel sectionHeaderToggled:header];
+  };
   self.fullRow = fullRow;
-  NSBox *rule = [[NSBox alloc] initWithFrame:NSZeroRect];
-  rule.boxType = NSBoxSeparator;
-  rule.translatesAutoresizingMaskIntoConstraints = NO;
-  [rule.widthAnchor constraintEqualToConstant:248].active = YES;
-  self.rule = rule;
   NSTextField *pay = [NSTextField wrappingLabelWithString:@""];
   pay.font = [NSFont systemFontOfSize:NSFont.systemFontSize];
   pay.textColor = NSColor.secondaryLabelColor;
-  pay.preferredMaxLayoutWidth = 248;
+  pay.preferredMaxLayoutWidth = kMenuContentWidth;
   pay.hidden = YES;
   self.payLabel = pay;
   NSButton *buy = [NSButton buttonWithTitle:@"Unlock the ramp"
@@ -3563,7 +4530,7 @@ static void openBrightnessKeyAccess(void) {
   self.rampClock.translatesAutoresizingMaskIntoConstraints = NO;
   NSView *clockWell = [[NSView alloc] initWithFrame:NSZeroRect];
   self.clockWell = clockWell;
-  [clockWell.widthAnchor constraintEqualToConstant:248].active = YES;
+  [clockWell.widthAnchor constraintEqualToConstant:kMenuContentWidth].active = YES;
   [clockWell addSubview:self.rampClock];
   [NSLayoutConstraint activateConstraints:@[
     [self.rampClock.leadingAnchor constraintEqualToAnchor:clockWell.leadingAnchor],
@@ -3593,30 +4560,25 @@ static void openBrightnessKeyAccess(void) {
   schedule.controlSize = NSControlSizeSmall;
   schedule.font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize];
   schedule.accessibilityLabel = @"Night Shift schedule";
-  [schedule.widthAnchor constraintEqualToConstant:248].active = YES;
+  schedule.selectedSegmentBezelColor = NSColor.controlAccentColor;
+  [schedule.widthAnchor constraintEqualToConstant:kMenuContentWidth].active = YES;
   self.scheduleControl = schedule;
 
-  NSBox *displayRule = [[NSBox alloc] initWithFrame:NSZeroRect];
-  displayRule.boxType = NSBoxSeparator;
-  displayRule.translatesAutoresizingMaskIntoConstraints = NO;
-  [displayRule.widthAnchor constraintEqualToConstant:248].active = YES;
   self.darkSwitch = [self appearanceButton];
   self.toneSwitch = [self appearanceButton];
-  NSTextField *brightTitle = [self sectionLabel:@"Brightness"];
-  self.brightTitle = brightTitle;
   NSStackView *brightRows = [[NSStackView alloc] initWithFrame:NSZeroRect];
   brightRows.orientation = NSUserInterfaceLayoutOrientationVertical;
   brightRows.alignment = NSLayoutAttributeLeading;
-  brightRows.spacing = 8;
-  [brightRows.widthAnchor constraintEqualToConstant:248].active = YES;
+  brightRows.spacing = 12;
+  [brightRows.widthAnchor constraintEqualToConstant:kMenuContentWidth].active = YES;
   self.brightRows = brightRows;
   self.displayRows = [NSMutableArray array];
   NSTextField *ddcNote = [NSTextField
       wrappingLabelWithString:@"Turn on DDC/CI in the monitor menu to change the backlight."];
   ddcNote.font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize];
   ddcNote.textColor = NSColor.secondaryLabelColor;
-  ddcNote.preferredMaxLayoutWidth = 248;
-  [ddcNote.widthAnchor constraintEqualToConstant:248].active = YES;
+  ddcNote.preferredMaxLayoutWidth = kMenuContentWidth;
+  [ddcNote.widthAnchor constraintEqualToConstant:kMenuContentWidth].active = YES;
   ddcNote.hidden = YES;
   self.ddcNote = ddcNote;
   NSButton *keyButton = [NSButton buttonWithTitle:@"Allow brightness keys"
@@ -3628,41 +4590,85 @@ static void openBrightnessKeyAccess(void) {
   keyButton.hidden = brightnessKeysReady();
   self.keyButton = keyButton;
 
+  // Spacing: 10 between rows and under each title, 12 above and below each
+  // divider, 14 side margins, as in the stock Sound menu.
   NSTextField *nightTitle = [self sectionLabel:@"Night Shift Intensity"];
-  NSTextField *appearanceTitle = [self sectionLabel:@"Appearance"];
+  NSStackView *nightSection = menuSection(
+      @[ nightTitle, nowRow, maxRow, pay, buy, schedule, fullRow, clockWell ], 10);
+  [nightSection setCustomSpacing:14 afterView:maxRow];
+  [nightSection setCustomSpacing:14 afterView:buy];
+  [nightSection setCustomSpacing:12 afterView:schedule];
+  [nightSection setCustomSpacing:6 afterView:fullRow];
+
+  self.collapsedSections = readCollapsedSections();
+  SectionHeader *brightHeader =
+      [[SectionHeader alloc] initWithTitle:[self sectionLabel:@"Brightness"]
+                                 accessory:nil
+                            chevronLeading:NO];
+  brightHeader.toggled = ^(SectionHeader *header) {
+    [panel sectionHeaderToggled:header];
+  };
+  self.brightHeader = brightHeader;
+  NSStackView *brightBody = menuSection(@[ brightRows, ddcNote, keyButton ], 10);
+  self.brightBody = brightBody;
+  NSStackView *brightSection = menuSection(@[ brightHeader, brightBody ], 10);
+  self.brightSection = brightSection;
+
+  SectionHeader *appearanceHeader =
+      [[SectionHeader alloc] initWithTitle:[self sectionLabel:@"Appearance"]
+                                 accessory:nil
+                            chevronLeading:NO];
+  appearanceHeader.toggled = ^(SectionHeader *header) {
+    [panel sectionHeaderToggled:header];
+  };
+  self.appearanceHeader = appearanceHeader;
+  NSStackView *appearanceBody = menuSection(@[ self.darkSwitch, self.toneSwitch ], 8);
+  self.appearanceBody = appearanceBody;
+  NSStackView *appearanceSection = menuSection(@[ appearanceHeader, appearanceBody ], 10);
+
+  BOOL brightClosed = [self.collapsedSections containsObject:@"brightness"];
+  BOOL appearanceClosed = [self.collapsedSections containsObject:@"appearance"];
+  [brightHeader setCollapsed:brightClosed animated:NO];
+  brightBody.hidden = brightClosed;
+  [appearanceHeader setCollapsed:appearanceClosed animated:NO];
+  appearanceBody.hidden = appearanceClosed;
+
+  NSView *brightDivider = menuHairline();
+  self.brightDivider = brightDivider;
   NSStackView *stack = [NSStackView stackViewWithViews:@[
-    nightTitle, nowRow, maxRow, pay, buy, schedule, fullRow, clockWell,
-    displayRule, brightTitle, brightRows, ddcNote, keyButton, rule, appearanceTitle,
-    self.darkSwitch,
-    self.toneSwitch
+    nightSection, brightDivider, brightSection, menuHairline(), appearanceSection
   ]];
   stack.orientation = NSUserInterfaceLayoutOrientationVertical;
   stack.alignment = NSLayoutAttributeLeading;
-  stack.spacing = 8;
-  stack.edgeInsets = NSEdgeInsetsMake(12, 14, 12, 14);
+  stack.spacing = 12;
+  stack.edgeInsets = NSEdgeInsetsMake(12, kMenuMargin, 8, kMenuMargin);
   stack.translatesAutoresizingMaskIntoConstraints = NO;
   stack.detachesHiddenViews = YES;
-  [stack setCustomSpacing:12 afterView:maxRow];
-  [stack setCustomSpacing:8 afterView:pay];
-  [stack setCustomSpacing:12 afterView:buy];
-  [stack setCustomSpacing:8 afterView:schedule];
-  [stack setCustomSpacing:2 afterView:fullRow];
-  [stack setCustomSpacing:8 afterView:clockWell];
-  [stack setCustomSpacing:12 afterView:displayRule];
-  [stack setCustomSpacing:8 afterView:brightTitle];
-  [stack setCustomSpacing:14 afterView:brightRows];
-  [stack setCustomSpacing:12 afterView:rule];
 
-  NSView *root = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 276, 280)];
+  NSView *root = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, kMenuWidth, 280)];
   [root addSubview:stack];
   [NSLayoutConstraint activateConstraints:@[
     [stack.leadingAnchor constraintEqualToAnchor:root.leadingAnchor],
     [stack.trailingAnchor constraintEqualToAnchor:root.trailingAnchor],
     [stack.topAnchor constraintEqualToAnchor:root.topAnchor],
     [stack.bottomAnchor constraintEqualToAnchor:root.bottomAnchor],
-    [root.widthAnchor constraintEqualToConstant:276],
+    [root.widthAnchor constraintEqualToConstant:kMenuWidth],
   ]];
   self.view = root;
+}
+
+// The accent or highlight color changed in System Settings. Dynamic colors
+// resolve again at draw time, so re-set them and redraw.
+- (void)applyAccent {
+  tintSlider(self.nowSlider);
+  tintSlider(self.maxSlider);
+  for (DisplayRow *row in self.displayRows) {
+    tintSlider(row.slider);
+  }
+  self.scheduleControl.selectedSegmentBezelColor = NSColor.controlAccentColor;
+  self.scheduleControl.needsDisplay = YES;
+  self.rampClock.needsDisplay = YES;
+  [self syncDisplay];
 }
 
 - (void)applyRampAccess {
@@ -3671,7 +4677,6 @@ static void openBrightnessKeyAccess(void) {
   NSString *until = rampLicenseUntil();
   self.maxRow.hidden = !paid;
   self.maxSlider.enabled = paid;
-  self.rule.hidden = NO;
   self.fullRow.hidden = !paid;
   self.clockWell.hidden = !paid || self.fullCollapsed;
   [self styleFullHeader];
@@ -3774,6 +4779,7 @@ static void openBrightnessKeyAccess(void) {
     slider.minValue = 0;
     slider.maxValue = 100;
     slider.continuous = YES;
+    tintSlider(slider);
     slider.enabled = readable && writable;
     slider.tag = (NSInteger)ids[i];
     NSString *title = displayTitle(ids[i]);
@@ -3783,18 +4789,19 @@ static void openBrightnessKeyAccess(void) {
     name.font = [NSFont systemFontOfSize:NSFont.systemFontSize];
     name.lineBreakMode = NSLineBreakByTruncatingTail;
     name.maximumNumberOfLines = 1;
-    [name.widthAnchor constraintEqualToConstant:248].active = YES;
+    [name.widthAnchor constraintEqualToConstant:kMenuContentWidth].active = YES;
     NSStackView *controls = [NSStackView stackViewWithViews:@[ slider, value ]];
     controls.orientation = NSUserInterfaceLayoutOrientationHorizontal;
     controls.spacing = 8;
     [controls setCustomSpacing:4 afterView:slider];
     controls.alignment = NSLayoutAttributeCenterY;
-    [controls.widthAnchor constraintEqualToConstant:248].active = YES;
+    [controls.widthAnchor constraintEqualToConstant:kMenuContentWidth].active = YES;
+    [controls.heightAnchor constraintGreaterThanOrEqualToConstant:24].active = YES;
     NSStackView *row = [NSStackView stackViewWithViews:@[ name, controls ]];
     row.orientation = NSUserInterfaceLayoutOrientationVertical;
     row.alignment = NSLayoutAttributeLeading;
-    row.spacing = 2;
-    [row.widthAnchor constraintEqualToConstant:248].active = YES;
+    row.spacing = 4;
+    [row.widthAnchor constraintEqualToConstant:kMenuContentWidth].active = YES;
     long percent = 0;
     if (readable) {
       percent = (long)llround(level * 100.0);
@@ -3822,7 +4829,8 @@ static void openBrightnessKeyAccess(void) {
 - (void)syncBrightness {
   uint32_t ids[16];
   int count = orderedDisplays(ids, 16);
-  self.brightTitle.hidden = count == 0;
+  self.brightSection.hidden = count == 0;
+  self.brightDivider.hidden = count == 0;
   self.brightRows.hidden = count == 0;
   if (self.trackingDisplay != 0) {
     return;
@@ -3890,28 +4898,43 @@ static void openBrightnessKeyAccess(void) {
 }
 
 - (void)styleFullHeader {
-  NSString *symbol = self.fullCollapsed ? @"chevron.right" : @"chevron.down";
-  NSImage *image = [NSImage imageWithSystemSymbolName:symbol accessibilityDescription:nil];
-  NSImageSymbolConfiguration *config =
-      [NSImageSymbolConfiguration configurationWithPointSize:10 weight:NSFontWeightSemibold];
-  image = [image imageWithSymbolConfiguration:config];
-  image.template = YES;
-  self.fullChevron.image = image;
-  self.fullChevron.contentTintColor = NSColor.secondaryLabelColor;
-  self.fullRow.accessibilityLabel =
-      self.fullCollapsed ? @"Full at, collapsed" : @"Full at, expanded";
+  if (self.fullRow.collapsed != self.fullCollapsed) {
+    [self.fullRow setCollapsed:self.fullCollapsed animated:NO];
+  }
 }
 
-- (void)toggleFullAt:(id)sender {
-  (void)sender;
-  if (self.fullRow.hidden) {
+- (void)revealBody:(NSView *)body {
+  body.hidden = NO;
+  if (!menuMotionAllowed()) {
+    body.alphaValue = 1;
     return;
   }
-  self.fullCollapsed = !self.fullCollapsed;
-  self.clockWell.hidden = self.fullCollapsed;
-  [self styleFullHeader];
-  if (self.fullToggled != nil) {
-    self.fullToggled();
+  body.alphaValue = 0;
+  [NSAnimationContext runAnimationGroup:^(NSAnimationContext *context) {
+    context.duration = 0.18;
+    body.animator.alphaValue = 1;
+  }];
+}
+
+- (void)sectionHeaderToggled:(SectionHeader *)header {
+  if (header == self.fullRow) {
+    self.fullCollapsed = header.collapsed;
+    self.clockWell.hidden = self.fullCollapsed;
+  } else {
+    BOOL bright = header == self.brightHeader;
+    NSString *name = bright ? @"brightness" : @"appearance";
+    NSView *body = bright ? self.brightBody : self.appearanceBody;
+    if (header.collapsed) {
+      body.hidden = YES;
+      [self.collapsedSections addObject:name];
+    } else {
+      [self revealBody:body];
+      [self.collapsedSections removeObject:name];
+    }
+    writeCollapsedSections(self.collapsedSections);
+  }
+  if (self.sectionToggled != nil) {
+    self.sectionToggled();
   }
 }
 
@@ -3970,6 +4993,7 @@ static void openBrightnessKeyAccess(void) {
 @property(nonatomic, strong) id localOutsideMonitor;
 - (void)showPage:(NSInteger)index;
 - (void)syncPaid:(BOOL)paid soon:(BOOL)soon until:(NSString *)until buying:(BOOL)buying;
+- (void)paintSidebar;
 @end
 
 @implementation SettingsPanel
@@ -4340,6 +5364,7 @@ static void openBrightnessKeyAccess(void) {
 @property(nonatomic, strong) StatusPanel *panel;
 @property(nonatomic) BOOL tracking;
 @property(nonatomic) BOOL menuOpen;
+@property(nonatomic) NSTimeInterval brightReleaseTime;
 @property(nonatomic) BOOL buying;
 @property(nonatomic) long pendingMax;
 @property(nonatomic, strong) id clockKeyMonitor;
@@ -4402,7 +5427,23 @@ static void openBrightnessKeyAccess(void) {
     strong.tracking = NO;
     [strong refresh];
   };
-  self.panel.fullToggled = ^{
+  [[NSNotificationCenter defaultCenter]
+      addObserverForName:NSSystemColorsDidChangeNotification
+                  object:nil
+                   queue:[NSOperationQueue mainQueue]
+              usingBlock:^(NSNotification *note) {
+                (void)note;
+                MenuBar *strong = menu;
+                if (strong == nil) {
+                  return;
+                }
+                [strong.panel applyAccent];
+                if (strong.settings.window != nil) {
+                  [strong.settings paintSidebar];
+                }
+                gBrightnessMeter.needsDisplay = YES;
+              }];
+  self.panel.sectionToggled = ^{
     [menu sizeMenuView];
   };
   [self refresh];
@@ -4413,6 +5454,7 @@ static void openBrightnessKeyAccess(void) {
   NSMenuItem *content = [[NSMenuItem alloc] init];
   content.view = self.panel.view;
   [self.menu addItem:content];
+  [self.menu addItem:[NSMenuItem separatorItem]];
   NSMenuItem *settings = [[NSMenuItem alloc] initWithTitle:@"Settings…"
                                                     action:@selector(showSettings:)
                                              keyEquivalent:@""];
@@ -4430,8 +5472,8 @@ static void openBrightnessKeyAccess(void) {
 - (void)sizeMenuView {
   [self.panel.view layoutSubtreeIfNeeded];
   NSSize fit = self.panel.view.fittingSize;
-  if (fit.width < 260) {
-    fit.width = 276;
+  if (fit.width < kMenuWidth - 16) {
+    fit.width = kMenuWidth;
   }
   if (fit.height < 40) {
     fit.height = 240;
@@ -4570,7 +5612,8 @@ static void openBrightnessKeyAccess(void) {
   if (self.panel.trackingDisplay != 0) {
     for (DisplayRow *row in self.panel.displayRows) {
       if (row.display == self.panel.trackingDisplay) {
-        setDisplayBrightness(row.display, (long)llround(row.slider.doubleValue));
+        [self brightReleaseHandled];
+        endBrightnessDrag(row.display, (long)llround(row.slider.doubleValue));
         break;
       }
     }
@@ -4748,7 +5791,7 @@ static void openBrightnessKeyAccess(void) {
       dispatch_async(dispatch_get_main_queue(), ^{
         self.buying = NO;
         if (body != nil) {
-          notify(body);
+          notifyPlain(body);
         }
         [self refresh];
       });
@@ -4759,14 +5802,14 @@ static void openBrightnessKeyAccess(void) {
       BOOL opened = page != nil && [[NSWorkspace sharedWorkspace] openURL:page];
       if (!opened) {
         self.buying = NO;
-        notify(@"could not open checkout");
+        notifyPlain(@"could not open checkout");
         [self refresh];
         return;
       }
       if (portal) {
         self.buying = NO;
         if (out != nil) {
-          notify(out);
+          notifyPlain(out);
         }
         [self refresh];
         return;
@@ -4780,7 +5823,7 @@ static void openBrightnessKeyAccess(void) {
             dispatch_async(dispatch_get_main_queue(), ^{
               self.buying = NO;
               if (body != nil) {
-                notify(body);
+                notifyPlain(body);
               }
               [self refresh];
             });
@@ -4789,7 +5832,7 @@ static void openBrightnessKeyAccess(void) {
         }
         dispatch_async(dispatch_get_main_queue(), ^{
           self.buying = NO;
-          notify(@"Checkout did not finish");
+          notifyPlain(@"Checkout did not finish");
           [self refresh];
         });
       });
@@ -4797,8 +5840,27 @@ static void openBrightnessKeyAccess(void) {
   });
 }
 
+// A mouse-up that already ended a brightness drag. NSSlider may send its own
+// action for the mouse-up, and ReleaseSlider sends another after tracking.
+// Both look settled, so without this a release sets and saves twice, the
+// second time with the readback brightMoved put on the slider.
+- (BOOL)brightReleaseHandled {
+  NSEvent *event = NSApp.currentEvent;
+  if (event == nil || event.type != NSEventTypeLeftMouseUp) {
+    return NO;
+  }
+  if (event.timestamp == self.brightReleaseTime) {
+    return YES;
+  }
+  self.brightReleaseTime = event.timestamp;
+  return NO;
+}
+
 - (void)brightMoved:(NSSlider *)slider {
   uint32_t display = (uint32_t)slider.tag;
+  if ((sliderSettled() || !self.menuOpen) && [self brightReleaseHandled]) {
+    return;
+  }
   long value = softwareDimPercent(display, (long)llround(slider.doubleValue));
   slider.doubleValue = value;
   for (DisplayRow *row in self.panel.displayRows) {
@@ -4807,24 +5869,33 @@ static void openBrightnessKeyAccess(void) {
       break;
     }
   }
-  self.panel.trackingDisplay = sliderSettled() ? 0 : display;
-  if (!setDisplayBrightness(display, value)) {
-    self.panel.trackingDisplay = 0;
+  // The built-in (a ~10ms DisplayServices call) and a confirmed DDC external
+  // (handed to the DDC worker, which keeps only the newest value) follow the
+  // knob live. Others still set once on release (ReleaseSlider sends that
+  // action after mouse-up). Ticks are held; the release saves once. Once
+  // the menu has closed, menuDidClose has ended the drag, so a late action
+  // ends it too rather than holding a value nothing would save.
+  if (!sliderSettled() && self.menuOpen) {
+    self.panel.trackingDisplay = display;
+    if (CGDisplayIsBuiltin(display) || ddcReady(display)) {
+      holdBrightnessTick(display, value);
+    }
+    return;
+  }
+  self.panel.trackingDisplay = 0;
+  if (!endBrightnessDrag(display, value)) {
     [self refresh];
     return;
   }
-  if (sliderSettled()) {
-    long shown = readPercent(display);
-    if (shown >= 0) {
-      slider.doubleValue = shown;
-      for (DisplayRow *row in self.panel.displayRows) {
-        if (row.display == display) {
-          row.valueLabel.stringValue = [NSString stringWithFormat:@"%ld%%", shown];
-          break;
-        }
+  long shown = readPercent(display);
+  if (shown >= 0) {
+    slider.doubleValue = shown;
+    for (DisplayRow *row in self.panel.displayRows) {
+      if (row.display == display) {
+        row.valueLabel.stringValue = [NSString stringWithFormat:@"%ld%%", shown];
+        break;
       }
     }
-    self.panel.trackingDisplay = 0;
   }
 }
 
@@ -4859,13 +5930,14 @@ static void openBrightnessKeyAccess(void) {
   BOOL ok = want ? [service registerAndReturnError:&error]
                  : [service unregisterAndReturnError:&error];
   if (!ok || service.status == SMAppServiceStatusRequiresApproval) {
-    notify(@"Allow Nightshift in Login Items");
+    notifyPlain(@"Allow Nightshift in Login Items");
   }
   [self syncLoginItem];
   [self refresh];
 }
 
 - (void)quitApp:(id)sender {
+  teardownDaemon();
   [NSApp terminate:sender];
 }
 
@@ -4925,11 +5997,16 @@ static void refreshMenu(void) {
           refreshMenu();
         }
         if (err != nil) {
-          notify(err);
+          notifyPlain(err);
         }
       }
     }
   }
+}
+
+- (void)applicationWillTerminate:(NSNotification *)notification {
+  (void)notification;
+  teardownDaemon();
 }
 @end
 
@@ -4986,7 +6063,8 @@ static uint32_t builtinDisplay(void) {
 }
 
 static uint32_t gCursorHiddenDisplay = 0;
-static uint32_t gBlackCursorDisplay = 0;
+static uint32_t gBlackCursorDisplays[8];
+static int gBlackCursorCount = 0;
 static NSTimer *gCursorHideTimer = nil;
 static id gCursorMonitor = nil;
 static CFMachPortRef gCursorTap = NULL;
@@ -5035,9 +6113,36 @@ static void cancelCursorHide(void) {
   gCursorHideTimer = nil;
 }
 
+static BOOL blackCursorHas(uint32_t display) {
+  for (int i = 0; i < gBlackCursorCount; i++) {
+    if (gBlackCursorDisplays[i] == display) {
+      return YES;
+    }
+  }
+  return NO;
+}
+
+static void blackCursorAdd(uint32_t display) {
+  if (display == 0 || blackCursorHas(display) || gBlackCursorCount >= 8) {
+    return;
+  }
+  gBlackCursorDisplays[gBlackCursorCount++] = display;
+}
+
+static void blackCursorRemove(uint32_t display) {
+  for (int i = 0; i < gBlackCursorCount; i++) {
+    if (gBlackCursorDisplays[i] != display) {
+      continue;
+    }
+    gBlackCursorCount--;
+    gBlackCursorDisplays[i] = gBlackCursorDisplays[gBlackCursorCount];
+    gBlackCursorDisplays[gBlackCursorCount] = 0;
+    return;
+  }
+}
+
 static BOOL displayIsBlack(uint32_t display) {
-  return display != 0 && display == gBlackCursorDisplay && !CGDisplayIsBuiltin(display) &&
-         readPercent(display) == 0;
+  return blackCursorHas(display) && !CGDisplayIsBuiltin(display) && readPercent(display) == 0;
 }
 
 static void scheduleCursorHide(void) {
@@ -5058,7 +6163,7 @@ static void scheduleCursorHide(void) {
 }
 
 static void pokeCursor(void) {
-  if (gBlackCursorDisplay == 0 && gCursorHiddenDisplay == 0) {
+  if (gBlackCursorCount == 0 && gCursorHiddenDisplay == 0) {
     return;
   }
   uint32_t under = displayUnderPointer();
@@ -5081,7 +6186,7 @@ static CGEventRef cursorTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
     }
     return event;
   }
-  if (gBlackCursorDisplay != 0 || gCursorHiddenDisplay != 0) {
+  if (gBlackCursorCount != 0 || gCursorHiddenDisplay != 0) {
     pokeCursor();
   }
   return event;
@@ -5132,7 +6237,7 @@ static void noteCursorBrightness(uint32_t display, long percent) {
     return;
   }
   if (percent <= 0) {
-    gBlackCursorDisplay = display;
+    blackCursorAdd(display);
     watchCursor();
     cancelCursorHide();
     if (displayUnderPointer() == display) {
@@ -5140,27 +6245,38 @@ static void noteCursorBrightness(uint32_t display, long percent) {
     }
     return;
   }
-  if (gBlackCursorDisplay == display) {
-    gBlackCursorDisplay = 0;
+  blackCursorRemove(display);
+  if (gCursorHiddenDisplay == display) {
     cancelCursorHide();
     showHiddenCursor();
   }
 }
 
-static void noteCursorDisplaysOffline(void) {
-  if (gBlackCursorDisplay == 0 && gCursorHiddenDisplay == 0) {
-    return;
-  }
-  BOOL online = NO;
-  uint32_t watched = gBlackCursorDisplay != 0 ? gBlackCursorDisplay : gCursorHiddenDisplay;
+static BOOL cursorDisplayOnline(uint32_t display) {
   for (NSScreen *screen in NSScreen.screens) {
-    if ([screen.deviceDescription[@"NSScreenNumber"] unsignedIntValue] == watched) {
-      online = YES;
-      break;
+    if ([screen.deviceDescription[@"NSScreenNumber"] unsignedIntValue] == display) {
+      return YES;
     }
   }
-  if (!online) {
-    gBlackCursorDisplay = 0;
+  return NO;
+}
+
+static void noteCursorDisplaysOffline(void) {
+  if (gBlackCursorCount == 0 && gCursorHiddenDisplay == 0) {
+    return;
+  }
+  for (int i = gBlackCursorCount - 1; i >= 0; i--) {
+    uint32_t display = gBlackCursorDisplays[i];
+    if (cursorDisplayOnline(display)) {
+      continue;
+    }
+    blackCursorRemove(display);
+    if (gCursorHiddenDisplay == display) {
+      cancelCursorHide();
+      showHiddenCursor();
+    }
+  }
+  if (gCursorHiddenDisplay != 0 && !cursorDisplayOnline(gCursorHiddenDisplay)) {
     cancelCursorHide();
     showHiddenCursor();
   }
@@ -5398,7 +6514,7 @@ static void startBrightnessKeys(void) {
     [NSApp activate];
     NSDictionary *options = @{(__bridge id)kAXTrustedCheckOptionPrompt : @YES};
     AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)options);
-    notify(@"Allow Nightshift in Accessibility to use the brightness keys");
+    notifyPlain(@"Allow Nightshift in Accessibility to use the brightness keys");
   }
   if (gTapTries++ >= 30) {
     return;
@@ -5430,12 +6546,50 @@ static void installMenu(void) {
 
 static char gSockPath[sizeof(((struct sockaddr_un *)0)->sun_path)];
 
+static void teardownDaemon(void) {
+  static BOOL done = NO;
+  if (done) {
+    return;
+  }
+  done = YES;
+  // A drag, or a release still waiting on its lamp write: the display shows
+  // these values, so keep them rather than restore the old ones next launch.
+  // Quit can't wait for the readback, so a pending release counts as landed.
+  for (int i = 0; i < gHeldBrightness.count; i++) {
+    noteBrightness(gHeldBrightness.display[i], gHeldBrightness.percent[i]);
+  }
+  gHeldBrightness.count = 0;
+  for (int i = 0; i < 8; i++) {
+    if (gDDC[i].display != 0 && gDDC[i].saveWaiting) {
+      gDDC[i].saveWaiting = NO;
+      noteBrightness(gDDC[i].display, gDDC[i].savePercent);
+    }
+  }
+  if (gShades != nil) {
+    for (NSNumber *key in gShades.allKeys) {
+      [gShades[key] orderOut:nil];
+      [gShades removeObjectForKey:key];
+    }
+  }
+  gBlackCursorCount = 0;
+  cancelCursorHide();
+  showHiddenCursor();
+  if (gSockPath[0] != '\0') {
+    unlink(gSockPath);
+    gSockPath[0] = '\0';
+  }
+  // Let a queued lamp write finish instead of exiting mid-transaction. A
+  // probe can run long, so wait only a moment.
+  dispatch_semaphore_t drained = dispatch_semaphore_create(0);
+  dispatch_async(ddcQueue(), ^{
+    dispatch_semaphore_signal(drained);
+  });
+  dispatch_semaphore_wait(drained,
+                          dispatch_time(DISPATCH_TIME_NOW, (int64_t)(300 * NSEC_PER_MSEC)));
+}
+
 static void stopDaemon(int sig) {
   (void)sig;
-  if (gCursorHiddenDisplay != 0) {
-    CGDisplayShowCursor(gCursorHiddenDisplay);
-    gCursorHiddenDisplay = 0;
-  }
   if (gSockPath[0] != '\0') {
     unlink(gSockPath);
   }
@@ -5506,7 +6660,7 @@ static void deliverPending(BOOL granted) {
       NSString *pending = gPending;
       gPending = nil;
       gLaunched = YES;
-      sendBanner(pending);
+      sendBanner(pending, !gPendingPlain);
       return;
     }
   } else {
