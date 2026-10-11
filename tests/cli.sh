@@ -30,6 +30,7 @@ stamp() {
 
 before_max=$(stamp "$SUPPORT/max")
 before_full=$(stamp "$SUPPORT/full")
+before_secret=$(stamp "$SUPPORT/install-secret")
 
 reject() {
   name=$1
@@ -95,6 +96,36 @@ reject "dark maybe" "use on or off" dark maybe
 reject "tone maybe" "use on or off" tone maybe
 reject "brightness 3" "usage: nightshift" brightness 3
 
+# The install secret is read from stdin, never taken as an argument; these
+# are refused before anything is read or saved.
+value=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+reject "license secret value" "takes no value" license secret "$value"
+reject "license secret --replace value" "takes no value" license secret --replace "$value"
+reject "license secret value --replace" "takes no value" license secret "$value" --replace
+reject "license secret --force" "takes no value" license secret --force
+out=$(mktemp)
+err=$(mktemp)
+"$BIN" license secret "$value" >"$out" 2>"$err" </dev/null
+if grep -F -q "$value" "$out" "$err"; then
+  echo "fail license secret: echoed the value"
+  fail=$((fail + 1))
+fi
+printf 'not-a-secret\n' | "$BIN" license secret >"$out" 2>"$err"
+code=$?
+if [ "$code" -ne 1 ] || ! grep -F -q "isn't an install secret" "$err" || grep -F -q "not-a-secret" "$out" "$err"; then
+  echo "fail license secret: bad piped secret (exit $code)"
+  cat "$err" >&2
+  fail=$((fail + 1))
+fi
+"$BIN" license secret >"$out" 2>"$err" </dev/null
+code=$?
+if [ "$code" -ne 1 ] || ! grep -F -q "no install secret was entered" "$err"; then
+  echo "fail license secret: empty stdin (exit $code)"
+  cat "$err" >&2
+  fail=$((fail + 1))
+fi
+rm -f "$out" "$err"
+
 out=$(mktemp)
 err=$(mktemp)
 "$BIN" ramp '8:30pm;id' >"$out" 2>"$err"
@@ -116,8 +147,10 @@ rm -f "$out" "$err"
 
 after_max=$(stamp "$SUPPORT/max")
 after_full=$(stamp "$SUPPORT/full")
-if [ "$before_max" != "$after_max" ] || [ "$before_full" != "$after_full" ]; then
-  echo "fail files changed: max $before_max -> $after_max full $before_full -> $after_full"
+after_secret=$(stamp "$SUPPORT/install-secret")
+if [ "$before_max" != "$after_max" ] || [ "$before_full" != "$after_full" ] ||
+  [ "$before_secret" != "$after_secret" ]; then
+  echo "fail files changed: max $before_max -> $after_max full $before_full -> $after_full secret $before_secret -> $after_secret"
   fail=$((fail + 1))
 fi
 

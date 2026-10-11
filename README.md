@@ -36,7 +36,9 @@ nightshift -h         # explain the commands, the ramp, and the notifications
 
 A warmth is a whole number from `0` to `100`. A max is from `1` to `100`.
 
-Setting a warmth is free. The evening ramp is a year at a time. `nightshift buy` opens checkout and saves the token. The menu button does the same. `nightshift license` prints the date it runs through. `nightshift license <token>` saves a token you already have.
+Setting a warmth is free. The evening ramp is a year at a time. `nightshift buy` opens checkout and saves the token. The menu button does the same. `nightshift license` prints the date it runs through. `nightshift license <token>` saves a token you already have. A token works only on the Mac it was issued for. If a license needs to move to another install ID (for example, after its ID file was lost), contact support with the email you paid with and the output of `nightshift license id`.
+
+Each Mac has an install secret, and the license is served only to the Mac that holds it. If support gives you a secret (after moving a license, granting one, or when this Mac lost its secret file), enter it with `nightshift license secret`. It asks for the secret without showing it, or reads one line from a pipe (`nightshift license secret < secret.txt`), then saves it and fetches the license. It never takes the secret as an argument, so it stays out of your shell history and `ps`. It won't replace a secret this Mac already has unless you add `--replace`. If `nightshift buy` says to contact support, this install ID already has a license under another secret (for example, this Mac lost its secret file): support can give you a new secret, so don't buy again.
 
 ## Menu bar
 
@@ -69,6 +71,12 @@ open Nightshift.app
 Run `Nightshift.app`, not a bare `nightshiftd`, or notifications have nowhere to go. `./nightshift` sends commands to that app.
 
 `main.m` is the command and `nightshiftd.m` is the daemon. `NightShift.m` holds the Night Shift calls they share.
+
+## License server
+
+`server/` sells and serves ramp licenses through Stripe. Every Stripe client in it is pinned to API version `2026-03-25.dahlia` (`stripeApiVersion` in `server/app.js`), and `setup.js` creates the webhook endpoint in that version. Invoices in this version carry no payment fields; the server asks Stripe for them. `server/test.js` fakes Stripe with scrubbed responses captured from a sandbox run in this version (`server/fixtures/stripe-2026-03-25/`).
+
+Upgrading the version means re-running the sandbox check: a test-mode checkout paid with test card 4242, a purchase held and refunded, `stripe events resend` of its events, and a lapsed customer buying again. Recapture the fixtures from that run. The server logs `WEBHOOK-VERSION` when an event arrives in another version.
 
 ## License
 

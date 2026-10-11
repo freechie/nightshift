@@ -1,6 +1,8 @@
 nightshift
 nightshiftd
 nightshift-tests
+logic-tests
+nightshift-testkey
 Nightshift.app/
 dist/
 license.pem

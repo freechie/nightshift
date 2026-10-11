@@ -18,7 +18,10 @@
 #import <objc/runtime.h>
 #import <stdlib.h>
 #import <string.h>
+#import <errno.h>
+#import <fcntl.h>
 #import <sys/stat.h>
+#import <unistd.h>
 
 extern const CFStringRef kSecAttrKeyTypeEd25519;
 extern const SecKeyAlgorithm kSecKeyAlgorithmEdDSASignatureMessageCurve25519SHA512;
@@ -316,7 +319,10 @@ static const uint8_t kRampPublicKey[32] = {
 static uint8_t gTestRampKey[32];
 static BOOL gUseTestRampKey = NO;
 
+static void forgetVerifiedTokens(void);
+
 void useRampPublicKeyForTests(const uint8_t *key) {
+  forgetVerifiedTokens();
   if (key == NULL) {
     gUseTestRampKey = NO;
     return;
@@ -324,6 +330,30 @@ void useRampPublicKeyForTests(const uint8_t *key) {
   memcpy(gTestRampKey, key, sizeof(gTestRampKey));
   gUseTestRampKey = YES;
 }
+
+#ifdef NIGHTSHIFT_TEST_KEYS
+// Test builds only (make nightshift-testkey, used by server/prove.js): the
+// public key comes from NIGHTSHIFT_TEST_PUBLIC_KEY (64 hex digits), so the
+// proof can sign with a throwaway key. Release builds never read it.
+static void useTestKeyFromEnvironment(void) {
+  static dispatch_once_t once;
+  dispatch_once(&once, ^{
+    const char *hex = getenv("NIGHTSHIFT_TEST_PUBLIC_KEY");
+    if (hex == NULL || strlen(hex) != 64) {
+      return;
+    }
+    uint8_t key[32];
+    for (int i = 0; i < 32; i++) {
+      unsigned byte = 0;
+      if (sscanf(hex + i * 2, "%2x", &byte) != 1) {
+        return;
+      }
+      key[i] = (uint8_t)byte;
+    }
+    useRampPublicKeyForTests(key);
+  });
+}
+#endif
 
 NSString *rampOffer(void) {
   return @"The ramp is a paid feature. Unlock it with nightshift license";
@@ -349,7 +379,16 @@ static BOOL ensureSupportDir(void) {
   return YES;
 }
 
-static BOOL rampDayCurrent(NSString *day) {
+static NSDateFormatter *utcDayFormatter(void) {
+  NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
+  fmt.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+  fmt.timeZone = [NSTimeZone timeZoneWithAbbreviation:@"UTC"];
+  fmt.dateFormat = @"yyyy-MM-dd";
+  fmt.lenient = NO;
+  return fmt;
+}
+
+static BOOL rampDayValid(NSString *day) {
   if (day.length != 10) {
     return NO;
   }
@@ -363,32 +402,73 @@ static BOOL rampDayCurrent(NSString *day) {
       return NO;
     }
   }
-  NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
-  fmt.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
-  fmt.timeZone = [NSTimeZone timeZoneWithAbbreviation:@"UTC"];
-  fmt.dateFormat = @"yyyy-MM-dd";
-  fmt.lenient = NO;
-  if ([fmt dateFromString:day] == nil) {
-    return NO;
+  return [utcDayFormatter() dateFromString:day] != nil;
+}
+
+static NSString *rampToday(void) { return [utcDayFormatter() stringFromDate:[NSDate date]]; }
+
+static BOOL rampDayCurrent(NSString *day) {
+  return rampDayValid(day) && [day compare:rampToday()] != NSOrderedAscending;
+}
+
+// Finding 6 / patch review N2: a token names the install it unlocks and
+// its last day, "ramp:<install-id>:<YYYY-MM-DD>". The old unbound tokens,
+// "ramp" and "ramp:<day>", were only ever test tokens and are refused.
+NSString *rampPayloadDay(NSString *payload, NSString *installID) {
+  if (![payload hasPrefix:@"ramp:"]) {
+    return nil;
   }
-  NSString *today = [fmt stringFromDate:[NSDate date]];
-  return [day compare:today] != NSOrderedAscending;
+  NSString *rest = [payload substringFromIndex:5];
+  NSString *day = nil;
+  if (rest.length != 47 || [rest characterAtIndex:36] != ':' || installID.length != 36) {
+    return nil;
+  }
+  NSString *bound = [rest substringToIndex:36];
+  day = [rest substringFromIndex:37];
+  if (![bound isEqualToString:installID.lowercaseString] || !rampDayValid(day)) {
+    return nil;
+  }
+  return day;
 }
 
 static BOOL rampPayloadCurrent(NSData *payload) {
   NSString *text = [[NSString alloc] initWithData:payload
                                          encoding:NSUTF8StringEncoding];
-  if ([text isEqualToString:@"ramp"]) {
-    return YES;
-  }
-  if (text.length != 15 || ![text hasPrefix:@"ramp:"]) {
-    return NO;
-  }
-  return rampDayCurrent([text substringFromIndex:5]);
+  NSString *day = rampPayloadDay(text, rampInstallID());
+  return day != nil && [day compare:rampToday()] != NSOrderedAscending;
 }
 
 static const uint8_t *rampPublicKey(void) {
+#ifdef NIGHTSHIFT_TEST_KEYS
+  useTestKeyFromEnvironment();
+#endif
   return gUseTestRampKey ? gTestRampKey : kRampPublicKey;
+}
+
+// Tokens whose signature already checked out, so the ramp tick, the menu
+// and the hourly refresh don't run Ed25519 on every call. Dates and the
+// install binding are still checked each time. Any thread.
+static NSMutableSet<NSString *> *gVerifiedTokens;
+
+static void forgetVerifiedTokens(void) {
+  @synchronized([NSString class]) {
+    gVerifiedTokens = nil;
+  }
+}
+
+static BOOL tokenVerifiedBefore(NSString *token) {
+  @synchronized([NSString class]) {
+    return [gVerifiedTokens containsObject:token];
+  }
+}
+
+static void rememberVerifiedToken(NSString *token) {
+  @synchronized([NSString class]) {
+    if (gVerifiedTokens == nil || gVerifiedTokens.count > 16) {
+      gVerifiedTokens = [NSMutableSet set];
+    }
+    [gVerifiedTokens addObject:[token copy]];
+  }
 }
 
 BOOL rampLicenseAllows(NSString *token) {
@@ -413,6 +493,12 @@ BOOL rampLicenseAllows(NSString *token) {
   if (payload.length == 0 || signature.length != 64) {
     return NO;
   }
+  if (!rampPayloadCurrent(payload)) {
+    return NO;
+  }
+  if (tokenVerifiedBefore(token)) {
+    return YES;
+  }
   NSData *keyData = [NSData dataWithBytes:rampPublicKey() length:32];
   NSDictionary *attrs = @{
     (__bridge id)kSecAttrKeyType : (__bridge id)kSecAttrKeyTypeEd25519,
@@ -434,7 +520,10 @@ BOOL rampLicenseAllows(NSString *token) {
   if (error != NULL) {
     CFRelease(error);
   }
-  return ok && rampPayloadCurrent(payload);
+  if (ok) {
+    rememberVerifiedToken(token);
+  }
+  return ok;
 }
 
 BOOL rampLicensed(void) {
@@ -484,11 +573,7 @@ NSString *rampLicenseUntilToken(NSString *token) {
   if (!rampLicenseAllows(trimmed)) {
     return nil;
   }
-  NSString *text = tokenPayload(trimmed);
-  if (text.length != 15 || ![text hasPrefix:@"ramp:"]) {
-    return nil;
-  }
-  return [text substringFromIndex:5];
+  return rampPayloadDay(tokenPayload(trimmed), rampInstallID());
 }
 
 NSString *rampLicenseUntil(void) {
@@ -521,27 +606,22 @@ BOOL rampLicenseNeedsRefresh(void) {
   if (rampLicenseRenewingSoon()) {
     return YES;
   }
-  if (rampLicensed() && rampLicenseUntil() == nil) {
-    return NO;
-  }
   NSString *text = [NSString stringWithContentsOfFile:licensePath()
                                               encoding:NSUTF8StringEncoding
                                                  error:NULL];
-  NSString *payload = tokenPayload(text);
-  if (payload.length == 15 && [payload hasPrefix:@"ramp:"]) {
-    return !rampDayCurrent([payload substringFromIndex:5]);
+  NSString *payload = tokenPayload([text stringByTrimmingCharactersInSet:
+                                             [NSCharacterSet whitespaceAndNewlineCharacterSet]]);
+  if (payload == nil) {
+    return NO;
   }
-  return NO;
+  NSString *day = rampPayloadDay(payload, rampInstallID());
+  return day != nil && !rampDayCurrent(day);
 }
 
 BOOL rampSaveNewerLicense(NSString *token) {
   NSString *trimmed = [token stringByTrimmingCharactersInSet:
                                 [NSCharacterSet whitespaceAndNewlineCharacterSet]];
   if (!rampLicenseAllows(trimmed)) {
-    return NO;
-  }
-  if (rampLicensed() && rampLicenseUntil() == nil &&
-      rampLicenseUntilToken(trimmed) != nil) {
     return NO;
   }
   NSString *have = rampLicenseUntil();
@@ -561,30 +641,187 @@ static NSString *readSupportFile(NSString *name) {
       stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
 }
 
-static BOOL writeSupportFile(NSString *name, NSString *text) {
+// N3: the install ID and secret are created once and never replaced. A
+// license is bound to the ID, so a file that exists but can't be read (a
+// permissions problem, a truncated or garbled file) is left alone and
+// reported, never overwritten with a new ID. Creation goes through link(2),
+// so two processes (the app and the CLI) can't each create a different one.
+static BOOL createSupportFileOnce(NSString *name, NSString *text, BOOL *exists) {
+  *exists = NO;
   if (!ensureSupportDir()) {
     return NO;
   }
   NSString *path = [supportDir() stringByAppendingPathComponent:name];
-  if (![[text stringByAppendingString:@"\n"] writeToFile:path
-                                               atomically:YES
-                                                 encoding:NSUTF8StringEncoding
-                                                    error:NULL]) {
+  NSString *tmp = [path stringByAppendingFormat:@".%d.new", (int)getpid()];
+  unlink(tmp.fileSystemRepresentation);
+  int fd = open(tmp.fileSystemRepresentation, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC,
+                S_IRUSR | S_IWUSR);
+  if (fd < 0) {
     return NO;
   }
-  return chmod(path.fileSystemRepresentation, S_IRUSR | S_IWUSR) == 0;
+  NSData *bytes = [[text stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding];
+  BOOL wrote = write(fd, bytes.bytes, bytes.length) == (ssize_t)bytes.length && fsync(fd) == 0;
+  close(fd);
+  int linked = wrote ? link(tmp.fileSystemRepresentation, path.fileSystemRepresentation) : -1;
+  int linkError = errno;
+  unlink(tmp.fileSystemRepresentation);
+  if (linked != 0 && wrote && linkError == EEXIST) {
+    *exists = YES;
+  }
+  return linked == 0;
 }
 
+// The trimmed text of a support file that must not be replaced: the file's
+// text when valid, make()'s when there was no file (created now), else nil.
+static NSString *readOrCreateOnce(NSString *name, BOOL (^valid)(NSString *),
+                                  NSString * (^make)(void)) {
+  NSString *path = [supportDir() stringByAppendingPathComponent:name];
+  for (int attempt = 0; attempt < 2; attempt++) {
+    NSString *text = readSupportFile(name);
+    if (text != nil) {
+      return valid(text) ? text : nil;
+    }
+    struct stat st;
+    if (lstat(path.fileSystemRepresentation, &st) == 0 || errno != ENOENT) {
+      return nil;
+    }
+    NSString *created = make();
+    if (created == nil) {
+      return nil;
+    }
+    BOOL exists = NO;
+    if (createSupportFileOnce(name, created, &exists)) {
+      return created;
+    }
+    if (!exists) {
+      return nil;
+    }
+    // Another process created it first: read theirs.
+  }
+  return nil;
+}
+
+static NSString *gInstallID;
+
+void forgetInstallIdentityForTests(void) {
+  @synchronized([NSUUID class]) {
+    gInstallID = nil;
+  }
+}
+
+NSString *rampInstallIDPath(void) {
+  return [supportDir() stringByAppendingPathComponent:@"install-id"];
+}
+
+// Serialized and cached: license checks run on the main thread and on
+// background queues, and the ramp tick asks on every pass.
 NSString *rampInstallID(void) {
-  NSString *existing = readSupportFile(@"install-id");
-  if (existing.length == 36) {
-    return existing.lowercaseString;
+  @synchronized([NSUUID class]) {
+    if (gInstallID == nil) {
+      NSString *text = readOrCreateOnce(
+          @"install-id",
+          ^BOOL(NSString *existing) {
+            return existing.length == 36 && [[NSUUID alloc] initWithUUIDString:existing] != nil;
+          },
+          ^NSString * {
+            return [NSUUID UUID].UUIDString.lowercaseString;
+          });
+      gInstallID = text.lowercaseString;
+    }
+    return gInstallID;
   }
-  NSString *created = [NSUUID UUID].UUIDString.lowercaseString;
-  if (!writeSupportFile(@"install-id", created)) {
-    return nil;
+}
+
+static BOOL validInstallSecret(NSString *text) {
+  if (text.length != 64) {
+    return NO;
   }
-  return created;
+  for (NSUInteger i = 0; i < 64; i++) {
+    unichar c = [text characterAtIndex:i];
+    if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
+      return NO;
+    }
+  }
+  return YES;
+}
+
+// Finding 10: a per-install secret, sent in a header (never a URL) with
+// license and checkout requests. The server keeps only its SHA-256, taken
+// at payment; it serves the license and the billing portal only to it.
+// Read from the file every time, not cached: `nightshift license secret
+// --replace` can change it under a running app.
+NSString *rampInstallSecret(void) {
+  @synchronized([NSUUID class]) {
+    return readOrCreateOnce(@"install-secret", ^BOOL(NSString *existing) {
+      return validInstallSecret(existing);
+    }, ^NSString * {
+      uint8_t bytes[32];
+      if (SecRandomCopyBytes(kSecRandomDefault, sizeof(bytes), bytes) != errSecSuccess) {
+        return nil;
+      }
+      NSMutableString *created = [NSMutableString stringWithCapacity:64];
+      for (size_t i = 0; i < sizeof(bytes); i++) {
+        [created appendFormat:@"%02x", bytes[i]];
+      }
+      return created;
+    });
+  }
+}
+
+// A secret from support (node admin.js grant or reset-secret), entered with
+// `nightshift license secret`. Like the install ID, an existing secret is
+// never replaced unless asked; a replacement is written to a 0600 temporary
+// file and renamed over the old one, so the file is always whole.
+BOOL rampSaveInstallSecret(NSString *value, BOOL replace, NSString **error) {
+  NSString *secret = [value stringByTrimmingCharactersInSet:
+                                [NSCharacterSet whitespaceAndNewlineCharacterSet]]
+                         .lowercaseString;
+  if (!validInstallSecret(secret)) {
+    if (error) {
+      *error = @"that isn't an install secret (64 hexadecimal characters)";
+    }
+    return NO;
+  }
+  @synchronized([NSUUID class]) {
+    if (!replace) {
+      BOOL exists = NO;
+      if (createSupportFileOnce(@"install-secret", secret, &exists)) {
+        return YES;
+      }
+      if (exists && [readSupportFile(@"install-secret") isEqualToString:secret]) {
+        return YES;
+      }
+      if (error) {
+        *error = exists ? @"this Mac already has an install secret; to replace it, "
+                          @"run again with --replace"
+                        : @"couldn't save the install secret";
+      }
+      return NO;
+    }
+    NSString *path = [supportDir() stringByAppendingPathComponent:@"install-secret"];
+    NSString *tmp = [path stringByAppendingFormat:@".%d.new", (int)getpid()];
+    BOOL saved = NO;
+    if (ensureSupportDir()) {
+      unlink(tmp.fileSystemRepresentation);
+      int fd = open(tmp.fileSystemRepresentation, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC,
+                    S_IRUSR | S_IWUSR);
+      if (fd >= 0) {
+        NSData *bytes =
+            [[secret stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding];
+        BOOL wrote =
+            write(fd, bytes.bytes, bytes.length) == (ssize_t)bytes.length && fsync(fd) == 0;
+        close(fd);
+        saved = wrote && rename(tmp.fileSystemRepresentation, path.fileSystemRepresentation) == 0;
+        if (!saved) {
+          unlink(tmp.fileSystemRepresentation);
+        }
+      }
+    }
+    if (!saved && error) {
+      *error = @"couldn't save the install secret";
+    }
+    return saved;
+  }
 }
 
 NSString *rampServerOrigin(void) {
@@ -599,7 +836,7 @@ NSString *rampServerOrigin(void) {
 }
 
 static NSData *httpJSON(NSString *method, NSString *urlString, NSData *body,
-                        NSInteger *status) {
+                        NSString *secret, NSInteger *status) {
   NSURL *url = [NSURL URLWithString:urlString];
   if (url == nil) {
     return nil;
@@ -610,6 +847,9 @@ static NSData *httpJSON(NSString *method, NSString *urlString, NSData *body,
   if (body != nil) {
     request.HTTPBody = body;
     [request setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+  }
+  if (secret != nil) {
+    [request setValue:secret forHTTPHeaderField:@"X-Nightshift-Secret"];
   }
   dispatch_semaphore_t gate = dispatch_semaphore_create(0);
   __block NSData *data = nil;
@@ -648,33 +888,59 @@ static NSString *unlockedLine(void) {
   return @"Ramp is unlocked";
 }
 
-static BOOL datedCannotReplaceForever(NSString *token) {
-  return token != nil && rampLicensed() && rampLicenseUntil() == nil &&
-         rampLicenseUntilToken(token) != nil;
-}
-
 static BOOL tokenOlderThanSaved(NSString *token) {
   NSString *have = rampLicenseUntil();
   NSString *next = token == nil ? nil : rampLicenseUntilToken(token);
   return have != nil && next != nil && [next compare:have] == NSOrderedAscending;
 }
 
-static NSInteger fetchLicense(NSString **tokenOut) {
+// The server's answer to a Mac whose purchase was held (it paid with a
+// secret that doesn't own this install ID): pending until the purchase is
+// cancelled and refunded, then refunded (v8). The text shown is fixed
+// here, never taken from the server.
+NSString *rampHeldPurchaseMessage(NSInteger status, NSData *body) {
+  if (status != 409 || body == nil) {
+    return nil;
+  }
+  id parsed = [NSJSONSerialization JSONObjectWithData:body options:0 error:NULL];
+  if (![parsed isKindOfClass:[NSDictionary class]]) {
+    return nil;
+  }
+  id error = ((NSDictionary *)parsed)[@"error"];
+  if ([error isEqual:@"refunded"]) {
+    return @"This purchase was refunded; contact support";
+  }
+  if ([error isEqual:@"pending"]) {
+    return @"This purchase is being reversed; contact support";
+  }
+  return nil;
+}
+
+static NSInteger fetchLicense(NSString **tokenOut, NSString **heldOut) {
   if (tokenOut != NULL) {
     *tokenOut = nil;
+  }
+  if (heldOut != NULL) {
+    *heldOut = nil;
   }
   NSString *installID = rampInstallID();
   if (installID == nil) {
     return -1;
   }
-  NSString *url = [NSString stringWithFormat:@"%@/license?install_id=%@", rampServerOrigin(),
-                                             installID];
+  // POST, so the install ID stays out of URLs and server logs (finding 10).
+  NSData *json = [NSJSONSerialization dataWithJSONObject:@{@"install_id" : installID}
+                                                 options:0
+                                                   error:NULL];
   NSInteger status = 0;
-  NSData *received = httpJSON(@"GET", url, nil, &status);
+  NSData *received = httpJSON(@"POST", [rampServerOrigin() stringByAppendingString:@"/license"],
+                              json, rampInstallSecret(), &status);
   if (status < 0 || status == 0) {
     return -1;
   }
   if (status != 200 || received == nil) {
+    if (heldOut != NULL) {
+      *heldOut = rampHeldPurchaseMessage(status, received);
+    }
     return status;
   }
   id parsed = [NSJSONSerialization JSONObjectWithData:received options:0 error:NULL];
@@ -702,8 +968,8 @@ static NSString *checkoutOrPortal(NSInteger *statusOut) {
   NSDictionary *body = @{@"install_id" : installID};
   NSData *json = [NSJSONSerialization dataWithJSONObject:body options:0 error:NULL];
   NSInteger status = 0;
-  NSData *received =
-      httpJSON(@"POST", [rampServerOrigin() stringByAppendingString:@"/checkout"], json, &status);
+  NSData *received = httpJSON(@"POST", [rampServerOrigin() stringByAppendingString:@"/checkout"],
+                              json, rampInstallSecret(), &status);
   if (statusOut != NULL) {
     *statusOut = status;
   }
@@ -726,7 +992,7 @@ NSString *rampCheckoutURL(void) {
 
 NSString *rampFetchLicenseToken(void) {
   NSString *token = nil;
-  return fetchLicense(&token) == 200 ? token : nil;
+  return fetchLicense(&token, NULL) == 200 ? token : nil;
 }
 
 int rampInstallReported(NSString *token, NSString **stdoutLine, NSString **stderrLine) {
@@ -743,15 +1009,6 @@ int rampInstallReported(NSString *token, NSString **stdoutLine, NSString **stder
       *stderrLine = @"that license was rejected";
     }
     return 1;
-  }
-  if (datedCannotReplaceForever(trimmed)) {
-    if (stdoutLine != NULL) {
-      *stdoutLine = @"Ramp is unlocked";
-    }
-    if (stderrLine != NULL) {
-      *stderrLine = @"a dated license cannot replace it";
-    }
-    return 0;
   }
   if (tokenOlderThanSaved(trimmed)) {
     if (stderrLine != NULL) {
@@ -780,21 +1037,24 @@ int rampTakeLicenseUpdate(NSString **stdoutLine, NSString **stderrLine) {
     *stderrLine = nil;
   }
   NSString *token = nil;
-  NSInteger status = fetchLicense(&token);
-  if (status < 0 || status == 503 || status == 204) {
+  NSString *held = nil;
+  NSInteger status = fetchLicense(&token, &held);
+  // v5 L3, v8: this Mac's purchase was held (being reversed, or refunded);
+  // say so, and keep any saved
+  // license (an unsigned answer never removes one).
+  if (held != nil) {
+    if (stderrLine != NULL) {
+      *stderrLine = held;
+    }
+    return 2;
+  }
+  // N4: an unsigned answer never removes a saved license. A 410 (revoked)
+  // only means there is nothing newer; the saved token runs to its day.
+  if (status < 0 || status == 503 || status == 204 || status == 410) {
     return 1;
   }
   if (status != 200 || token == nil) {
     return 1;
-  }
-  if (datedCannotReplaceForever(token)) {
-    if (stdoutLine != NULL) {
-      *stdoutLine = @"Ramp is unlocked";
-    }
-    if (stderrLine != NULL) {
-      *stderrLine = @"a dated license cannot replace it";
-    }
-    return 0;
   }
   if (tokenOlderThanSaved(token)) {
     if (stderrLine != NULL) {
@@ -835,14 +1095,15 @@ int rampBeginPurchase(NSString **openURL, BOOL *portal, NSString **stdoutLine,
   if (stderrLine != NULL) {
     *stderrLine = nil;
   }
-  if (rampLicensed() && rampLicenseUntil() == nil) {
-    if (stdoutLine != NULL) {
-      *stdoutLine = @"Ramp is unlocked";
-    }
-    return 0;
-  }
   NSString *token = nil;
-  NSInteger status = fetchLicense(&token);
+  NSString *held = nil;
+  NSInteger status = fetchLicense(&token, &held);
+  if (held != nil) {
+    if (stderrLine != NULL) {
+      *stderrLine = held;
+    }
+    return 2;
+  }
   if (status < 0 || status == 503) {
     if (stderrLine != NULL) {
       *stderrLine = @"could not reach the license server";
@@ -850,15 +1111,6 @@ int rampBeginPurchase(NSString **openURL, BOOL *portal, NSString **stdoutLine,
     return 2;
   }
   if (status == 200 && token != nil) {
-    if (datedCannotReplaceForever(token)) {
-      if (stdoutLine != NULL) {
-        *stdoutLine = @"Ramp is unlocked";
-      }
-      if (stderrLine != NULL) {
-        *stderrLine = @"a dated license cannot replace it";
-      }
-      return 0;
-    }
     if (tokenOlderThanSaved(token)) {
       if (stderrLine != NULL) {
         *stderrLine =
@@ -904,8 +1156,11 @@ int rampBeginPurchase(NSString **openURL, BOOL *portal, NSString **stdoutLine,
       }
       return 0;
     }
+    // The install ID is in use under another install secret, so the server
+    // won't sell it from this Mac (patch review v5).
     if (stderrLine != NULL) {
-      *stderrLine = @"could not open checkout";
+      *stderrLine = @"this install ID already has a license under another install secret; "
+                    @"contact support with nightshift license id";
     }
     return 2;
   }

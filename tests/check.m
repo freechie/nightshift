@@ -17,6 +17,7 @@
 #import <mach-o/dyld.h>
 #import <stdio.h>
 #import <stdlib.h>
+#import <sys/stat.h>
 #import <unistd.h>
 
 static int gFailed = 0;
@@ -192,64 +193,270 @@ static NSString *tokenFor(NSString *payload, const uint8_t *sig) {
 }
 
 static void checkLicense(void) {
+  // A throwaway test key; its private half was discarded after signing
+  // these payloads. Never the production key.
   static const uint8_t key[32] = {
-      0xcd, 0xc9, 0x09, 0x4f, 0xd8, 0xad, 0x92, 0x37, 0xbf, 0xf1, 0xb4,
-      0x45, 0xbc, 0x5a, 0x7b, 0x42, 0x61, 0x98, 0x8b, 0x45, 0xff, 0x00,
-      0x07, 0x7d, 0x22, 0x34, 0x11, 0x43, 0xce, 0x35, 0x7c, 0x32};
-  static const uint8_t forever[64] = {
-      0x68, 0xb2, 0xdb, 0x5f, 0x9d, 0x86, 0x3a, 0x86, 0x8c, 0xb5, 0x8f,
-      0x0b, 0x56, 0x73, 0x67, 0xd8, 0xee, 0x09, 0x0b, 0x7f, 0xeb, 0x1d,
-      0x8f, 0x7b, 0xdb, 0x7d, 0x4d, 0x8a, 0xef, 0xe5, 0x72, 0xb7, 0x42,
-      0x66, 0xdc, 0x8e, 0x4f, 0xc7, 0x96, 0x2b, 0xfd, 0x46, 0x8d, 0xc2,
-      0xa5, 0x6b, 0xf4, 0x3b, 0x15, 0x94, 0x7f, 0x14, 0xf0, 0xb7, 0xae,
-      0x59, 0x3a, 0xec, 0xd0, 0x3c, 0x77, 0x48, 0x2f, 0x06};
-  static const uint8_t later[64] = {
-      0xc7, 0x35, 0xfa, 0x71, 0xb8, 0x1d, 0xa1, 0x70, 0xf1, 0xef, 0x50,
-      0xe8, 0x28, 0xe8, 0xa1, 0xe0, 0x96, 0x2e, 0xf7, 0x0d, 0x7d, 0x85,
-      0xf7, 0x55, 0xde, 0xea, 0x88, 0x9c, 0xb6, 0xd5, 0xc5, 0x8d, 0x06,
-      0x88, 0x6f, 0xd3, 0xe0, 0x98, 0xc8, 0x05, 0xfa, 0x27, 0xc7, 0xc2,
-      0x6c, 0x01, 0x16, 0xd6, 0x5a, 0xb3, 0x37, 0xe6, 0x6c, 0x16, 0xa6,
-      0xf0, 0x05, 0x3f, 0x85, 0x85, 0xc0, 0x52, 0xa0, 0x0c};
-  static const uint8_t earlier[64] = {
-      0x00, 0x75, 0x24, 0xf9, 0x4a, 0xb4, 0x37, 0x8f, 0xa4, 0x98, 0x0f,
-      0x68, 0xbf, 0x3e, 0x5b, 0xe3, 0x62, 0xbd, 0x36, 0x80, 0x58, 0xd0,
-      0xa3, 0xef, 0xec, 0xd3, 0xbc, 0xce, 0xd0, 0x1f, 0x67, 0x72, 0xfe,
-      0xfd, 0xcb, 0xd3, 0xf6, 0x4c, 0xdd, 0x34, 0x76, 0x50, 0x81, 0xf1,
-      0x37, 0x1e, 0xe3, 0x43, 0x65, 0x0d, 0xb9, 0x72, 0x5a, 0xae, 0x9d,
-      0x2d, 0x60, 0x51, 0xd4, 0x16, 0x37, 0x56, 0x1c, 0x04};
-  useRampPublicKeyForTests(key);
-  expectBool(@"ramp token", rampLicenseAllows(tokenFor(@"ramp", forever)), YES);
-  expectBool(@"dated ramp token",
-             rampLicenseAllows(tokenFor(@"ramp:2099-01-01", later)), YES);
-  expectText(@"ramp until",
-             rampLicenseUntilToken(tokenFor(@"ramp:2099-01-01", later)),
-             @"2099-01-01");
-  expectBool(@"forever has no until",
-             rampLicenseUntilToken(tokenFor(@"ramp", forever)) == nil, YES);
-  expectBool(@"expired ramp token",
-             rampLicenseAllows(tokenFor(@"ramp:2020-01-01", earlier)), NO);
-  expectBool(@"reject empty license", rampLicenseAllows(@""), NO);
-  expectBool(@"reject tampered license",
-             rampLicenseAllows(tokenFor(@"ramp-extra", forever)), NO);
-
+      0x64, 0x7e, 0xd6, 0x0e, 0xf3, 0x3f, 0x7d, 0x9b, 0x9d, 0xc8, 0x80,
+      0x72, 0xb8, 0x80, 0x2f, 0x1f, 0xdb, 0x38, 0xd6, 0x80, 0x74, 0x62,
+      0x91, 0x39, 0x50, 0xa9, 0x3f, 0xf1, 0xb7, 0x85, 0x2d, 0xac};
+  static const uint8_t bound_sig[64] = {
+      0x2e, 0xed, 0x96, 0x10, 0x76, 0xfa, 0x19, 0x17, 0xe8, 0xcb, 0x23,
+      0x72, 0x9d, 0xca, 0xc7, 0xd0, 0xe1, 0xdd, 0xa4, 0x5f, 0xb9, 0x06,
+      0x5d, 0x49, 0xec, 0x91, 0x85, 0xbf, 0x47, 0x1a, 0xe7, 0xea, 0x56,
+      0x72, 0xa0, 0xb7, 0xf8, 0x5b, 0xca, 0x91, 0x8a, 0x61, 0x29, 0x44,
+      0xe9, 0xb4, 0x5f, 0x70, 0x38, 0x84, 0x93, 0xa9, 0x7c, 0xa7, 0xf4,
+      0x8d, 0xba, 0x6d, 0x82, 0x50, 0xe3, 0x9b, 0xbe, 0x04};
+  static const uint8_t boundOlder[64] = {
+      0x6b, 0x1a, 0xb2, 0x77, 0x4c, 0x31, 0xc3, 0x96, 0x0b, 0x65, 0x7d,
+      0x75, 0x88, 0x2c, 0x68, 0xb1, 0xad, 0xd5, 0xbd, 0x99, 0xc6, 0xf8,
+      0x5f, 0x22, 0x9f, 0xd4, 0xa5, 0xa6, 0x7c, 0x00, 0xc6, 0x66, 0x2a,
+      0xde, 0xe6, 0xfa, 0x14, 0x53, 0x33, 0x1b, 0x1c, 0x3a, 0x20, 0xff,
+      0x8a, 0xbd, 0x7b, 0xfe, 0xd7, 0x97, 0x53, 0xc7, 0x62, 0x25, 0xc1,
+      0xcc, 0x6e, 0x3b, 0x4b, 0x98, 0xa0, 0x58, 0x36, 0x05};
+  static const uint8_t boundExpired[64] = {
+      0x2b, 0x93, 0x7d, 0x11, 0xed, 0xc8, 0xb0, 0x86, 0x38, 0xb5, 0x30,
+      0xfe, 0x65, 0x85, 0x09, 0xf7, 0x8a, 0x4c, 0x86, 0xfc, 0x94, 0xb2,
+      0x8c, 0xae, 0x87, 0x7e, 0x6e, 0xa7, 0xb6, 0x14, 0x01, 0x52, 0xe2,
+      0xe0, 0xf3, 0x75, 0x27, 0x40, 0xb9, 0x30, 0xd5, 0x96, 0x03, 0x48,
+      0xca, 0xde, 0x4c, 0x4a, 0xb4, 0x0a, 0x5b, 0x4e, 0x37, 0xfa, 0x12,
+      0xad, 0x79, 0x80, 0xd7, 0x28, 0xe7, 0x1e, 0x59, 0x0f};
+  static const uint8_t otherInstall[64] = {
+      0x31, 0x22, 0x05, 0x10, 0xa1, 0xf2, 0xd3, 0x73, 0x16, 0xbf, 0xac,
+      0xa4, 0x79, 0x3c, 0x30, 0xa1, 0xc2, 0xb0, 0x95, 0xa8, 0x22, 0x22,
+      0x58, 0x85, 0x95, 0x7e, 0x2b, 0x1e, 0x46, 0x6b, 0x9c, 0xa5, 0x3b,
+      0x1a, 0x71, 0x52, 0xe7, 0xb6, 0x06, 0x08, 0x9d, 0x87, 0xf5, 0x36,
+      0x0e, 0x8d, 0xc2, 0xd5, 0x0e, 0x77, 0x82, 0x5e, 0x4c, 0x3e, 0x00,
+      0x70, 0x91, 0x17, 0x8f, 0x3e, 0x28, 0x69, 0x0d, 0x0d};
+  static const uint8_t legacyLate[64] = {
+      0x67, 0xfa, 0xc2, 0xc8, 0x70, 0x11, 0xc3, 0xa0, 0x70, 0xa3, 0xbe,
+      0xd0, 0x36, 0xc8, 0x24, 0x0a, 0xd9, 0xd5, 0x94, 0xe4, 0xe9, 0xd6,
+      0x28, 0x62, 0x73, 0x7a, 0xb8, 0x34, 0x4e, 0x11, 0x1d, 0x3b, 0xc2,
+      0x33, 0x22, 0xab, 0xcd, 0x19, 0x56, 0x02, 0xc0, 0x60, 0xd6, 0x6b,
+      0xcf, 0xf8, 0x69, 0x8d, 0xb1, 0x89, 0x57, 0x55, 0x74, 0xb4, 0x4e,
+      0xdd, 0x6a, 0x07, 0xd8, 0x2b, 0x51, 0x4b, 0x89, 0x0d};
+  static const uint8_t bare[64] = {
+      0x23, 0xfd, 0x7a, 0xcc, 0x43, 0xed, 0x0c, 0xd8, 0x26, 0x26, 0x18,
+      0x9e, 0x07, 0x86, 0xa3, 0x8e, 0xe4, 0xd5, 0xba, 0x94, 0xdf, 0x6f,
+      0x36, 0xbb, 0x30, 0x81, 0x26, 0x8f, 0x1b, 0xde, 0xac, 0x6c, 0x52,
+      0xf3, 0xcf, 0x96, 0x09, 0x17, 0x2e, 0x34, 0xf2, 0xd8, 0xb5, 0xa0,
+      0xb7, 0x59, 0x54, 0xbc, 0xb7, 0xf8, 0x29, 0x03, 0x74, 0x9d, 0xe5,
+      0xd2, 0x46, 0x25, 0xb1, 0x73, 0x8c, 0x83, 0xab, 0x01};
+  NSString *installID = @"5f0e1c2a-3b4d-4e6f-8a9b-0c1d2e3f4a5b";
+  NSString *otherID = @"a0b1c2d3-e4f5-4a6b-8c7d-9e0f1a2b3c4d";
   NSString *home = [NSHomeDirectory() stringByStandardizingPath];
   if (home == nil || ![home hasPrefix:@"/tmp/nslic"]) {
     fail(@"license save home", home ?: @"nil");
-    useRampPublicKeyForTests(NULL);
     return;
   }
-  NSString *foreverToken = tokenFor(@"ramp", forever);
-  NSString *laterToken = tokenFor(@"ramp:2099-01-01", later);
-  NSString *earlierToken = tokenFor(@"ramp:2020-01-01", earlier);
-  expectBool(@"save dated license", rampSaveNewerLicense(laterToken), YES);
-  expectText(@"dated license until", rampLicenseUntil(), @"2099-01-01");
-  expectBool(@"forever replaces dated", rampSaveNewerLicense(foreverToken), YES);
-  expectBool(@"forever has no saved until", rampLicenseUntil() == nil, YES);
-  expectBool(@"dated does not replace forever", rampSaveNewerLicense(laterToken), NO);
-  expectBool(@"forever still has no until", rampLicenseUntil() == nil, YES);
-  expectBool(@"expired does not replace forever",
-             rampSaveNewerLicense(earlierToken), NO);
-  expectBool(@"forever remains licensed", rampLicensed(), YES);
+  NSString *dir = [home stringByAppendingPathComponent:@"Library/Application Support/nightshift"];
+  [[NSFileManager defaultManager] createDirectoryAtPath:dir
+                            withIntermediateDirectories:YES
+                                             attributes:nil
+                                                  error:NULL];
+  NSString *idPath = [dir stringByAppendingPathComponent:@"install-id"];
+  NSString *secretPath = [dir stringByAppendingPathComponent:@"install-secret"];
+  NSString *licenseFile = [dir stringByAppendingPathComponent:@"license"];
+  NSString *(^fileText)(NSString *) = ^NSString *(NSString *path) {
+    return [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:NULL];
+  };
+  void (^writeText)(NSString *, NSString *) = ^(NSString *path, NSString *text) {
+    [text writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+  };
+
+  // N3: created only when absent, never overwritten, cached.
+  [[NSFileManager defaultManager] removeItemAtPath:idPath error:NULL];
+  forgetInstallIdentityForTests();
+  NSString *created = rampInstallID();
+  expectBool(@"install id created when absent", created.length == 36, YES);
+  expectText(@"created id is saved", fileText(idPath), [created stringByAppendingString:@"\n"]);
+  forgetInstallIdentityForTests();
+  expectText(@"created id read back", rampInstallID(), created);
+  for (NSString *bad in @[ @"not-an-install-id\n", @"", @"5f0e1c2a-3b4d-4e6f-8a9b\n" ]) {
+    writeText(idPath, bad);
+    forgetInstallIdentityForTests();
+    expectBool([@"unreadable id is nil: " stringByAppendingString:bad],
+               rampInstallID() == nil, YES);
+    expectText([@"unreadable id left alone: " stringByAppendingString:bad], fileText(idPath), bad);
+  }
+  if (geteuid() != 0) {
+    writeText(idPath, [created stringByAppendingString:@"\n"]);
+    chmod(idPath.fileSystemRepresentation, 0);
+    forgetInstallIdentityForTests();
+    expectBool(@"unreadable id file is nil", rampInstallID() == nil, YES);
+    chmod(idPath.fileSystemRepresentation, S_IRUSR | S_IWUSR);
+    expectText(@"unreadable id file left alone", fileText(idPath),
+               [created stringByAppendingString:@"\n"]);
+  }
+  writeText(idPath, [installID.uppercaseString stringByAppendingString:@"\n"]);
+  forgetInstallIdentityForTests();
+  expectText(@"install id", rampInstallID(), installID);
+  writeText(idPath, [otherID stringByAppendingString:@"\n"]);
+  expectText(@"install id is cached", rampInstallID(), installID);
+  writeText(idPath, [installID stringByAppendingString:@"\n"]);
+
+  [[NSFileManager defaultManager] removeItemAtPath:secretPath error:NULL];
+  NSString *secret = rampInstallSecret();
+  expectBool(@"install secret created", secret.length == 64, YES);
+  writeText(secretPath, @"short\n");
+  forgetInstallIdentityForTests();
+  expectBool(@"bad secret is nil", rampInstallSecret() == nil, YES);
+  expectText(@"bad secret left alone", fileText(secretPath), @"short\n");
+
+  // A secret from support (nightshift license secret): checked, never
+  // replacing one without asking, and always a whole 0600 file.
+  NSString *given = [@"0123456789ABCDEF" stringByPaddingToLength:64
+                                                     withString:@"0123456789ABCDEF"
+                                                startingAtIndex:0];
+  NSString *givenLower = given.lowercaseString;
+  NSString *other = [@"" stringByPaddingToLength:64 withString:@"9" startingAtIndex:0];
+  NSString *err = nil;
+  for (NSString *bad in @[ @"", @"short", [given stringByAppendingString:@"0"],
+                           [given stringByReplacingCharactersInRange:NSMakeRange(0, 1)
+                                                          withString:@"g"] ]) {
+    err = nil;
+    expectBool([@"bad secret refused: " stringByAppendingString:bad],
+               rampSaveInstallSecret(bad, YES, &err), NO);
+    expectBool(@"bad secret says why", [err containsString:@"64 hexadecimal"], YES);
+  }
+  expectBool(@"nil secret refused", rampSaveInstallSecret(nil, YES, NULL), NO);
+  expectText(@"bad secrets saved nothing", fileText(secretPath), @"short\n");
+  err = nil;
+  expectBool(@"secret over an unreadable one needs --replace",
+             rampSaveInstallSecret(given, NO, &err), NO);
+  expectBool(@"refusal names --replace", [err containsString:@"--replace"], YES);
+  expectText(@"refused secret left the file alone", fileText(secretPath), @"short\n");
+  [[NSFileManager defaultManager] removeItemAtPath:secretPath error:NULL];
+  expectBool(@"secret saved when absent",
+             rampSaveInstallSecret([NSString stringWithFormat:@"  %@\n", given], NO, NULL), YES);
+  expectText(@"saved secret is trimmed and lower-case", fileText(secretPath),
+             [givenLower stringByAppendingString:@"\n"]);
+  struct stat secretStat;
+  stat(secretPath.fileSystemRepresentation, &secretStat);
+  expectLong(@"saved secret is 0600", secretStat.st_mode & 0777, 0600);
+  expectText(@"saved secret is used", rampInstallSecret(), givenLower);
+  expectBool(@"same secret again is fine", rampSaveInstallSecret(given, NO, NULL), YES);
+  err = nil;
+  expectBool(@"another secret needs --replace", rampSaveInstallSecret(other, NO, &err), NO);
+  expectBool(@"another secret refusal names --replace", [err containsString:@"--replace"], YES);
+  expectText(@"existing secret kept", fileText(secretPath),
+             [givenLower stringByAppendingString:@"\n"]);
+  chmod(secretPath.fileSystemRepresentation, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+  expectBool(@"--replace replaces", rampSaveInstallSecret(other, YES, NULL), YES);
+  expectText(@"replaced secret saved", fileText(secretPath), [other stringByAppendingString:@"\n"]);
+  stat(secretPath.fileSystemRepresentation, &secretStat);
+  expectLong(@"replaced secret is 0600", secretStat.st_mode & 0777, 0600);
+  expectText(@"replaced secret used without a restart", rampInstallSecret(), other);
+  NSArray *left = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:dir error:NULL];
+  expectBool(@"no temporary secret files left",
+             [[left filteredArrayUsingPredicate:
+                        [NSPredicate predicateWithFormat:@"SELF ENDSWITH '.new'"]] count] == 0,
+             YES);
+  expectBool(@"bad secret doesn't replace", rampSaveInstallSecret(@"short", YES, NULL), NO);
+  expectText(@"secret kept after a bad replace", rampInstallSecret(), other);
+  forgetInstallIdentityForTests();
+  expectText(@"install id after forgetting", rampInstallID(), installID);
+
+  // v5 L3, v8: the server's held-purchase replies, shown with fixed text.
+  NSData *(^json)(NSString *) = ^NSData *(NSString *text) {
+    return [text dataUsingEncoding:NSUTF8StringEncoding];
+  };
+  expectText(@"refunded reply", rampHeldPurchaseMessage(409, json(@"{\"error\":\"refunded\","
+                                                                  @"\"message\":\"anything\"}")),
+             @"This purchase was refunded; contact support");
+  expectText(@"pending reply", rampHeldPurchaseMessage(409, json(@"{\"error\":\"pending\","
+                                                                 @"\"message\":\"anything\"}")),
+             @"This purchase is being reversed; contact support");
+  expectBool(@"contact-support reply isn't held",
+             rampHeldPurchaseMessage(409, json(@"{\"error\":\"contact support\"}")) == nil, YES);
+  expectBool(@"refunded needs 409",
+             rampHeldPurchaseMessage(200, json(@"{\"error\":\"refunded\"}")) == nil, YES);
+  expectBool(@"pending needs 409",
+             rampHeldPurchaseMessage(200, json(@"{\"error\":\"pending\"}")) == nil, YES);
+  expectBool(@"garbled reply isn't held", rampHeldPurchaseMessage(409, json(@"{")) == nil, YES);
+  expectBool(@"non-object reply isn't held",
+             rampHeldPurchaseMessage(409, json(@"[\"pending\"]")) == nil, YES);
+  expectBool(@"empty reply isn't held", rampHeldPurchaseMessage(409, nil) == nil, YES);
+
+  // Payload rules, no signature or clock involved.
+  NSString *bound = [NSString stringWithFormat:@"ramp:%@:2099-01-01", installID];
+  expectText(@"bound payload day", rampPayloadDay(bound, installID), @"2099-01-01");
+  expectBool(@"bound payload, other install",
+             rampPayloadDay(bound, otherID) == nil, YES);
+  expectText(@"bound payload, upper-case id",
+             rampPayloadDay(bound, installID.uppercaseString), @"2099-01-01");
+  for (NSString *legacyPayload in @[ @"ramp:2026-12-31", @"ramp:2027-10-01",
+                                      @"ramp:2028-10-01", @"ramp:2099-01-01" ]) {
+    expectBool([@"legacy payload refused: " stringByAppendingString:legacyPayload],
+               rampPayloadDay(legacyPayload, installID) == nil, YES);
+  }
+  expectBool(@"undated payload", rampPayloadDay(@"ramp", installID) == nil, YES);
+  expectBool(@"bad day", rampPayloadDay(@"ramp:2027-02-30", installID) == nil, YES);
+  expectBool(@"bad bound day",
+             rampPayloadDay([NSString stringWithFormat:@"ramp:%@:2099-1-01x", installID],
+                            installID) == nil,
+             YES);
+  expectBool(@"missing install separator",
+             rampPayloadDay([NSString stringWithFormat:@"ramp:%@-2099-01-01", installID],
+                            installID) == nil,
+             YES);
+
+  useRampPublicKeyForTests(key);
+  NSString *boundToken = tokenFor(bound, bound_sig);
+  NSString *olderToken =
+      tokenFor([NSString stringWithFormat:@"ramp:%@:2098-06-01", installID], boundOlder);
+  NSString *expiredToken =
+      tokenFor([NSString stringWithFormat:@"ramp:%@:2020-01-01", installID], boundExpired);
+  NSString *otherToken =
+      tokenFor([NSString stringWithFormat:@"ramp:%@:2099-01-01", otherID], otherInstall);
+  expectBool(@"bound token", rampLicenseAllows(boundToken), YES);
+  // Twice: the second answer comes from the signature cache.
+  expectBool(@"bound token again", rampLicenseAllows(boundToken), YES);
+  expectText(@"bound until", rampLicenseUntilToken(boundToken), @"2099-01-01");
+  expectBool(@"token for another install", rampLicenseAllows(otherToken), NO);
+  expectBool(@"expired token", rampLicenseAllows(expiredToken), NO);
+  expectBool(@"undated token", rampLicenseAllows(tokenFor(@"ramp", bare)), NO);
+  expectBool(@"legacy token", rampLicenseAllows(tokenFor(@"ramp:2099-01-01", legacyLate)), NO);
+  expectBool(@"reject empty license", rampLicenseAllows(@""), NO);
+  expectBool(@"reject tampered license",
+             rampLicenseAllows(tokenFor(bound, boundOlder)), NO);
+  expectBool(@"reject a payload the key never signed",
+             rampLicenseAllows(tokenFor([bound stringByReplacingOccurrencesOfString:@"2099"
+                                                                        withString:@"2097"],
+                                        bound_sig)),
+             NO);
+
+  expectBool(@"save bound license", rampSaveNewerLicense(olderToken), YES);
+  expectText(@"saved until", rampLicenseUntil(), @"2098-06-01");
+  expectBool(@"later license replaces it", rampSaveNewerLicense(boundToken), YES);
+  expectText(@"later saved until", rampLicenseUntil(), @"2099-01-01");
+  expectBool(@"earlier license does not replace it", rampSaveNewerLicense(olderToken), NO);
+  expectBool(@"expired does not replace it", rampSaveNewerLicense(expiredToken), NO);
+  expectBool(@"other install does not replace it", rampSaveNewerLicense(otherToken), NO);
+  expectBool(@"bound license is licensed", rampLicensed(), YES);
+  expectBool(@"no refresh years ahead", rampLicenseNeedsRefresh(), NO);
+
+  // N2: no unbound token, legacy or undated, is accepted or replaces a
+  // saved license, and a saved one doesn't ask the server for a swap.
+  NSString *bareToken = tokenFor(@"ramp", bare);
+  NSString *legacyToken = tokenFor(@"ramp:2099-01-01", legacyLate);
+  expectBool(@"legacy token can't be saved", rampSaveNewerLicense(legacyToken), NO);
+  expectBool(@"undated token can't be saved", rampSaveNewerLicense(bareToken), NO);
+  expectText(@"bound license kept", rampLicenseUntil(), @"2099-01-01");
+  expectBool(@"install a legacy token", installRampLicense(legacyToken), NO);
+  writeText(licenseFile, [legacyToken stringByAppendingString:@"\n"]);
+  expectBool(@"saved legacy token is not licensed", rampLicensed(), NO);
+  expectBool(@"saved legacy token has no day", rampLicenseUntil() == nil, YES);
+  expectBool(@"saved legacy token is not refreshed", rampLicenseNeedsRefresh(), NO);
+  writeText(licenseFile, [bareToken stringByAppendingString:@"\n"]);
+  expectBool(@"saved undated token is not licensed", rampLicensed(), NO);
+  expectBool(@"saved undated token is not refreshed", rampLicenseNeedsRefresh(), NO);
+  expectBool(@"a bound license replaces it", rampSaveNewerLicense(boundToken), YES);
+  expectText(@"bound license saved", rampLicenseUntil(), @"2099-01-01");
+
+  // Another key: the cache must not vouch for tokens the new key didn't sign.
+  static const uint8_t otherKey[32] = {1};
+  useRampPublicKeyForTests(otherKey);
+  expectBool(@"cache cleared with the key", rampLicenseAllows(boundToken), NO);
   useRampPublicKeyForTests(NULL);
 }
 

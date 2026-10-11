@@ -14,7 +14,7 @@ if [[ -z "$identity" ]]; then
   identity="-"
 fi
 
-codesign --force --sign "$identity" "$app"
+codesign --force --options runtime --sign "$identity" "$app"
 
 if [[ "$identity" == "-" ]]; then
   echo "dev-sign: ad-hoc. Allow Nightshift in Accessibility again after this build."

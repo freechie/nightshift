@@ -14,6 +14,7 @@
 // limitations under the License.
 
 #import "NightShift.h"
+#import "NightshiftLogic.h"
 #import <AppKit/AppKit.h>
 #import <ApplicationServices/ApplicationServices.h>
 #import <dlfcn.h>
@@ -37,6 +38,7 @@ extern IOReturn IOAVServiceWriteI2C(IOAVServiceRef service, uint32_t chip,
 
 static BOOL brightnessKeysReady(void);
 static long readPercent(uint32_t display);
+static void refreshKeyDisplays(void);
 static long ddcShownPercent(uint32_t display);
 static void noteCursorBrightness(uint32_t display, long percent);
 static void noteCursorDisplaysOffline(void);
@@ -65,9 +67,11 @@ extern void SLSSetAppearanceThemeSwitchesAutomatically(int automatic);
 @end
 #import <errno.h>
 #import <fcntl.h>
+#import <pthread.h>
 #import <signal.h>
 #import <stdio.h>
 #import <string.h>
+#import <sys/file.h>
 #import <sys/socket.h>
 #import <sys/stat.h>
 #import <sys/un.h>
@@ -234,33 +238,10 @@ static long glideValue(int now) {
   return glideWarmth(gFromMinute, gToMinute, gFromValue, gMax, now);
 }
 
-static int glideStage(int now) {
-  int span = minutesBetween(gFromMinute, gToMinute);
-  int elapsed = minutesBetween(gFromMinute, now);
-  if (span == 0 || elapsed >= span) {
-    return 3;
-  }
-  if (elapsed * 2 >= span) {
-    return 2;
-  }
-  return 1;
-}
+static int glideStage(int now) { return nsGlideStage(gFromMinute, gToMinute, now); }
 
 static int glideEnd(int now, int scheduleEnd) {
-  int untilEnd = minutesBetween(now, scheduleEnd);
-  if (untilEnd == 0) {
-    return now;
-  }
-  if (gFullAt >= 0) {
-    int untilFull = minutesBetween(now, gFullAt);
-    if (untilFull > 0 && untilFull <= untilEnd) {
-      return gFullAt;
-    }
-  }
-  if (untilEnd <= kGlideMinutes) {
-    return scheduleEnd;
-  }
-  return (now + kGlideMinutes) % 1440;
+  return nsGlideEnd(now, scheduleEnd, gFullAt, kGlideMinutes);
 }
 
 static void sendBanner(NSString *body, BOOL controls) {
@@ -348,33 +329,21 @@ static void announce(int now) {
 }
 
 static BOOL clockInSchedule(int start, int end, int clock) {
-  int length = minutesBetween(start, end);
-  if (length == 0 || clock < 0 || clock >= 1440) {
-    return NO;
-  }
-  return minutesBetween(start, clock) <= length;
+  return nsClockInSchedule(start, end, clock);
 }
 
 static BOOL aheadOfTurnOn(int now, int start, int clock) {
-  int untilStart = minutesBetween(now, start);
-  int untilClock = minutesBetween(now, clock);
-  return untilStart > 0 && untilClock > 0 && untilClock <= untilStart;
+  return nsAheadOfTurnOn(now, start, clock);
 }
 
 static void ensureFullAt(int start, int end) {
   if (gFullAt >= 0) {
     return;
   }
-  int length = minutesBetween(start, end);
-  if (length == 0) {
-    return;
+  int fullAt = nsDefaultFullAt(start, end, gRampClock, kRampMinutes);
+  if (fullAt >= 0) {
+    gFullAt = fullAt;
   }
-  if (gRampClock >= 0 && clockInSchedule(start, end, gRampClock)) {
-    gFullAt = gRampClock;
-    return;
-  }
-  int ramp = length < kRampMinutes ? length : kRampMinutes;
-  gFullAt = (start + ramp) % 1440;
 }
 
 static BOOL adoptCurrentMax(long current) {
@@ -1139,7 +1108,8 @@ static BOOL noteBrightness(uint32_t display, long percent) {
   }
   NSNumber *level = @(percent / 100.0);
   NSString *key = displayBrightnessKey(display);
-  gBrightnessSaved[key] = level;
+  // Black is for this session only (finding 1): the file never holds 0.
+  gBrightnessSaved[key] = @(nsPersistedBrightness(percent) / 100.0);
   gSoftwareBrightness[@(display)] = level;
   // Every save is the percent the user asked for. An unmarked line is a lamp
   // percent from before that split, and restore must not convert it twice.
@@ -1258,6 +1228,15 @@ typedef struct {
   long postFloor;   // floor the shade was predicted from
   BOOL saveWaiting; // a drag's release waits on the lamp write to save
   long savePercent; // the percent that release saves
+  // An unconfirmed channel's brightness waits for its write: the shade and
+  // the save happen when the job lands (ddcLanded), or fall back to the
+  // shade alone when the write fails.
+  // N9: when the brightness was last set (CFAbsoluteTime, 0 never), so a
+  // revalidation never overrides a value that was just chosen.
+  CFAbsoluteTime changedAt;
+  BOOL applyWaiting;
+  long applyPercent;
+  int applySaving;  // BrightnessSaving the change was made with
 } DDCSlot;
 
 static DDCSlot gDDC[8];
@@ -1287,11 +1266,17 @@ typedef struct {
   int value;
   BOOL wrote;
   BOOL read;
+  BOOL stable; // two readbacks agreed on landed
   int landed;
   int max;
 } DDCJob;
 static BOOL gDDCBusy = NO;
 static BOOL gDDCAgain = NO;
+// The next probe reads ready channels too: after wake, a replug or a screen
+// change the service may be dead or the monitor may have reset its lamp.
+static BOOL gDDCRevalidate = NO;
+// N9: when the Mac last woke (CFAbsoluteTime, 0 never).
+static CFAbsoluteTime gWokeAt = 0;
 static CFAbsoluteTime gDDCLast = 0;
 static uint32_t gRestoredDisplays[8];
 static int gRestoredCount = 0;
@@ -1305,81 +1290,14 @@ static uint8_t ddcChecksum(const uint8_t *bytes, int count) {
   return sum;
 }
 
-// One DCPAVServiceProxy that might belong to a display.
-typedef struct {
-  uint32_t vendor;   // EDID bytes 8-9, big-endian PNP ID, as CGDisplayVendorNumber
-  uint32_t product;  // EDID bytes 10-11
-  uint32_t serial;   // EDID bytes 12-15, 0 when the monitor leaves it unset
-  BOOL external;     // "Location" is "External", or the property is missing
-  char port[32];     // "dispext0" from the parent "dispext0:dcpav-service-epic:0"
-} DDCCandidate;
+// DDCCandidate and DDCTarget live in NightshiftLogic.h.
 
-// What CoreGraphics knows about the display being matched.
-typedef struct {
-  uint32_t vendor;
-  uint32_t model;
-  uint32_t serial;
-  char port[32];      // "dispext0" from CoreDisplay's IODisplayLocation, "" if unknown
-  int twins;          // online displays with this vendor and model, this one included
-  BOOL serialShared;  // another of those twins reports the same nonzero serial
-} DDCTarget;
-
-// Copies the part of name before stop ("dispext0" from "dispext0@88000000").
 static BOOL ddcPortName(const char *name, char stop, char *out, size_t cap) {
-  size_t length = 0;
-  while (name[length] != '\0' && name[length] != stop) {
-    length++;
-  }
-  if (length == 0 || length >= cap || strncmp(name, "disp", 4) != 0) {
-    out[0] = '\0';
-    return NO;
-  }
-  memcpy(out, name, length);
-  out[length] = '\0';
-  return YES;
+  return nsDDCPortName(name, stop, out, cap);
 }
 
-// The index of the one candidate that is certainly this display, or -1 when it is
-// ambiguous and the shade should be used. Never trades a known brand for a guess.
 static int ddcPickCandidate(const DDCCandidate *candidates, int count, const DDCTarget *target) {
-  BOOL vendorKnown = target->vendor != 0 && target->vendor != 0xFFFFFFFFu;
-  int sameModel = 0;
-  int lastModel = -1;
-  int samePort = 0;
-  int lastPort = -1;
-  int sameSerial = 0;
-  int lastSerial = -1;
-  for (int i = 0; i < count; i++) {
-    const DDCCandidate *c = &candidates[i];
-    if (!c->external || c->product != target->model ||
-        (vendorKnown && c->vendor != target->vendor)) {
-      continue;
-    }
-    sameModel++;
-    lastModel = i;
-    if (target->port[0] != '\0' && strcmp(c->port, target->port) == 0) {
-      samePort++;
-      lastPort = i;
-    }
-    if (target->serial != 0 && c->serial == target->serial) {
-      sameSerial++;
-      lastSerial = i;
-    }
-  }
-  if (samePort == 1) {
-    const DDCCandidate *c = &candidates[lastPort];
-    if (target->serial != 0 && c->serial != 0 && c->serial != target->serial) {
-      return -1;
-    }
-    return lastPort;
-  }
-  if (sameSerial == 1 && !target->serialShared) {
-    return lastSerial;
-  }
-  if (sameModel == 1 && target->twins <= 1) {
-    return lastModel;
-  }
-  return -1;
+  return nsDDCPickCandidate(candidates, count, target);
 }
 
 typedef CFDictionaryRef (*DisplayInfoFn)(CGDirectDisplayID display);
@@ -1533,7 +1451,29 @@ static IOAVServiceRef serviceMatching(const DDCTarget *target) {
   return pick >= 0 ? services[pick] : NULL;
 }
 
+// DDC/CI wants a pause after a Set VCP before the monitor will answer the
+// next message with the new value (MonitorControl: 10 ms between writes,
+// 50 ms before a read, 20 ms between read retries). Worker only.
+static const useconds_t kDDCAfterWrite = 60000;
+static const useconds_t kDDCBetweenReads = 30000;
+static const useconds_t kDDCRecheck = 100000;
+static uint64_t gDDCWroteAt = 0;
+
+static uint64_t ddcNow(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
+
+static void ddcWaitAfterWrite(void) {
+  if (gDDCWroteAt == 0) {
+    return;
+  }
+  uint64_t elapsed = ddcNow() - gDDCWroteAt;
+  uint64_t wait = (uint64_t)kDDCAfterWrite * 1000;
+  if (elapsed < wait) {
+    usleep((useconds_t)((wait - elapsed) / 1000));
+  }
+}
+
 static BOOL ddcReadOnce(IOAVServiceRef service, int *current, int *max) {
+  ddcWaitAfterWrite();
   uint8_t request[4] = {0x82, 0x01, 0x10, 0};
   request[3] = (uint8_t)(0x6E ^ request[0] ^ request[1] ^ request[2]);
   if (IOAVServiceWriteI2C(service, 0x37, 0x51, request, 4) != 0) {
@@ -1566,49 +1506,102 @@ static BOOL ddcReadOnce(IOAVServiceRef service, int *current, int *max) {
   return YES;
 }
 
+// Brightness for a display that waits for the current probe to land
+// (setDisplayBrightnessThen, revalidateDDC). Main thread only.
+static DisplayPercents gDeferredBrightness;
+
+// Main thread. Callers waiting for a display's newest lamp write to land
+// (the CLI's brightness command), fired once by ddcLanded, or with NO when
+// the channel is cleared or replaced.
+typedef void (^BrightnessDone)(BOOL ok);
+static NSMutableDictionary<NSNumber *, NSMutableArray<BrightnessDone> *> *gDDCWaiters;
+
+static void ddcAddWaiter(uint32_t display, BrightnessDone done) {
+  if (gDDCWaiters == nil) {
+    gDDCWaiters = [NSMutableDictionary dictionary];
+  }
+  NSMutableArray<BrightnessDone> *list = gDDCWaiters[@(display)];
+  if (list == nil) {
+    list = [NSMutableArray array];
+    gDDCWaiters[@(display)] = list;
+  }
+  [list addObject:[done copy]];
+}
+
+static void ddcFireWaiters(uint32_t display, BOOL ok) {
+  NSArray<BrightnessDone> *list = gDDCWaiters[@(display)];
+  if (list.count == 0) {
+    return;
+  }
+  [gDDCWaiters removeObjectForKey:@(display)];
+  for (BrightnessDone done in list) {
+    done(ok);
+  }
+}
+
 static void clearDDCSlot(int i) {
   __atomic_store_n(&gDDC[i].max, 0, __ATOMIC_RELEASE);
   IOAVServiceRef service = gDDC[i].service;
   gDDC[i].service = NULL;
-  gDDC[i].display = 0;
   gDDC[i].current = 0;
   gDDC[i].floorRaw = -1;
   gDDC[i].combined = -1;
   gDDC[i].posted = -1;
   gDDC[i].retries = 0;
   gDDC[i].saveWaiting = NO;
+  gDDC[i].applyWaiting = NO;
+  uint32_t display = gDDC[i].display;
+  gDDC[i].display = 0;
   // Queued work for the old channel sees a new seq and drops out.
   gDDC[i].settled = __atomic_add_fetch(&gDDC[i].seq, 1, __ATOMIC_ACQ_REL);
   if (service != NULL) {
     CFRelease(service);
   }
+  if (display != 0) {
+    ddcFireWaiters(display, NO);
+  }
+}
+
+// Finding 9: a display reuses its own slot even when a lower slot is free,
+// so it never ends up with two.
+static int ddcSlotIndexFor(uint32_t display) {
+  uint32_t displays[8];
+  for (int i = 0; i < 8; i++) {
+    displays[i] = gDDC[i].display;
+  }
+  return nsDDCSlotFor(displays, 8, display);
 }
 
 static void publishDDC(uint32_t display, IOAVServiceRef service, int current, int max) {
-  for (int i = 0; i < 8; i++) {
-    if (gDDC[i].display != display && gDDC[i].display != 0) {
-      continue;
+  int i = ddcSlotIndexFor(display);
+  if (i < 0) {
+    if (service != NULL) {
+      CFRelease(service);
     }
-    if (gDDC[i].service != NULL && gDDC[i].service != service) {
-      CFRelease(gDDC[i].service);
-    }
-    if (gDDC[i].display != display) {
-      gDDC[i].floorRaw = -1;
-      gDDC[i].combined = -1;
-    }
-    gDDC[i].display = display;
-    gDDC[i].service = service;
-    gDDC[i].current = current;
-    gDDC[i].posted = max > 0 ? current : -1;
-    gDDC[i].retries = 0;
-    gDDC[i].saveWaiting = NO;
-    gDDC[i].settled = __atomic_add_fetch(&gDDC[i].seq, 1, __ATOMIC_ACQ_REL);
-    __atomic_store_n(&gDDC[i].max, max, __ATOMIC_RELEASE);
     return;
   }
-  if (service != NULL) {
-    CFRelease(service);
+  if (gDDC[i].service != NULL && gDDC[i].service != service) {
+    CFRelease(gDDC[i].service);
   }
+  if (gDDC[i].display != display) {
+    gDDC[i].floorRaw = -1;
+    gDDC[i].combined = -1;
+  }
+  gDDC[i].display = display;
+  gDDC[i].service = service;
+  gDDC[i].current = current;
+  gDDC[i].posted = max > 0 ? current : -1;
+  gDDC[i].retries = 0;
+  gDDC[i].saveWaiting = NO;
+  if (gDDC[i].applyWaiting) {
+    // The write this replaces never applied its change; do it after the probe.
+    gDDC[i].applyWaiting = NO;
+    putDisplayPercent(&gDeferredBrightness, display, gDDC[i].applyPercent);
+  }
+  gDDC[i].settled = __atomic_add_fetch(&gDDC[i].seq, 1, __ATOMIC_ACQ_REL);
+  __atomic_store_n(&gDDC[i].max, max, __ATOMIC_RELEASE);
+  // Anything waiting on a job this replaced hears now rather than timing out.
+  ddcFireWaiters(display, max > 0);
 }
 
 static BOOL ddcReady(uint32_t display) {
@@ -1681,7 +1674,9 @@ static BOOL snapshotReady(const DDCSnapshot *snap, uint32_t display) {
 // Main thread. A probe result is older than any confirmation or seq bump
 // that happened after the snapshot, and must not be published over it.
 static BOOL ddcMovedSince(const DDCSnapshot *snap, uint32_t display) {
-  if (ddcReady(display)) {
+  // Confirmed since the probe was sent. A channel that was already ready is
+  // being revalidated, and only a seq bump makes its reads stale.
+  if (ddcReady(display) && !snapshotReady(snap, display)) {
     return YES;
   }
   for (int i = 0; i < 8; i++) {
@@ -1735,14 +1730,98 @@ static void applyPendingBrightnessKeys(void) {
   }
 }
 
+static DDCSlot *ddcSlot(uint32_t display);
+static long ddcFloorPercent(uint32_t display);
+static int ddcLampValue(DDCSlot *slot, long percent, long floor, int scale);
+static void combinedLevels(long percent, long floor, long *hardware, long *software);
+static BOOL ddcNear(int got, int want, int scale);
+
+static BOOL setDisplayBrightness(uint32_t display, long percent);
+
+static double secondsSince(CFAbsoluteTime at) {
+  return at == 0 ? -1 : CFAbsoluteTimeGetCurrent() - at;
+}
+
+// Main thread. A probe re-read a channel that was already confirmed (after
+// wake, replug or a screen change). The service is always the fresh one, so
+// a dead IOAVService from before the change is dropped. A failed read keeps
+// the confirmed scale: the first write that fails demotes it (ddcLanded).
+//
+// N9: the slot is refreshed in place. It is not republished, which would
+// bump seq (dropping a just-released drag's settle and save) and clear
+// saveWaiting and applyWaiting. A probe result only gets here when no write
+// was queued since it was sent (ddcMovedSince). Then nsRevalidateAction
+// decides: keep a value the user set in the last kNSUserQuietSeconds,
+// reapply the shown brightness when the monitor came back from sleep far
+// off (it reset itself), and otherwise adopt what the monitor reports, so
+// changes made with its own buttons stick.
+static void revalidateDDC(uint32_t display, IOAVServiceRef service, int current, int max) {
+  DDCSlot *slot = ddcSlot(display);
+  if (slot == NULL) {
+    publishDDC(display, service, current, max);
+    return;
+  }
+  if (service != NULL) {
+    if (slot->service != service) {
+      if (slot->service != NULL) {
+        CFRelease(slot->service);
+      }
+      slot->service = service;
+    } else {
+      CFRelease(service);
+    }
+  }
+  if (max <= 0) {
+    if (service == NULL) {
+      return;
+    }
+    slot->posted = -1;
+    return;
+  }
+  slot->current = current;
+  slot->posted = current;
+  slot->retries = 0;
+  __atomic_store_n(&slot->max, max, __ATOMIC_RELEASE);
+  if (slot->combined < 0 || slot->combined > 100 || slot->applyWaiting || slot->saveWaiting) {
+    return;
+  }
+  long floor = ddcFloorPercent(display);
+  long hardware = 0;
+  long software = 100;
+  combinedLevels(slot->combined, floor, &hardware, &software);
+  int target = ddcLampValue(slot, hardware, floor, max);
+  switch (nsRevalidateAction(current, target, max, secondsSince(slot->changedAt),
+                             secondsSince(gWokeAt))) {
+    case kNSRevalidateKeep:
+      break;
+    case kNSRevalidateReapply:
+      putDisplayPercent(&gDeferredBrightness, display, slot->combined);
+      break;
+    case kNSRevalidateAdopt: {
+      long adopted = nsLampToCombined(nsDDCRawPercent(current, max), floor < 0 ? 0 : floor);
+      if (adopted != slot->combined) {
+        // Saved, so a relaunch restores the monitor's value too.
+        BrightnessSaving was = gBrightnessSaving;
+        gBrightnessSaving = kSaveNow;
+        setDisplayBrightness(display, adopted);
+        gBrightnessSaving = was;
+      }
+      break;
+    }
+  }
+}
+
 static void probeDDC(void) {
   if (gDDCBusy) {
     gDDCAgain = YES;
     return;
   }
-  if (!ddcNeedsProbe() && gDDCLast != 0 && CFAbsoluteTimeGetCurrent() - gDDCLast < 3) {
+  if (!gDDCRevalidate && !ddcNeedsProbe() && gDDCLast != 0 &&
+      CFAbsoluteTimeGetCurrent() - gDDCLast < 3) {
     return;
   }
+  BOOL revalidate = gDDCRevalidate;
+  gDDCRevalidate = NO;
   gDDCBusy = YES;
   gDDCLast = CFAbsoluteTimeGetCurrent();
   DDCSnapshot seen = ddcSnapshot();
@@ -1754,7 +1833,7 @@ static void probeDDC(void) {
     DDCTarget wanted[8];
     int pending = 0;
     for (int i = 0; i < count && pending < 8; i++) {
-      if (CGDisplayIsBuiltin(ids[i]) || snapshotReady(&seen, ids[i])) {
+      if (CGDisplayIsBuiltin(ids[i]) || (!revalidate && snapshotReady(&seen, ids[i]))) {
         continue;
       }
       DDCTarget *t = &wanted[pending];
@@ -1790,6 +1869,9 @@ static void probeDDC(void) {
       BOOL ok = NO;
       if (service != NULL) {
         for (int attempt = 0; attempt < 4 && !ok; attempt++) {
+          if (attempt > 0) {
+            usleep(kDDCBetweenReads);
+          }
           ok = ddcReadOnce(service, &current, &max);
         }
       }
@@ -1818,6 +1900,11 @@ static void probeDDC(void) {
         if (results[i].service == NULL && ddcHasService(results[i].display)) {
           continue;
         }
+        if (snapshotReady(&seen, results[i].display)) {
+          revalidateDDC(results[i].display, results[i].service, results[i].current,
+                        results[i].max);
+          continue;
+        }
         publishDDC(results[i].display, results[i].service, results[i].current,
                    results[i].max);
       }
@@ -1829,6 +1916,7 @@ static void probeDDC(void) {
       applyDeferredBrightness();
       applyPendingBrightnessKeys();
       refreshMenu();
+      refreshKeyDisplays();
       if (again) {
         probeDDC();
       }
@@ -1859,28 +1947,9 @@ static int ddcScale(int storedMax) {
   return storedMax > 0 ? storedMax : kDDCAssumeScale;
 }
 
-static int ddcValue(long percent, int scale) {
-  int value = (int)llround((percent / 100.0) * scale);
-  if (value < 0) {
-    value = 0;
-  }
-  if (value > scale) {
-    value = scale;
-  }
-  return value;
-}
+static int ddcValue(long percent, int scale) { return nsDDCValue(percent, scale); }
 
-static BOOL ddcNear(int got, int want, int scale) {
-  int tol = scale / 20;
-  if (tol < 2) {
-    tol = 2;
-  }
-  int diff = got - want;
-  if (diff < 0) {
-    diff = -diff;
-  }
-  return diff <= tol;
-}
+static BOOL ddcNear(int got, int want, int scale) { return nsDDCNear(got, want, scale); }
 
 static BOOL ddcWriteOnce(IOAVServiceRef service, int value) {
   uint8_t request[6] = {0x84, 0x03, 0x10, (uint8_t)((value >> 8) & 0xFF),
@@ -1893,6 +1962,7 @@ static BOOL ddcWriteOnce(IOAVServiceRef service, int value) {
       wrote = YES;
     }
   }
+  gDDCWroteAt = ddcNow();
   return wrote;
 }
 
@@ -1911,49 +1981,11 @@ static DDCSlot *ddcSlot(uint32_t display) {
   return NULL;
 }
 
-static long ddcRawPercent(int raw, int scale) {
-  if (scale <= 0) {
-    return 0;
-  }
-  long percent = (long)llround((raw * 100.0) / (double)scale);
-  if (percent < 0) {
-    return 0;
-  }
-  if (percent > 100) {
-    return 100;
-  }
-  return percent;
-}
+static long ddcRawPercent(int raw, int scale) { return nsDDCRawPercent(raw, scale); }
 
 static void ddcNoteMove(DDCSlot *slot, int before, int wanted, int landed, int scale,
-                        long percent) {
-  int tol = scale / 20;
-  if (tol < 2) {
-    tol = 2;
-  }
-  if (percent <= 0 && landed > 0 && wanted < before) {
-    if (slot->floorRaw < 0 || landed < slot->floorRaw) {
-      slot->floorRaw = landed;
-    }
-    return;
-  }
-  if (landed > wanted + tol) {
-    int far = (scale * 15) / 100;
-    if (far < tol + 1) {
-      far = tol + 1;
-    }
-    BOOL movedDown = before - landed > tol;
-    BOOL askedFar = wanted < before && landed - wanted > far;
-    if (movedDown || askedFar || slot->floorRaw == landed) {
-      if (slot->floorRaw < 0 || landed < slot->floorRaw) {
-        slot->floorRaw = landed;
-      }
-    }
-    return;
-  }
-  if (slot->floorRaw > landed) {
-    slot->floorRaw = wanted <= tol ? 0 : -1;
-  }
+                        long percent, BOOL stable) {
+  slot->floorRaw = nsDDCLearnFloor(slot->floorRaw, before, wanted, landed, scale, percent, stable);
 }
 
 static long ddcFloorPercent(uint32_t display) {
@@ -1968,40 +2000,10 @@ static long ddcFloorPercent(uint32_t display) {
   return ddcRawPercent(slot->floorRaw, scale);
 }
 
-static const long kCombinedSwitch = 50;
-
-static long lampToCombined(long lamp, long floor) {
-  if (floor < 0) {
-    floor = 0;
-  }
-  if (lamp < floor) {
-    lamp = floor;
-  }
-  if (lamp > 100) {
-    lamp = 100;
-  }
-  long room = 100 - floor;
-  if (room <= 0) {
-    return kCombinedSwitch;
-  }
-  return kCombinedSwitch + ((lamp - floor) * (100 - kCombinedSwitch)) / room;
-}
+static long lampToCombined(long lamp, long floor) { return nsLampToCombined(lamp, floor); }
 
 static void combinedLevels(long percent, long floor, long *hardware, long *software) {
-  if (floor < 0) {
-    floor = 0;
-  }
-  if (floor > 99) {
-    floor = 99;
-  }
-  if (percent >= kCombinedSwitch) {
-    long rise = percent - kCombinedSwitch;
-    *hardware = floor + ((100 - floor) * rise) / (100 - kCombinedSwitch);
-    *software = 100;
-    return;
-  }
-  *hardware = floor;
-  *software = (percent * 100) / kCombinedSwitch;
+  nsCombinedLevels(percent, floor, hardware, software);
 }
 
 static long ddcShownPercent(uint32_t display) {
@@ -2039,10 +2041,14 @@ static int ddcLampValue(DDCSlot *slot, long percent, long floor, int scale) {
 
 // Worker only. Reads back what the monitor applied and, when it reports a
 // different scale than the write assumed, makes the one corrective write.
+// A reading that is off target is read again after a pause: slow monitors
+// report the old value for a while, and only a reading two reads agree on
+// (stable) may teach the slot a floor.
 static void ddcConfirm(DDCJob *job) {
   int current = 0;
   int max = 0;
   job->read = NO;
+  job->stable = NO;
   if (!ddcReadOnce(job->service, &current, &max) || max <= 0) {
     return;
   }
@@ -2059,7 +2065,18 @@ static void ddcConfirm(DDCJob *job) {
     current = corrected;
     max = correctedMax;
   }
+  BOOL stable = ddcNear(current, ddcValue(job->percent, max), max);
+  if (!stable) {
+    usleep(kDDCRecheck);
+    int again = 0;
+    int againMax = 0;
+    if (ddcReadOnce(job->service, &again, &againMax) && againMax == max) {
+      stable = again == current;
+      current = again;
+    }
+  }
   job->read = YES;
+  job->stable = stable;
   job->landed = current;
   job->max = max;
 }
@@ -2077,58 +2094,11 @@ static long ddcSettle(DDCSlot *slot, const DDCJob *job) {
   int before = slot->current;
   ddcCommit(slot, job->landed, job->max);
   ddcNoteMove(slot, before, ddcValue(job->percent, job->max), job->landed, job->max,
-              job->percent);
+              job->percent, job->stable);
   slot->posted = job->landed;
   return ddcRawPercent(job->landed, job->max);
 }
 
-// Main thread, blocking: write and confirm before returning. Used where the
-// caller must report the landed value (CLI) or a failed write must fall back
-// to the shade (unconfirmed channel). The I2C still runs on the DDC queue.
-static BOOL ddcSet(uint32_t display, long percent, long floor, long *landedPercent) {
-  DDCSlot *slot = ddcSlot(display);
-  if (slot == NULL) {
-    return NO;
-  }
-  int max = __atomic_load_n(&slot->max, __ATOMIC_ACQUIRE);
-  int scale = ddcScale(max);
-  int value = ddcLampValue(slot, percent, floor, scale);
-  unsigned latest = __atomic_load_n(&slot->seq, __ATOMIC_ACQUIRE);
-  // The lamp is confirmed at this value and nothing newer is queued.
-  if (max > 0 && slot->settled == latest && value == slot->current &&
-      value == slot->posted) {
-    if (landedPercent != NULL) {
-      *landedPercent = ddcRawPercent(slot->current, max);
-    }
-    return YES;
-  }
-  // Supersede any queued live write so it can't land after this one.
-  __block DDCJob job = {0};
-  job.display = display;
-  job.service = CFRetain(slot->service);
-  job.seq = __atomic_add_fetch(&slot->seq, 1, __ATOMIC_ACQ_REL);
-  job.percent = percent;
-  job.scale = scale;
-  job.value = value;
-  dispatch_sync(ddcQueue(), ^{
-    job.wrote = ddcWriteOnce(job.service, job.value);
-    if (job.wrote) {
-      ddcConfirm(&job);
-    }
-  });
-  CFRelease(job.service);
-  // Main was blocked, so the slot can't have been cleared meanwhile.
-  if (!job.wrote) {
-    slot->posted = -1;
-    slot->settled = job.seq;
-    return NO;
-  }
-  long landed = ddcSettle(slot, &job);
-  if (landedPercent != NULL) {
-    *landedPercent = landed;
-  }
-  return YES;
-}
 
 static BOOL externalNeedsDDC(void) {
   for (int i = 0; i < 8; i++) {
@@ -2312,7 +2282,33 @@ static long softwareDimPercent(uint32_t display, long percent) {
   return percent;
 }
 
-static void ddcPost(uint32_t display, DDCSlot *slot, long percent, long floor);
+static BOOL ddcPost(uint32_t display, DDCSlot *slot, long percent, long floor);
+static void probeDDC(void);
+
+// Main thread. Finishes a change with the saving mode it was made with,
+// after the fact (an unconfirmed channel's write landing). A release that
+// waited on the lamp saves now that it landed.
+static BOOL finishBrightnessAs(uint32_t display, long percent, int saving) {
+  BrightnessSaving was = gBrightnessSaving;
+  gBrightnessSaving = saving == kSaveHeld ? kSaveHeld : kSaveNow;
+  BOOL ok = finishBrightness(display, percent);
+  gBrightnessSaving = was;
+  return ok;
+}
+
+// Main thread. An unconfirmed channel refused the write: the shade does all
+// of the dimming, never below kSoftwareDimFloor.
+static BOOL shadeInstead(uint32_t display, long percent, int saving) {
+  if (screenForDisplay(display) == nil) {
+    return NO;
+  }
+  restoreGamma(display);
+  if (percent < kSoftwareDimFloor) {
+    percent = kSoftwareDimFloor;
+  }
+  applyDim(display, percent);
+  return finishBrightnessAs(display, percent, saving);
+}
 
 static void forgetLandedSave(uint32_t display) {
   DDCSlot *slot = ddcSlot(display);
@@ -2363,31 +2359,59 @@ static void ddcLanded(DDCJob job) {
     slot->settled = job.seq;
     // The lamp refused a released drag. Keep the saved value.
     slot->saveWaiting = NO;
+    BOOL shaded = NO;
+    if (slot->applyWaiting) {
+      slot->applyWaiting = NO;
+      slot->combined = -1;
+      shaded = shadeInstead(job.display, slot->applyPercent, slot->applySaving);
+    }
+    // Finding 4: a confirmed channel that stops taking writes (sleep, a
+    // replug that kept the display ID, a retrained link) is demoted and
+    // probed again instead of being written to forever.
+    if (__atomic_load_n(&slot->max, __ATOMIC_ACQUIRE) > 0) {
+      __atomic_store_n(&slot->max, 0, __ATOMIC_RELEASE);
+      gDDCRevalidate = YES;
+      gDDCLast = 0;
+      probeDDC();
+    }
+    refreshKeyDisplays();
+    ddcFireWaiters(job.display, shaded);
     return;
   }
   long floor = slot->postFloor;
+  BOOL applying = slot->applyWaiting;
+  slot->applyWaiting = NO;
   ddcSettle(slot, &job);
   saveLandedBrightness(job.display, slot);
-  if (slot->combined < 0 || slot->combined > 100) {
-    return;
+  BOOL retrying = NO;
+  if (slot->combined >= 0 && slot->combined <= 100) {
+    long learned = ddcFloorPercent(job.display);
+    long hardware = 0;
+    long software = 100;
+    combinedLevels(slot->combined, learned, &hardware, &software);
+    int scale = ddcScale(__atomic_load_n(&slot->max, __ATOMIC_ACQUIRE));
+    int target = ddcLampValue(slot, hardware, learned, scale);
+    // A newly learned floor moves the split, so the shade follows it. Without
+    // one, a lamp well off target means the write didn't take.
+    BOOL off = learned != floor ? target != slot->current
+                                : !ddcNear(slot->current, target, scale);
+    if (learned != floor || applying) {
+      slot->postFloor = learned;
+      if (applying) {
+        restoreGamma(job.display);
+      }
+      applyDim(job.display, software);
+    }
+    if (off && slot->retries < 2) {
+      slot->retries++;
+      retrying = ddcPost(job.display, slot, hardware, learned);
+    }
   }
-  long learned = ddcFloorPercent(job.display);
-  long hardware = 0;
-  long software = 100;
-  combinedLevels(slot->combined, learned, &hardware, &software);
-  int scale = ddcScale(__atomic_load_n(&slot->max, __ATOMIC_ACQUIRE));
-  int target = ddcLampValue(slot, hardware, learned, scale);
-  // A newly learned floor moves the split, so the shade follows it. Without
-  // one, a lamp well off target means the write didn't take.
-  BOOL off = learned != floor ? target != slot->current
-                              : !ddcNear(slot->current, target, scale);
-  if (learned != floor) {
-    slot->postFloor = learned;
-    applyDim(job.display, software);
+  if (applying) {
+    finishBrightnessAs(job.display, slot->applyPercent, slot->applySaving);
   }
-  if (off && slot->retries < 2) {
-    slot->retries++;
-    ddcPost(job.display, slot, hardware, learned);
+  if (!retrying) {
+    ddcFireWaiters(job.display, YES);
   }
 }
 
@@ -2403,12 +2427,12 @@ static const int64_t kDDCSettleDelay = (int64_t)(150 * NSEC_PER_MSEC);
 // Main thread. Hands the newest lamp target to the worker and returns at once.
 // The worker drops any target that was replaced before it ran, writes the
 // rest, and reads back once the value has been idle for kDDCSettleDelay.
-static void ddcPost(uint32_t display, DDCSlot *slot, long percent, long floor) {
+static BOOL ddcPost(uint32_t display, DDCSlot *slot, long percent, long floor) {
   int scale = ddcScale(__atomic_load_n(&slot->max, __ATOMIC_ACQUIRE));
   int value = ddcLampValue(slot, percent, floor, scale);
   // Already there or already queued, e.g. a move inside the shade range.
   if (value == slot->posted) {
-    return;
+    return NO;
   }
   slot->posted = value;
   unsigned *latest = &slot->seq;
@@ -2440,29 +2464,111 @@ static void ddcPost(uint32_t display, DDCSlot *slot, long percent, long floor) {
       ddcDeliver(done);
     });
   });
+  return YES;
 }
 
 // Brightness asked for on an unconfirmed channel while a probe holds the DDC
 // queue. Writing it then would park the main thread, and the brightness-key
 // tap, behind the probe, so the newest value per display waits here and is
-// applied when the probe lands. Main thread only.
-static DisplayPercents gDeferredBrightness;
+// applied when the probe lands. gDeferredBrightness is declared above
+// clearDDCSlot.
 
-static BOOL setDisplayBrightnessWaiting(uint32_t display, long percent, BOOL wait) {
+// Finding 1, patch review N6. Online displays other than display that are
+// trusted to still show a picture (nsCountsAsLit): the built-in panel, or a
+// display whose brightness is read from the display itself. A display known
+// only through the software shade (a dummy plug, a virtual or DisplayLink
+// display, a monitor without working DDC) doesn't count.
+static BOOL hardwareBrightness(uint32_t display) {
+  float level = 0;
+  return ddcReady(display) || DisplayServicesCanChangeBrightness(display) ||
+         readCoreBrightness(display, &level);
+}
+
+static int litDisplaysBesides(uint32_t display) {
+  uint32_t ids[16];
+  int count = orderedDisplays(ids, 16);
+  NSOtherDisplay others[16];
+  int n = 0;
+  for (int i = 0; i < count; i++) {
+    uint32_t other = ids[i];
+    if (other == display) {
+      continue;
+    }
+    BOOL builtin = CGDisplayIsBuiltin(other) != 0;
+    others[n++] = (NSOtherDisplay){
+        .builtin = builtin,
+        .hardware = !builtin && hardwareBrightness(other),
+        .asleep = CGDisplayIsAsleep(other) != 0,
+        .mirrored = CGDisplayMirrorsDisplay(other) == display ||
+                    CGDisplayMirrorsDisplay(display) == other,
+        .percent = readPercent(other),
+    };
+  }
+  return nsLitDisplays(others, n);
+}
+
+// The percent display may be set to. Black on an external display only while
+// another display stays lit; otherwise the dimmest visible level.
+static long safeBrightness(uint32_t display, long percent) {
+  if (percent > 0) {
+    return percent > 100 ? 100 : percent;
+  }
+  BOOL builtin = CGDisplayIsBuiltin(display) != 0;
+  return nsSafeBrightness(percent, builtin, builtin ? 0 : litDisplaysBesides(display));
+}
+
+// Main thread. Finding 1 failsafe, after displays come or go and after
+// wake: if every display is black (the lit one was unplugged or its lid
+// closed), the first black external display comes back at
+// kNSRestoreMinimum.
+static BOOL setDisplayBrightness(uint32_t display, long percent);
+
+static void keepADisplayLit(void) {
+  uint32_t ids[16];
+  int count = orderedDisplays(ids, 16);
+  for (int i = 0; i < count; i++) {
+    if (CGDisplayIsBuiltin(ids[i]) || readPercent(ids[i]) != 0 ||
+        litDisplaysBesides(ids[i]) > 0) {
+      continue;
+    }
+    BrightnessSaving was = gBrightnessSaving;
+    gBrightnessSaving = kSaveNow;
+    setDisplayBrightness(ids[i], kNSRestoreMinimum);
+    gBrightnessSaving = was;
+    return;
+  }
+}
+
+// Sets a display's brightness. NO means it failed now and done is not
+// called. YES means it was applied or is on its way; done, when given, is
+// called once on the main thread when the lamp write lands (YES) or fails
+// (NO), right away for anything that isn't a DDC lamp. Nothing here waits
+// on the monitor (finding 5).
+static BOOL setDisplayBrightnessThen(uint32_t display, long percent, BrightnessDone done) {
   if (percent < 0) {
     percent = 0;
   }
   if (percent > 100) {
     percent = 100;
   }
+  percent = safeBrightness(display, percent);
+  DDCSlot *changed = ddcSlot(display);
+  if (changed != NULL) {
+    changed->changedAt = CFAbsoluteTimeGetCurrent();
+  }
   float level = (float)percent / 100.0f;
+  BOOL ok = NO;
   if (DisplayServicesCanChangeBrightness(display)) {
     if (DisplayServicesSetBrightness(display, level) != 0) {
       return NO;
     }
     restoreGamma(display);
     applyDim(display, 100);
-    return finishBrightness(display, percent);
+    ok = finishBrightness(display, percent);
+    if (ok && done != nil) {
+      done(YES);
+    }
+    return ok;
   }
   float current = 0;
   if (readCoreBrightness(display, &current)) {
@@ -2472,13 +2578,17 @@ static BOOL setDisplayBrightnessWaiting(uint32_t display, long percent, BOOL wai
                                   andDisplay:display]) {
       restoreGamma(display);
       applyDim(display, 100);
-      return finishBrightness(display, percent);
+      ok = finishBrightness(display, percent);
+      if (ok && done != nil) {
+        done(YES);
+      }
+      return ok;
     }
   }
   // Report the value now so the next key step builds on it. The CLI waits
-  // instead, since it prints what landed, and an older deferred value must
-  // not land after it.
-  if (wait) {
+  // for its own write instead, and an older deferred value must not land
+  // after it.
+  if (done != nil) {
     dropDisplayPercent(&gDeferredBrightness, display);
   } else if (gDDCBusy && ddcUnconfirmed(display) && putDisplayPercent(&gDeferredBrightness, display, percent)) {
     if (gSoftwareBrightness == nil) {
@@ -2493,68 +2603,71 @@ static BOOL setDisplayBrightnessWaiting(uint32_t display, long percent, BOOL wai
   combinedLevels(percent, floor, &hardware, &software);
   DDCSlot *slot = ddcSlot(display);
   // A confirmed channel is optimistic: shade, number and save happen now and
-  // the worker brings the lamp along. An unconfirmed one still waits, since a
-  // failed write there falls back to the shade below.
-  if (!wait && slot != NULL && __atomic_load_n(&slot->max, __ATOMIC_ACQUIRE) > 0) {
+  // the worker brings the lamp along.
+  if (slot != NULL && __atomic_load_n(&slot->max, __ATOMIC_ACQUIRE) > 0) {
     slot->retries = 0;
     slot->postFloor = floor;
+    slot->applyWaiting = NO;
     ddcRememberCombined(display, percent);
-    ddcPost(display, slot, hardware, floor);
+    BOOL posted = ddcPost(display, slot, hardware, floor);
     restoreGamma(display);
     applyDim(display, software);
     if (gBrightnessSaving == kSaveWhenLanded) {
       saveWhenLanded(display, slot, percent);
-      return YES;
+      ok = YES;
+    } else {
+      ok = finishBrightness(display, percent);
     }
-    return finishBrightness(display, percent);
-  }
-  long landed = hardware;
-  if (ddcSet(display, hardware, floor, &landed)) {
-    restoreGamma(display);
-    long learned = ddcFloorPercent(display);
-    if (learned != floor) {
-      long correctedHardware = hardware;
-      long correctedSoftware = software;
-      combinedLevels(percent, learned, &correctedHardware, &correctedSoftware);
-      // A failed correction leaves the lamp at the first write. Keep that shade.
-      if (correctedHardware == landed ||
-          ddcSet(display, correctedHardware, learned, &landed)) {
-        software = correctedSoftware;
+    if (ok && done != nil) {
+      if (posted || slot->settled != __atomic_load_n(&slot->seq, __ATOMIC_ACQUIRE)) {
+        ddcAddWaiter(display, done);
+      } else {
+        done(YES);
       }
     }
-    slot = ddcSlot(display);
-    if (slot != NULL) {
-      slot->postFloor = ddcFloorPercent(display);
-    }
+    return ok;
+  }
+  // An unconfirmed channel writes in the background too. Its number shows
+  // the new value now; the shade and the save wait for the write
+  // (ddcLanded), and a write that fails falls back to the shade there.
+  if (slot != NULL) {
+    slot->retries = 0;
+    slot->postFloor = floor;
+    slot->saveWaiting = NO;
     ddcRememberCombined(display, percent);
-    applyDim(display, software);
-    return finishBrightness(display, percent);
-  }
-  if (ddcReady(display)) {
-    return NO;
-  }
-  if ((ddcFailed(display) || ddcUnconfirmed(display)) &&
-      screenForDisplay(display) != nil) {
-    restoreGamma(display);
-    if (ddcUnconfirmed(display) && percent < kSoftwareDimFloor) {
-      percent = kSoftwareDimFloor;
-    } else {
-      percent = softwareDimPercent(display, percent);
+    slot->applyWaiting = YES;
+    slot->applyPercent = percent;
+    slot->applySaving = gBrightnessSaving;
+    slot->posted = -1;
+    ddcPost(display, slot, hardware, floor);
+    if (done != nil) {
+      ddcAddWaiter(display, done);
     }
+    return YES;
+  }
+  if (ddcFailed(display) && screenForDisplay(display) != nil) {
+    restoreGamma(display);
+    percent = softwareDimPercent(display, percent);
     applyDim(display, percent);
-    return finishBrightness(display, percent);
-  }
-  if (screenForDisplay(display) != nil) {
+    ok = finishBrightness(display, percent);
+  } else if (screenForDisplay(display) != nil) {
     return NO;
+  } else {
+    // No window can cover this display; dim its gamma, never to black.
+    float gammaLevel = percent > 0 && percent < kNSShadeFloor ? kNSShadeFloor / 100.0f : level;
+    if (!setGammaLevel(display, gammaLevel)) {
+      return NO;
+    }
+    ok = finishBrightness(display, percent);
   }
-  if (setGammaLevel(display, level)) {
-    return finishBrightness(display, percent);
+  if (ok && done != nil) {
+    done(YES);
   }
-  return NO;
+  return ok;
 }
 
 static BOOL setDisplayBrightness(uint32_t display, long percent) {
-  return setDisplayBrightnessWaiting(display, percent, NO);
+  return setDisplayBrightnessThen(display, percent, nil);
 }
 
 // Main thread, once a probe has landed and gDDCBusy is clear, so nothing
@@ -2651,6 +2764,7 @@ static void forgetOfflineDisplays(void) {
   }
   liftBrightnessHUD();
   noteCursorDisplaysOffline();
+  keepADisplayLit();
 }
 
 static void refitDimWindows(void) {
@@ -2685,7 +2799,6 @@ static void restoreSavedBrightness(void) {
       markDisplayRestored(ids[i]);
       continue;
     }
-    gSoftwareBrightness[@(ids[i])] = saved;
     long percent = lround(saved.doubleValue * 100.0);
     NSString *savedKey = displayBrightnessKey(ids[i]);
     BOOL legacyLamp = gCombinedBrightness == nil ||
@@ -2698,6 +2811,11 @@ static void restoreSavedBrightness(void) {
     if (converting) {
       percent = lampToCombined(percent, 0);
     }
+    // Finding 1: black and near-black don't survive a relaunch, so a login
+    // item can't start the session on a screen the user can't see.
+    percent = nsRestoredBrightness(percent);
+    legacy = nsRestoredBrightness(legacy);
+    gSoftwareBrightness[@(ids[i])] = @(percent / 100.0);
     if (percent >= 100) {
       markDisplayRestored(ids[i]);
       continue;
@@ -2712,15 +2830,21 @@ static void restoreSavedBrightness(void) {
       markDisplayRestored(ids[i]);
       continue;
     }
-    if (setDisplayBrightness(ids[i], percent)) {
-      // The write fell back to the shade, so the line was a shade percent
-      // all along. Put it back. Either save marks the line, so no later
-      // launch converts it again. This runs only once a probe has landed,
-      // with gDDCBusy clear, so the set above wrote instead of deferring.
-      if (converting && !ddcReady(ids[i]) && percent != legacy) {
-        setDisplayBrightness(ids[i], legacy);
-      }
-      markDisplayRestored(ids[i]);
+    // If the write falls back to the shade, the line was a shade percent
+    // all along. Put it back once that is known. Either save marks the line,
+    // so no later launch converts it again. This runs only once a probe has
+    // landed, with gDDCBusy clear, so the set writes instead of deferring.
+    uint32_t display = ids[i];
+    BrightnessDone check = nil;
+    if (converting && percent != legacy) {
+      check = ^(BOOL landed) {
+        if (!landed && !ddcReady(display)) {
+          setDisplayBrightness(display, legacy);
+        }
+      };
+    }
+    if (setDisplayBrightnessThen(display, percent, check)) {
+      markDisplayRestored(display);
     }
   }
 }
@@ -3236,6 +3360,12 @@ static BOOL knownDisplay(uint32_t display) {
   return NO;
 }
 
+// Set by a handler that keeps the connection to answer it later.
+static BOOL gKeepConnection = NO;
+// How long a CLI brightness reply waits for the lamp. Below main.m's
+// kBrightnessTimeout, so the CLI hears an answer.
+static const int64_t kBrightnessReplyWait = (int64_t)(8 * NSEC_PER_SEC);
+
 static BOOL handleControl(const char *buf, int fd) {
   if (strcmp(buf, "schedule") == 0) {
     BLStatus status;
@@ -3360,17 +3490,46 @@ static BOOL handleControl(const char *buf, int fd) {
     long percent = 0;
     int consumed = 0;
     if (sscanf(buf + 11, "%u %ld%n", &display, &percent, &consumed) != 2 ||
-        buf[11 + consumed] != '\0' || percent < 0 || percent > 100 ||
-        !knownDisplay(display) || !setDisplayBrightnessWaiting(display, percent, YES)) {
+        buf[11 + consumed] != '\0' || percent < 0 || percent > 100 || !knownDisplay(display)) {
       dprintf(fd, "failed\n");
       return YES;
     }
-    long shown = readPercent(display);
-    if (shown < 0) {
-      shown = softwareDimPercent(display, percent);
+    // Finding 5: the reply waits for the lamp write without blocking the
+    // main thread. The connection is ours now and is closed by answer, at
+    // the latest after kBrightnessReplyWait.
+    int reply = fd;
+    __block BOOL answered = NO;
+    void (^answer)(BOOL) = ^(BOOL ok) {
+      if (answered) {
+        return;
+      }
+      answered = YES;
+      long shown = readPercent(display);
+      if (shown < 0) {
+        shown = softwareDimPercent(display, percent);
+      }
+      if (ok) {
+        showBrightnessHUD(display, shown);
+        dprintf(reply, "%u %ld\n", display, shown);
+      } else {
+        dprintf(reply, "failed\n");
+      }
+      close(reply);
+    };
+    gKeepConnection = YES;
+    if (!setDisplayBrightnessThen(display, percent, ^(BOOL ok) {
+          answer(ok);
+        })) {
+      gKeepConnection = NO;
+      answered = YES;
+      dprintf(fd, "failed\n");
+      return YES;
     }
-    showBrightnessHUD(display, shown);
-    dprintf(fd, "%u %ld\n", display, shown);
+    // Still in flight: report the value it is heading for.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, kBrightnessReplyWait),
+                   dispatch_get_main_queue(), ^{
+                     answer(YES);
+                   });
     return YES;
   }
   if (strcmp(buf, "keys") == 0) {
@@ -4310,8 +4469,8 @@ static BOOL menuMotionAllowed(void) {
 }
 @end
 
-// Thin divider between menu sections, like the stock Sound menu's: one point
-// of the system separator color, inset to the content margins.
+// Thin divider between menu sections, like the stock Battery menu's: one
+// faint point, inset to the content margins.
 @interface MenuHairline : NSView
 @end
 
@@ -4322,7 +4481,15 @@ static BOOL menuMotionAllowed(void) {
 
 - (void)updateLayer {
   [self.effectiveAppearance performAsCurrentDrawingAppearance:^{
-    self.layer.backgroundColor = NSColor.separatorColor.CGColor;
+    // separatorColor reads as a dark rule inside a menu. Match the faint,
+    // slightly lighter line in the stock Battery menu instead.
+    BOOL dark = [self.effectiveAppearance
+                    bestMatchFromAppearancesWithNames:@[ NSAppearanceNameAqua,
+                                                         NSAppearanceNameDarkAqua ]] ==
+                NSAppearanceNameDarkAqua;
+    NSColor *color = dark ? [NSColor colorWithWhite:1 alpha:0.1]
+                          : [NSColor colorWithWhite:0 alpha:0.1];
+    self.layer.backgroundColor = color.CGColor;
   }];
 }
 
@@ -4396,7 +4563,7 @@ static BOOL gSettingsKeepsOpenForOtherApp = NO;
 
 static void openBrightnessKeyAccess(void) {
   for (NSWindow *window in NSApp.windows) {
-    if (window.isVisible && [window.title isEqualToString:@"Nightshift Settings"]) {
+    if (window.isVisible && [window.identifier isEqualToString:@"NightshiftSettings"]) {
       gSettingsKeepsOpenForOtherApp = YES;
     }
   }
@@ -4959,34 +5126,524 @@ static void openBrightnessKeyAccess(void) {
 }
 @end
 
-@interface SidebarHost : NSVisualEffectView
-@property(nonatomic, copy) void (^appearanceChanged)(void);
+// MARK: - Settings window
+
+// Menu bar choices, one "key value" per line in the support folder file
+// menubar, next to max, full, clock and sections:
+//   icon horizon
+//   warmth on
+static NSString *menuBarPrefsPath(void) {
+  return [[NSHomeDirectory()
+      stringByAppendingPathComponent:@"Library/Application Support/nightshift"]
+      stringByAppendingPathComponent:@"menubar"];
+}
+
+static NSMutableDictionary<NSString *, NSString *> *gMenuBarPrefs = nil;
+
+static NSMutableDictionary<NSString *, NSString *> *menuBarPrefs(void) {
+  if (gMenuBarPrefs != nil) {
+    return gMenuBarPrefs;
+  }
+  gMenuBarPrefs = [NSMutableDictionary dictionary];
+  NSString *text = [NSString stringWithContentsOfFile:menuBarPrefsPath()
+                                             encoding:NSUTF8StringEncoding
+                                                error:NULL];
+  NSCharacterSet *blank = NSCharacterSet.whitespaceAndNewlineCharacterSet;
+  for (NSString *line in [text componentsSeparatedByString:@"\n"]) {
+    NSString *trimmed = [line stringByTrimmingCharactersInSet:blank];
+    NSRange space = [trimmed rangeOfString:@" "];
+    if (space.location == NSNotFound || space.location == 0) {
+      continue;
+    }
+    NSString *key = [trimmed substringToIndex:space.location];
+    NSString *value =
+        [[trimmed substringFromIndex:space.location + 1] stringByTrimmingCharactersInSet:blank];
+    if (value.length > 0) {
+      gMenuBarPrefs[key] = value;
+    }
+  }
+  return gMenuBarPrefs;
+}
+
+static BOOL setMenuBarPref(NSString *key, NSString *value) {
+  NSMutableDictionary<NSString *, NSString *> *prefs = menuBarPrefs();
+  NSString *old = prefs[key];
+  prefs[key] = value;
+  NSMutableString *text = [NSMutableString string];
+  for (NSString *name in [prefs.allKeys sortedArrayUsingSelector:@selector(compare:)]) {
+    [text appendFormat:@"%@ %@\n", name, prefs[name]];
+  }
+  NSString *path = menuBarPrefsPath();
+  if (![text writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:NULL]) {
+    if (old != nil) {
+      prefs[key] = old;
+    } else {
+      [prefs removeObjectForKey:key];
+    }
+    fprintf(stderr, "failed to save menu bar settings\n");
+    return NO;
+  }
+  chmod(path.fileSystemRepresentation, S_IRUSR | S_IWUSR);
+  return YES;
+}
+
+static BOOL menuBarShowsWarmth(void) {
+  return [menuBarPrefs()[@"warmth"] isEqualToString:@"on"];
+}
+
+static BOOL appearanceIsDark(NSAppearance *appearance) {
+  NSAppearanceName match = [appearance
+      bestMatchFromAppearancesWithNames:@[ NSAppearanceNameAqua, NSAppearanceNameDarkAqua ]];
+  return [match isEqualToString:NSAppearanceNameDarkAqua];
+}
+
+// One icon the user can pick in Settings › General.
+//
+// Art drops in as bundle resources in Contents/Resources (phase 2):
+//   icon-<ident>.pdf (or .png)        the app icon tile, the full art with its
+//                                     transparent margin
+//   icon-<ident>-glyph.pdf (or .png)  the menu bar template glyph, black on
+//                                     clear, 1 unit = 1 pt
+// The design files are SVG (settings-mock/icons/<name>.svg and
+// <name>-glyph.svg); convert them on the Mac before bundling, for example
+// `rsvg-convert -f pdf -o icon-lamp-glyph.pdf lamp-glyph.svg`, and copy them
+// into Nightshift.app/Contents/Resources from the Makefile.
+// A choice with menuSymbol set shows that SF Symbol in the menu bar instead of
+// a bundled glyph: Horizon and Mono use sun.horizon, Thermometer uses
+// thermometer.medium. SF Symbols are fine in UI but not in app icons, so the
+// tile drawn here without bundled art is only a placeholder.
+@interface IconChoice : NSObject
+@property(nonatomic, copy) NSString *ident;
+@property(nonatomic, copy) NSString *name;
+@property(nonatomic, copy) NSString *menuSymbol;
+@property(nonatomic, copy) NSArray<NSColor *> *placeholderColors;
++ (NSArray<IconChoice *> *)all;
++ (IconChoice *)standard;
++ (IconChoice *)current;
+- (NSImage *)tileImageOfSize:(CGFloat)size;
+- (NSImage *)menuImage;
 @end
 
-@implementation SidebarHost
-- (void)viewDidChangeEffectiveAppearance {
-  [super viewDidChangeEffectiveAppearance];
-  if (self.appearanceChanged != nil) {
-    self.appearanceChanged();
+@implementation IconChoice
++ (IconChoice *)choice:(NSString *)ident
+                  name:(NSString *)name
+                symbol:(NSString *)symbol
+                colors:(NSArray<NSColor *> *)colors {
+  IconChoice *choice = [[IconChoice alloc] init];
+  choice.ident = ident;
+  choice.name = name;
+  choice.menuSymbol = symbol;
+  choice.placeholderColors = colors;
+  return choice;
+}
+
++ (NSArray<IconChoice *> *)all {
+  static NSArray<IconChoice *> *choices = nil;
+  static dispatch_once_t once;
+  dispatch_once(&once, ^{
+    NSColor *indigo = [NSColor colorWithSRGBRed:0.16 green:0.17 blue:0.42 alpha:1];
+    NSColor *violet = [NSColor colorWithSRGBRed:0.49 green:0.25 blue:0.53 alpha:1];
+    NSColor *amber = [NSColor colorWithSRGBRed:1.00 green:0.62 blue:0.34 alpha:1];
+    // Phase 1 offers Horizon only. Phase 2 adds, in this order, once their
+    // resources are bundled: Mono (symbol sun.horizon), Thermometer (symbol
+    // thermometer.medium), Dusk Moon, Warm Dial and Lamp (bundled glyphs,
+    // symbol nil).
+    choices = @[
+      [IconChoice choice:@"horizon"
+                    name:@"Horizon"
+                  symbol:@"sun.horizon"
+                  colors:@[ indigo, violet, amber ]],
+    ];
+  });
+  return choices;
+}
+
++ (IconChoice *)standard {
+  return [IconChoice all].firstObject;
+}
+
++ (IconChoice *)current {
+  NSString *saved = menuBarPrefs()[@"icon"];
+  for (IconChoice *choice in [IconChoice all]) {
+    if ([choice.ident isEqualToString:saved]) {
+      return choice;
+    }
   }
+  return [IconChoice standard];
+}
+
++ (NSImage *)bundled:(NSString *)name {
+  for (NSString *type in @[ @"pdf", @"png" ]) {
+    NSString *path = [NSBundle.mainBundle pathForResource:name ofType:type];
+    NSImage *image = path == nil ? nil : [[NSImage alloc] initWithContentsOfFile:path];
+    if (image != nil) {
+      return image;
+    }
+  }
+  return nil;
+}
+
+- (NSImage *)tileImageOfSize:(CGFloat)size {
+  NSImage *art = [IconChoice bundled:[@"icon-" stringByAppendingString:self.ident]];
+  if (art != nil) {
+    art = [art copy];
+    art.size = NSMakeSize(size, size);
+    return art;
+  }
+  NSArray<NSColor *> *colors = self.placeholderColors;
+  NSString *symbolName = self.menuSymbol;
+  return [NSImage imageWithSize:NSMakeSize(size, size)
+                        flipped:NO
+                 drawingHandler:^BOOL(NSRect rect) {
+                   // The art files keep about a tenth of margin, so the
+                   // placeholder does too.
+                   NSRect tileRect = NSInsetRect(rect, NSWidth(rect) * 0.1, NSWidth(rect) * 0.1);
+                   CGFloat radius = NSWidth(tileRect) * 0.225;
+                   NSBezierPath *tile = [NSBezierPath bezierPathWithRoundedRect:tileRect
+                                                                        xRadius:radius
+                                                                        yRadius:radius];
+                   NSGradient *gradient = [[NSGradient alloc] initWithColors:colors];
+                   [gradient drawInBezierPath:tile angle:-90];
+                   if (symbolName == nil) {
+                     return YES;
+                   }
+                   NSImageSymbolConfiguration *config = [[NSImageSymbolConfiguration
+                       configurationWithPointSize:NSWidth(tileRect) * 0.36
+                                           weight:NSFontWeightSemibold]
+                       configurationByApplyingConfiguration:
+                           [NSImageSymbolConfiguration
+                               configurationWithPaletteColors:@[ NSColor.whiteColor ]]];
+                   NSImage *symbol = [[NSImage imageWithSystemSymbolName:symbolName
+                                                 accessibilityDescription:nil]
+                       imageWithSymbolConfiguration:config];
+                   if (symbol == nil) {
+                     return YES;
+                   }
+                   NSSize s = symbol.size;
+                   NSRect target = NSMakeRect(NSMidX(tileRect) - s.width / 2,
+                                              NSMidY(tileRect) - s.height / 2, s.width, s.height);
+                   [symbol drawInRect:target
+                             fromRect:NSZeroRect
+                            operation:NSCompositingOperationSourceOver
+                             fraction:1];
+                   return YES;
+                 }];
+}
+
+- (NSImage *)menuImage {
+  NSImage *image = nil;
+  if (self.menuSymbol != nil) {
+    NSImageSymbolConfiguration *symbol =
+        [NSImageSymbolConfiguration configurationWithPointSize:16 weight:NSFontWeightRegular];
+    image = [[NSImage imageWithSystemSymbolName:self.menuSymbol
+                       accessibilityDescription:@"Nightshift"]
+        imageWithSymbolConfiguration:symbol];
+  } else {
+    image = [IconChoice bundled:[NSString stringWithFormat:@"icon-%@-glyph", self.ident]];
+    image.accessibilityDescription = @"Nightshift";
+  }
+  image.template = YES;
+  return image;
 }
 @end
 
-@interface SettingsPanel : NSObject <NSWindowDelegate>
+// Settings layout, modelled on System Settings.
+static const CGFloat kSettingsWidth = 720;
+static const CGFloat kSettingsHeight = 540;
+static const CGFloat kSettingsSidebarWidth = 200;
+static const CGFloat kFormWidth = 480;  // content pane 520 less 20 a side
+static const CGFloat kFormInset = 10;
+
+enum {
+  kPaneGeneral = 0,
+  kPaneNightShift,
+  kPaneDisplays,
+  kPaneLicense,
+  kPaneAbout,
+  kPaneCount,
+};
+
+static NSString *const kSettingsWindowID = @"NightshiftSettings";
+
+// The rounded inset box behind a group of rows.
+@interface FormGroupView : NSView
+@end
+
+@implementation FormGroupView
+- (BOOL)wantsUpdateLayer {
+  return YES;
+}
+
+- (void)updateLayer {
+  BOOL dark = appearanceIsDark(self.effectiveAppearance);
+  CGFloat scale = self.window != nil ? self.window.backingScaleFactor : 2;
+  self.layer.cornerRadius = 10;
+  self.layer.borderWidth = 1.0 / MAX(scale, 1);
+  self.layer.backgroundColor =
+      (dark ? [NSColor colorWithWhite:1 alpha:0.05] : [NSColor colorWithWhite:0 alpha:0.035])
+          .CGColor;
+  self.layer.borderColor =
+      (dark ? [NSColor colorWithWhite:1 alpha:0.08] : [NSColor colorWithWhite:0 alpha:0.07])
+          .CGColor;
+}
+
+- (void)viewDidChangeEffectiveAppearance {
+  [super viewDidChangeEffectiveAppearance];
+  self.needsDisplay = YES;
+}
+@end
+
+// A capsule label: the display status pill and the Pro badge.
+@interface PillView : NSView
+@property(nonatomic, strong) NSTextField *label;
+@property(nonatomic, strong) NSColor *color;
+@property(nonatomic) BOOL solid;
+- (instancetype)initWithText:(NSString *)text color:(NSColor *)color solid:(BOOL)solid;
+- (void)setText:(NSString *)text color:(NSColor *)color;
+@end
+
+@implementation PillView
+- (instancetype)initWithText:(NSString *)text color:(NSColor *)color solid:(BOOL)solid {
+  self = [super initWithFrame:NSZeroRect];
+  if (self == nil) {
+    return nil;
+  }
+  self.wantsLayer = YES;
+  self.solid = solid;
+  self.translatesAutoresizingMaskIntoConstraints = NO;
+  self.label = [NSTextField labelWithString:text];
+  self.label.font = [NSFont systemFontOfSize:solid ? 9.5 : 11 weight:NSFontWeightBold];
+  self.label.translatesAutoresizingMaskIntoConstraints = NO;
+  [self addSubview:self.label];
+  CGFloat pad = solid ? 5 : 8;
+  [NSLayoutConstraint activateConstraints:@[
+    [self.label.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:pad],
+    [self.label.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-pad],
+    [self.label.centerYAnchor constraintEqualToAnchor:self.centerYAnchor],
+    [self.heightAnchor constraintEqualToConstant:solid ? 15 : 20],
+  ]];
+  [self setContentHuggingPriority:NSLayoutPriorityRequired
+                   forOrientation:NSLayoutConstraintOrientationHorizontal];
+  [self setText:text color:color];
+  return self;
+}
+
+- (void)setText:(NSString *)text color:(NSColor *)color {
+  self.label.stringValue = text;
+  self.color = color;
+  self.label.textColor = self.solid ? NSColor.whiteColor : color;
+  self.needsDisplay = YES;
+}
+
+- (BOOL)wantsUpdateLayer {
+  return YES;
+}
+
+- (void)updateLayer {
+  [self.effectiveAppearance performAsCurrentDrawingAppearance:^{
+    NSColor *fill = self.solid ? self.color : [self.color colorWithAlphaComponent:0.16];
+    self.layer.backgroundColor = fill.CGColor;
+  }];
+  self.layer.cornerRadius = NSHeight(self.bounds) / 2;
+}
+
+- (void)layout {
+  [super layout];
+  self.needsDisplay = YES;
+}
+
+- (void)viewDidChangeEffectiveAppearance {
+  [super viewDidChangeEffectiveAppearance];
+  self.needsDisplay = YES;
+}
+@end
+
+// A small status dot, as in "● Allowed".
+@interface DotView : NSView
+@property(nonatomic, strong) NSColor *color;
+@end
+
+@implementation DotView
+- (void)drawRect:(NSRect)dirtyRect {
+  (void)dirtyRect;
+  [(self.color != nil ? self.color : NSColor.secondaryLabelColor) setFill];
+  [[NSBezierPath bezierPathWithOvalInRect:NSInsetRect(self.bounds, 0.5, 0.5)] fill];
+}
+@end
+
+// A row in a group: title and optional caption on the left, control on the
+// right.
+@interface FormRow : NSView
+@property(nonatomic, strong) NSTextField *titleField;
+@property(nonatomic, strong) NSTextField *captionField;
+@end
+
+@implementation FormRow
+@end
+
+// One choice in the icon picker: the tile, its name under it, and an accent
+// ring around the chosen one.
+@interface IconTile : NSView
+@property(nonatomic, strong) IconChoice *choice;
+@property(nonatomic, strong) NSImageView *imageView;
+@property(nonatomic, strong) NSTextField *nameField;
+@property(nonatomic) BOOL selected;
+@property(nonatomic, copy) void (^picked)(IconTile *tile);
+- (instancetype)initWithChoice:(IconChoice *)choice;
+@end
+
+// The image includes the art's margin; the visible tile is 80% of it.
+static const CGFloat kIconTileImage = 60;
+
+@implementation IconTile
+- (instancetype)initWithChoice:(IconChoice *)choice {
+  self = [super initWithFrame:NSZeroRect];
+  if (self == nil) {
+    return nil;
+  }
+  self.choice = choice;
+  self.translatesAutoresizingMaskIntoConstraints = NO;
+  self.imageView = [NSImageView imageViewWithImage:[choice tileImageOfSize:kIconTileImage]];
+  self.imageView.translatesAutoresizingMaskIntoConstraints = NO;
+  self.nameField = [NSTextField labelWithString:choice.name];
+  self.nameField.font = [NSFont systemFontOfSize:11];
+  self.nameField.alignment = NSTextAlignmentCenter;
+  self.nameField.translatesAutoresizingMaskIntoConstraints = NO;
+  [self addSubview:self.imageView];
+  [self addSubview:self.nameField];
+  [NSLayoutConstraint activateConstraints:@[
+    [self.widthAnchor constraintEqualToConstant:72],
+    [self.imageView.topAnchor constraintEqualToAnchor:self.topAnchor],
+    [self.imageView.centerXAnchor constraintEqualToAnchor:self.centerXAnchor],
+    [self.imageView.widthAnchor constraintEqualToConstant:kIconTileImage],
+    [self.imageView.heightAnchor constraintEqualToConstant:kIconTileImage],
+    [self.nameField.topAnchor constraintEqualToAnchor:self.imageView.bottomAnchor constant:1],
+    [self.nameField.centerXAnchor constraintEqualToAnchor:self.centerXAnchor],
+    [self.nameField.widthAnchor constraintLessThanOrEqualToAnchor:self.widthAnchor],
+    [self.nameField.bottomAnchor constraintEqualToAnchor:self.bottomAnchor],
+  ]];
+  return self;
+}
+
+- (void)setSelected:(BOOL)selected {
+  _selected = selected;
+  self.nameField.font =
+      [NSFont systemFontOfSize:11 weight:selected ? NSFontWeightSemibold : NSFontWeightRegular];
+  self.needsDisplay = YES;
+}
+
+- (void)drawRect:(NSRect)dirtyRect {
+  (void)dirtyRect;
+  if (!self.selected) {
+    return;
+  }
+  NSRect frame = self.imageView.frame;
+  NSRect tile = NSInsetRect(frame, NSWidth(frame) * 0.1, NSWidth(frame) * 0.1);
+  NSRect ring = NSInsetRect(tile, -3.5, -3.5);
+  CGFloat radius = NSWidth(tile) * 0.225 + 3.5;
+  NSBezierPath *path = [NSBezierPath bezierPathWithRoundedRect:ring xRadius:radius yRadius:radius];
+  path.lineWidth = 3;
+  [NSColor.controlAccentColor setStroke];
+  [path stroke];
+}
+
+- (BOOL)acceptsFirstMouse:(NSEvent *)event {
+  (void)event;
+  return YES;
+}
+
+- (void)mouseDown:(NSEvent *)event {
+  (void)event;
+  if (self.picked != nil) {
+    self.picked(self);
+  }
+}
+
+- (BOOL)isAccessibilityElement {
+  return YES;
+}
+
+- (NSAccessibilityRole)accessibilityRole {
+  return NSAccessibilityRadioButtonRole;
+}
+
+- (NSString *)accessibilityLabel {
+  return self.choice.name;
+}
+
+- (id)accessibilityValue {
+  return @(self.selected ? 1 : 0);
+}
+
+- (BOOL)accessibilityPerformPress {
+  if (self.picked != nil) {
+    self.picked(self);
+  }
+  return YES;
+}
+@end
+
+@interface SettingsFlippedView : NSView
+@end
+
+@implementation SettingsFlippedView
+- (BOOL)isFlipped {
+  return YES;
+}
+@end
+
+@interface SettingsPanel
+    : NSObject <NSWindowDelegate, NSTableViewDataSource, NSTableViewDelegate, NSToolbarDelegate>
 @property(nonatomic, strong) NSWindow *window;
-@property(nonatomic, strong) NSButton *generalButton;
-@property(nonatomic, strong) NSButton *displaysButton;
-@property(nonatomic, strong) NSButton *proButton;
-@property(nonatomic, strong) NSView *generalPage;
-@property(nonatomic, strong) NSView *displaysPage;
-@property(nonatomic, strong) NSView *proPage;
-@property(nonatomic, strong) NSButton *loginCheck;
-@property(nonatomic, strong) NSButton *cycleCheck;
+@property(nonatomic, strong) NSTableView *sidebarTable;
+@property(nonatomic, strong) NSSearchField *searchField;
+@property(nonatomic, strong) NSArray<NSNumber *> *visiblePanes;
+@property(nonatomic, strong) NSMutableArray<NSView *> *pages;
+@property(nonatomic, strong) NSMutableArray<NSMutableArray<NSString *> *> *paneWords;
+@property(nonatomic) NSInteger buildingPane;
+@property(nonatomic) BOOL selectingRow;
+// General
+@property(nonatomic, strong) NSSwitch *loginSwitch;
+@property(nonatomic, strong) NSSwitch *cycleSwitch;
+@property(nonatomic, strong) NSSwitch *warmthSwitch;
+@property(nonatomic, strong) NSMutableArray<IconTile *> *iconTiles;
+@property(nonatomic, copy) void (^iconPicked)(IconChoice *choice);
+// Night Shift
+@property(nonatomic, strong) NSPopUpButton *schedulePopup;
+@property(nonatomic, strong) NSTextField *timesLabel;
+@property(nonatomic, strong) NSSlider *maxSlider;
+@property(nonatomic, strong) NSTextField *maxValue;
+@property(nonatomic, strong) FormRow *maxRow;
+@property(nonatomic, strong) NSDatePicker *fullAtPicker;
+@property(nonatomic, strong) FormRow *fullAtRow;
+@property(nonatomic, strong) NSButton *unlockButton;
+@property(nonatomic) BOOL editingFullAt;
+// Displays
+@property(nonatomic, strong) NSStackView *displaysStack;
+@property(nonatomic, strong) NSMutableArray<NSView *> *displaySections;
+@property(nonatomic, strong) NSMutableArray<DisplayRow *> *displayRows;
+@property(nonatomic, copy) NSString *displaySignature;
+@property(nonatomic) uint32_t trackingDisplay;
+@property(nonatomic, weak) id brightnessTarget;
+@property(nonatomic) SEL brightnessAction;
+@property(nonatomic, strong) DotView *keysDot;
 @property(nonatomic, strong) NSTextField *keysStatus;
 @property(nonatomic, strong) NSButton *keysButton;
+// License
+@property(nonatomic, strong) DotView *licenseDot;
 @property(nonatomic, strong) NSTextField *licenseStatus;
+@property(nonatomic, strong) NSView *buySection;
 @property(nonatomic, strong) NSButton *buyButton;
+@property(nonatomic, strong) NSTextField *installIDLabel;
+@property(nonatomic, strong) NSButton *installIDCopyButton;
+@property(nonatomic) BOOL paid;
+@property(nonatomic) BOOL soon;
+@property(nonatomic, copy) NSString *until;
+@property(nonatomic) BOOL buying;
+// Window
 @property(nonatomic, copy) void (^becameKey)(void);
+@property(nonatomic, copy) void (^needsSync)(void);
+@property(nonatomic, strong) NSTimer *syncTimer;
 @property(nonatomic) NSInteger page;
 @property(nonatomic) BOOL stayOpen;
 @property(nonatomic, strong) id outsideMonitor;
@@ -4994,39 +5651,995 @@ static void openBrightnessKeyAccess(void) {
 - (void)showPage:(NSInteger)index;
 - (void)syncPaid:(BOOL)paid soon:(BOOL)soon until:(NSString *)until buying:(BOOL)buying;
 - (void)paintSidebar;
+- (void)showMaxValue:(long)value;
+- (void)showBrightness:(long)percent forDisplay:(uint32_t)display;
+- (int)fullAtMinute;
 @end
 
+// The top menu bar while Settings is open. There is deliberately no Quit
+// here: quitting the daemon would drop brightness and warmth.
+static void installSettingsMenu(void) {
+  if (NSApp.mainMenu != nil) {
+    return;
+  }
+  NSMenu *bar = [[NSMenu alloc] init];
+
+  NSMenuItem *appItem = [[NSMenuItem alloc] init];
+  NSMenu *appMenu = [[NSMenu alloc] initWithTitle:@"Nightshift"];
+  [appMenu addItemWithTitle:@"Close Nightshift Settings"
+                     action:@selector(performClose:)
+              keyEquivalent:@""];
+  appItem.submenu = appMenu;
+  [bar addItem:appItem];
+
+  NSMenuItem *editItem = [[NSMenuItem alloc] init];
+  NSMenu *edit = [[NSMenu alloc] initWithTitle:@"Edit"];
+  [edit addItemWithTitle:@"Undo" action:@selector(undo:) keyEquivalent:@"z"];
+  NSMenuItem *redo = [edit addItemWithTitle:@"Redo" action:@selector(redo:) keyEquivalent:@"z"];
+  redo.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagShift;
+  [edit addItem:[NSMenuItem separatorItem]];
+  [edit addItemWithTitle:@"Cut" action:@selector(cut:) keyEquivalent:@"x"];
+  [edit addItemWithTitle:@"Copy" action:@selector(copy:) keyEquivalent:@"c"];
+  [edit addItemWithTitle:@"Paste" action:@selector(paste:) keyEquivalent:@"v"];
+  [edit addItemWithTitle:@"Select All" action:@selector(selectAll:) keyEquivalent:@"a"];
+  editItem.submenu = edit;
+  [bar addItem:editItem];
+
+  NSMenuItem *windowItem = [[NSMenuItem alloc] init];
+  NSMenu *window = [[NSMenu alloc] initWithTitle:@"Window"];
+  [window addItemWithTitle:@"Close" action:@selector(performClose:) keyEquivalent:@"w"];
+  [window addItemWithTitle:@"Minimize"
+                    action:@selector(performMiniaturize:)
+             keyEquivalent:@"m"];
+  windowItem.submenu = window;
+  [bar addItem:windowItem];
+  NSApp.windowsMenu = window;
+
+  NSApp.mainMenu = bar;
+}
+
 @implementation SettingsPanel
-- (NSTextField *)heading:(NSString *)text {
-  NSTextField *label = [NSTextField labelWithString:text];
-  label.font = [NSFont systemFontOfSize:13 weight:NSFontWeightSemibold];
-  label.textColor = NSColor.labelColor;
-  return label;
+
+// MARK: Form helpers
+
+// Words the sidebar search matches for the pane being built.
+- (void)addWords:(NSString *)text {
+  if (text.length > 0 && self.buildingPane >= 0 && self.buildingPane < kPaneCount) {
+    [self.paneWords[(NSUInteger)self.buildingPane] addObject:text];
+  }
 }
 
-- (NSTextField *)bodyLabel:(NSString *)text {
+- (NSTextField *)captionLabel:(NSString *)text width:(CGFloat)width {
   NSTextField *label = [NSTextField wrappingLabelWithString:text];
-  label.font = [NSFont systemFontOfSize:NSFont.systemFontSize];
+  label.font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize];
   label.textColor = NSColor.secondaryLabelColor;
-  label.preferredMaxLayoutWidth = 350;
+  label.preferredMaxLayoutWidth = width;
+  label.selectable = NO;
   return label;
 }
 
-- (NSView *)pageWithViews:(NSArray<NSView *> *)views {
-  NSStackView *stack = [NSStackView stackViewWithViews:views];
+// A row: title and optional caption on the left, the control on the right.
+// Pass caption @"" for a caption that is filled in later.
+- (FormRow *)row:(NSString *)title caption:(NSString *)caption control:(NSView *)control {
+  [self addWords:title];
+  [self addWords:caption];
+  FormRow *row = [[FormRow alloc] initWithFrame:NSZeroRect];
+  row.translatesAutoresizingMaskIntoConstraints = NO;
+  CGFloat controlWidth = control == nil ? 0 : control.fittingSize.width + 16;
+  NSMutableArray<NSView *> *texts = [NSMutableArray array];
+  if (title.length > 0) {
+    row.titleField = [NSTextField labelWithString:title];
+    row.titleField.font = [NSFont systemFontOfSize:NSFont.systemFontSize];
+    row.titleField.textColor = NSColor.labelColor;
+    row.titleField.lineBreakMode = NSLineBreakByTruncatingTail;
+    [row.titleField
+        setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow
+                                 forOrientation:NSLayoutConstraintOrientationHorizontal];
+    [texts addObject:row.titleField];
+  }
+  if (caption != nil) {
+    row.captionField =
+        [self captionLabel:caption width:MAX(160, kFormWidth - 2 * kFormInset - controlWidth)];
+    [texts addObject:row.captionField];
+  }
+  NSStackView *text = [NSStackView stackViewWithViews:texts];
+  text.orientation = NSUserInterfaceLayoutOrientationVertical;
+  text.alignment = NSLayoutAttributeLeading;
+  text.spacing = 2;
+  text.detachesHiddenViews = YES;
+  [text setContentHuggingPriority:NSLayoutPriorityDefaultLow
+                   forOrientation:NSLayoutConstraintOrientationHorizontal];
+  NSMutableArray<NSView *> *parts = [NSMutableArray arrayWithObject:text];
+  if (control != nil) {
+    [control setContentHuggingPriority:NSLayoutPriorityRequired
+                        forOrientation:NSLayoutConstraintOrientationHorizontal];
+    [control setContentCompressionResistancePriority:NSLayoutPriorityRequired
+                                      forOrientation:NSLayoutConstraintOrientationHorizontal];
+    if ([control isKindOfClass:[NSControl class]] && title.length > 0 &&
+        control.accessibilityLabel.length == 0) {
+      control.accessibilityLabel = title;
+    }
+    [parts addObject:control];
+  }
+  NSStackView *line = [NSStackView stackViewWithViews:parts];
+  line.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+  line.alignment = NSLayoutAttributeCenterY;
+  line.spacing = 12;
+  line.distribution = NSStackViewDistributionFill;
+  line.edgeInsets = NSEdgeInsetsMake(9, kFormInset, 9, kFormInset);
+  line.translatesAutoresizingMaskIntoConstraints = NO;
+  [row addSubview:line];
+  [NSLayoutConstraint activateConstraints:@[
+    [line.leadingAnchor constraintEqualToAnchor:row.leadingAnchor],
+    [line.trailingAnchor constraintEqualToAnchor:row.trailingAnchor],
+    [line.topAnchor constraintEqualToAnchor:row.topAnchor],
+    [line.bottomAnchor constraintEqualToAnchor:row.bottomAnchor],
+    [row.widthAnchor constraintEqualToConstant:kFormWidth],
+    [row.heightAnchor constraintGreaterThanOrEqualToConstant:40],
+  ]];
+  return row;
+}
+
+// The hairline between rows, inset to the row text, one device pixel.
+- (NSView *)hairline {
+  MenuHairline *line = [[MenuHairline alloc] initWithFrame:NSZeroRect];
+  line.wantsLayer = YES;
+  line.translatesAutoresizingMaskIntoConstraints = NO;
+  CGFloat scale = NSScreen.mainScreen != nil ? NSScreen.mainScreen.backingScaleFactor : 2;
+  [line.widthAnchor constraintEqualToConstant:kFormWidth - 2 * kFormInset].active = YES;
+  [line.heightAnchor constraintEqualToConstant:1.0 / MAX(scale, 1)].active = YES;
+  return line;
+}
+
+- (NSView *)groupWithViews:(NSArray<NSView *> *)views {
+  NSMutableArray<NSView *> *parts = [NSMutableArray array];
+  for (NSView *view in views) {
+    if (parts.count > 0) {
+      [parts addObject:[self hairline]];
+    }
+    [parts addObject:view];
+  }
+  NSStackView *stack = [NSStackView stackViewWithViews:parts];
+  stack.orientation = NSUserInterfaceLayoutOrientationVertical;
+  stack.alignment = NSLayoutAttributeCenterX;
+  stack.spacing = 0;
+  stack.translatesAutoresizingMaskIntoConstraints = NO;
+  FormGroupView *group = [[FormGroupView alloc] initWithFrame:NSZeroRect];
+  group.wantsLayer = YES;
+  group.translatesAutoresizingMaskIntoConstraints = NO;
+  [group addSubview:stack];
+  [NSLayoutConstraint activateConstraints:@[
+    [stack.leadingAnchor constraintEqualToAnchor:group.leadingAnchor],
+    [stack.trailingAnchor constraintEqualToAnchor:group.trailingAnchor],
+    [stack.topAnchor constraintEqualToAnchor:group.topAnchor],
+    [stack.bottomAnchor constraintEqualToAnchor:group.bottomAnchor],
+    [group.widthAnchor constraintEqualToConstant:kFormWidth],
+  ]];
+  return group;
+}
+
+// A section: small secondary header, the rounded group, an optional footer.
+- (NSView *)section:(NSString *)header
+          accessory:(NSView *)accessory
+               rows:(NSArray<NSView *> *)rows
+             footer:(NSString *)footer {
+  NSMutableArray<NSView *> *parts = [NSMutableArray array];
+  if (header.length > 0) {
+    [self addWords:header];
+    NSTextField *title = [NSTextField labelWithString:header];
+    title.font = [NSFont systemFontOfSize:11 weight:NSFontWeightSemibold];
+    title.textColor = NSColor.secondaryLabelColor;
+    title.lineBreakMode = NSLineBreakByTruncatingTail;
+    NSMutableArray<NSView *> *headParts = [NSMutableArray arrayWithObject:title];
+    if (accessory != nil) {
+      [headParts addObject:accessory];
+    }
+    NSStackView *head = [NSStackView stackViewWithViews:headParts];
+    head.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+    head.alignment = NSLayoutAttributeCenterY;
+    head.spacing = 6;
+    head.edgeInsets = NSEdgeInsetsMake(0, kFormInset, 0, 0);
+    [parts addObject:head];
+  }
+  [parts addObject:[self groupWithViews:rows]];
+  if (footer.length > 0) {
+    [self addWords:footer];
+    NSTextField *foot = [self captionLabel:footer width:kFormWidth - 2 * kFormInset];
+    NSStackView *footBox = [NSStackView stackViewWithViews:@[ foot ]];
+    footBox.edgeInsets = NSEdgeInsetsMake(0, kFormInset, 0, kFormInset);
+    [parts addObject:footBox];
+  }
+  NSStackView *stack = [NSStackView stackViewWithViews:parts];
   stack.orientation = NSUserInterfaceLayoutOrientationVertical;
   stack.alignment = NSLayoutAttributeLeading;
-  stack.spacing = 10;
-  stack.edgeInsets = NSEdgeInsetsMake(20, 20, 20, 20);
+  stack.spacing = 6;
   stack.translatesAutoresizingMaskIntoConstraints = NO;
-  NSView *page = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 420, 240)];
-  [page addSubview:stack];
+  return stack;
+}
+
+// A scrolling page of sections, 18 pt apart. The scroll view's automatic
+// content insets keep the first section clear of the toolbar.
+- (NSScrollView *)pageWithSections:(NSArray<NSView *> *)sections stack:(NSStackView **)stackOut {
+  NSStackView *stack = [NSStackView stackViewWithViews:sections];
+  stack.orientation = NSUserInterfaceLayoutOrientationVertical;
+  stack.alignment = NSLayoutAttributeCenterX;
+  stack.spacing = 18;
+  stack.detachesHiddenViews = YES;
+  stack.edgeInsets = NSEdgeInsetsMake(6, 20, 20, 20);
+  stack.translatesAutoresizingMaskIntoConstraints = NO;
+  SettingsFlippedView *document = [[SettingsFlippedView alloc] initWithFrame:NSZeroRect];
+  document.translatesAutoresizingMaskIntoConstraints = NO;
+  [document addSubview:stack];
+  NSScrollView *scroll = [[NSScrollView alloc] initWithFrame:NSZeroRect];
+  scroll.drawsBackground = NO;
+  scroll.hasVerticalScroller = YES;
+  scroll.autohidesScrollers = YES;
+  scroll.translatesAutoresizingMaskIntoConstraints = NO;
+  scroll.documentView = document;
+  NSClipView *clip = scroll.contentView;
   [NSLayoutConstraint activateConstraints:@[
-    [stack.leadingAnchor constraintEqualToAnchor:page.leadingAnchor],
-    [stack.trailingAnchor constraintEqualToAnchor:page.trailingAnchor],
-    [stack.topAnchor constraintEqualToAnchor:page.topAnchor],
+    [stack.leadingAnchor constraintEqualToAnchor:document.leadingAnchor],
+    [stack.trailingAnchor constraintEqualToAnchor:document.trailingAnchor],
+    [stack.topAnchor constraintEqualToAnchor:document.topAnchor],
+    [stack.bottomAnchor constraintEqualToAnchor:document.bottomAnchor],
+    [document.leadingAnchor constraintEqualToAnchor:clip.leadingAnchor],
+    [document.trailingAnchor constraintEqualToAnchor:clip.trailingAnchor],
+    [document.topAnchor constraintEqualToAnchor:clip.topAnchor],
   ]];
+  if (stackOut != NULL) {
+    *stackOut = stack;
+  }
+  return scroll;
+}
+
+- (NSStackView *)hstack:(NSArray<NSView *> *)views spacing:(CGFloat)spacing {
+  NSStackView *stack = [NSStackView stackViewWithViews:views];
+  stack.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+  stack.alignment = NSLayoutAttributeCenterY;
+  stack.spacing = spacing;
+  stack.detachesHiddenViews = YES;
+  return stack;
+}
+
+- (NSStackView *)dot:(DotView * __strong *)dotOut label:(NSTextField * __strong *)labelOut {
+  DotView *dot = [[DotView alloc] initWithFrame:NSMakeRect(0, 0, 8, 8)];
+  dot.translatesAutoresizingMaskIntoConstraints = NO;
+  [dot.widthAnchor constraintEqualToConstant:8].active = YES;
+  [dot.heightAnchor constraintEqualToConstant:8].active = YES;
+  NSTextField *label = [NSTextField labelWithString:@""];
+  label.font = [NSFont systemFontOfSize:NSFont.systemFontSize];
+  label.textColor = NSColor.secondaryLabelColor;
+  *dotOut = dot;
+  *labelOut = label;
+  return [self hstack:@[ dot, label ] spacing:6];
+}
+
+- (NSButton *)pushButton:(NSString *)title action:(SEL)action {
+  NSButton *button = [NSButton buttonWithTitle:title target:self action:action];
+  button.bezelStyle = NSBezelStyleRounded;
+  return button;
+}
+
+- (NSTextField *)secondaryLabel:(NSString *)text {
+  NSTextField *label = [NSTextField labelWithString:text];
+  label.font = [NSFont systemFontOfSize:NSFont.systemFontSize];
+  label.textColor = NSColor.secondaryLabelColor;
+  return label;
+}
+
+- (NSTextField *)valueLabel {
+  NSTextField *value = [NSTextField labelWithString:@"—"];
+  value.font = [NSFont monospacedDigitSystemFontOfSize:NSFont.systemFontSize
+                                                 weight:NSFontWeightRegular];
+  value.textColor = NSColor.secondaryLabelColor;
+  value.alignment = NSTextAlignmentRight;
+  [value.widthAnchor constraintEqualToConstant:40].active = YES;
+  return value;
+}
+
+- (NSSlider *)formSlider:(CGFloat)width {
+  ReleaseSlider *slider = [[ReleaseSlider alloc] initWithFrame:NSZeroRect];
+  slider.minValue = 0;
+  slider.maxValue = 100;
+  slider.continuous = YES;
+  slider.translatesAutoresizingMaskIntoConstraints = NO;
+  [slider.widthAnchor constraintEqualToConstant:width].active = YES;
+  tintSlider(slider);
+  return slider;
+}
+
+// MARK: General
+
+- (NSView *)iconPickerRow {
+  self.iconTiles = [NSMutableArray array];
+  NSMutableArray<NSView *> *tiles = [NSMutableArray array];
+  __weak SettingsPanel *panel = self;
+  for (IconChoice *choice in [IconChoice all]) {
+    IconTile *tile = [[IconTile alloc] initWithChoice:choice];
+    tile.picked = ^(IconTile *picked) {
+      [panel pickIcon:picked.choice];
+    };
+    [self.iconTiles addObject:tile];
+    [tiles addObject:tile];
+    [self addWords:choice.name];
+  }
+  NSStackView *strip = [self hstack:tiles spacing:4];
+  strip.alignment = NSLayoutAttributeTop;
+  strip.edgeInsets = NSEdgeInsetsMake(12, kFormInset - 4, 8, kFormInset);
+  [strip setAccessibilityRole:NSAccessibilityRadioGroupRole];
+  strip.accessibilityLabel = @"Icon";
+  NSStackView *box = [NSStackView stackViewWithViews:@[ strip ]];
+  box.orientation = NSUserInterfaceLayoutOrientationVertical;
+  box.alignment = NSLayoutAttributeLeading;
+  [box.widthAnchor constraintEqualToConstant:kFormWidth].active = YES;
+  [self syncIconTiles];
+  return box;
+}
+
+- (void)pickIcon:(IconChoice *)choice {
+  if (self.iconPicked != nil) {
+    self.iconPicked(choice);
+  }
+  [self syncIconTiles];
+}
+
+- (void)syncIconTiles {
+  NSString *current = [IconChoice current].ident;
+  for (IconTile *tile in self.iconTiles) {
+    tile.selected = [tile.choice.ident isEqualToString:current];
+  }
+}
+
+- (NSView *)generalPane {
+  self.loginSwitch = [[NSSwitch alloc] initWithFrame:NSZeroRect];
+  self.cycleSwitch = [[NSSwitch alloc] initWithFrame:NSZeroRect];
+  self.warmthSwitch = [[NSSwitch alloc] initWithFrame:NSZeroRect];
+  NSButton *notifications = [self pushButton:@"Open…" action:@selector(openNotifications:)];
+  notifications.accessibilityLabel = @"Open Notification settings";
+
+  NSView *startup = [self section:@"Startup"
+                        accessory:nil
+                             rows:@[ [self row:@"Open at login"
+                                         caption:@"Nightshift starts when you log in and keeps "
+                                                 @"the evening ramp running."
+                                         control:self.loginSwitch] ]
+                           footer:nil];
+  [self addWords:@"Menu bar"];
+  NSView *icon = [self section:@"Icon"
+                     accessory:nil
+                          rows:@[
+                            [self iconPickerRow],
+                            [self row:@"Show warmth next to icon"
+                                caption:@"Shows the current warmth, like 64%, in the menu bar."
+                                control:self.warmthSwitch],
+                          ]
+                        footer:@"Sets the menu bar icon. More icons are on the way."];
+  NSView *clock = [self section:@"Clock"
+                      accessory:nil
+                           rows:@[ [self row:@"24-hour time"
+                                       caption:@"Full at in the menu and in Settings uses "
+                                               @"24-hour time."
+                                       control:self.cycleSwitch] ]
+                         footer:nil];
+  NSView *alerts = [self section:@"Notifications"
+                       accessory:nil
+                            rows:@[ [self row:@"Notification style"
+                                        caption:@"Warmth banners can stay on screen. Choose "
+                                                @"Alerts for Nightshift."
+                                        control:notifications] ]
+                          footer:nil];
+  return [self pageWithSections:@[ startup, icon, clock, alerts ] stack:NULL];
+}
+
+// MARK: Night Shift
+
+- (NSView *)nightShiftPane {
+  self.schedulePopup = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
+  NSArray<NSString *> *titles = @[ @"Off", @"Custom", @"Sunset to Sunrise" ];
+  NSInteger modes[3] = {0, 2, 1};
+  for (NSUInteger i = 0; i < titles.count; i++) {
+    [self.schedulePopup addItemWithTitle:titles[i]];
+    self.schedulePopup.lastItem.tag = modes[i];
+    [self addWords:titles[i]];
+  }
+
+  // Night Shift's hours can only be read here; nothing in Nightshift sets
+  // them yet, so the row hands off to System Settings.
+  self.timesLabel = [self secondaryLabel:@"—"];
+  self.timesLabel.font = [NSFont monospacedDigitSystemFontOfSize:NSFont.systemFontSize
+                                                         weight:NSFontWeightRegular];
+  NSButton *change = [self pushButton:@"Change…" action:@selector(openNightShiftSettings:)];
+  change.accessibilityLabel = @"Change hours in System Settings";
+  FormRow *hours = [self row:@"Hours"
+                     caption:@"Set in System Settings › Displays › Night Shift."
+                     control:[self hstack:@[ self.timesLabel, change ] spacing:10]];
+
+  NSView *schedule = [self section:@"Schedule"
+                         accessory:nil
+                              rows:@[
+                                [self row:@"Schedule"
+                                    caption:@"Custom runs the evening ramp between your hours."
+                                    control:self.schedulePopup],
+                                hours,
+                              ]
+                            footer:nil];
+
+  self.maxSlider = [self formSlider:150];
+  self.maxSlider.minValue = 1;
+  self.maxValue = [self valueLabel];
+  NSTextField *less = [self secondaryLabel:@"Less Warm"];
+  less.font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize];
+  NSTextField *more = [self secondaryLabel:@"More Warm"];
+  more.font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize];
+  NSStackView *maxControl = [self hstack:@[ less, self.maxSlider, more, self.maxValue ]
+                                 spacing:8];
+  self.maxRow = [self row:@"Max" caption:@"" control:maxControl];
+  NSView *warmth = [self section:@"Warmth" accessory:nil rows:@[ self.maxRow ] footer:nil];
+
+  self.fullAtPicker = [[NSDatePicker alloc] initWithFrame:NSZeroRect];
+  self.fullAtPicker.datePickerStyle = NSDatePickerStyleTextFieldAndStepper;
+  self.fullAtPicker.datePickerElements = NSDatePickerElementFlagHourMinute;
+  self.fullAtPicker.datePickerMode = NSDatePickerModeSingle;
+  self.fullAtPicker.bezeled = YES;
+  self.fullAtPicker.calendar = [NSCalendar calendarWithIdentifier:NSCalendarIdentifierGregorian];
+  self.fullAtPicker.timeZone = [NSTimeZone localTimeZone];
+  self.unlockButton = [self pushButton:@"Unlock…" action:@selector(showLicensePane:)];
+  self.fullAtRow =
+      [self row:@"Full at"
+          caption:@""
+          control:[self hstack:@[ self.unlockButton, self.fullAtPicker ] spacing:8]];
+  PillView *pro = [[PillView alloc] initWithText:@"PRO"
+                                           color:NSColor.controlAccentColor
+                                           solid:YES];
+  [self addWords:@"Pro"];
+  [self addWords:@"Ramp"];
+  NSView *ramp = [self section:@"Evening Ramp"
+                     accessory:pro
+                          rows:@[ self.fullAtRow ]
+                        footer:@"On a Custom schedule, warmth starts low and climbs to Max over "
+                               @"two hours, or by Full at. After Full at, it holds at Max."];
+  // PHASE 2: a Ramp length row (popup: 1, 2, 3 hours) joins Evening Ramp, and
+  // a "Tonight" section with the warmth-over-time chart goes here, between
+  // Evening Ramp and the end of the page.
+  return [self pageWithSections:@[ schedule, warmth, ramp ] stack:NULL];
+}
+
+- (void)syncNightShift {
+  BLStatus status;
+  BOOL known = readStatus(gClient, &status);
+  NSInteger mode = known ? status.mode : -1;
+  if (mode >= 0 && self.schedulePopup.selectedTag != mode) {
+    [self.schedulePopup selectItemWithTag:mode];
+  }
+  self.schedulePopup.enabled = known;
+  BOOL custom = mode == kModeCustom;
+  if (known && custom) {
+    int from = status.schedule.from.hour * 60 + status.schedule.from.minute;
+    int to = status.schedule.to.hour * 60 + status.schedule.to.minute;
+    self.timesLabel.stringValue =
+        [NSString stringWithFormat:@"%@ – %@", clockString(from), clockString(to)];
+  } else if (known && mode == 1) {
+    self.timesLabel.stringValue = @"Sunset – Sunrise";
+  } else {
+    self.timesLabel.stringValue = @"—";
+  }
+
+  BOOL paid = self.paid;
+  self.maxSlider.enabled = paid;
+  self.maxRow.captionField.stringValue =
+      paid ? @"The warmest the ramp gets. Current warmth stays at or below it."
+           : @"Max is part of Nightshift Pro.";
+  long now = 0;
+  long maxv = 0;
+  const char *state = NULL;
+  int full = -1;
+  if (warmthStatus(&now, &maxv, &state, &full)) {
+    if (maxv >= 1) {
+      [self showMaxValue:maxv];
+    } else {
+      self.maxSlider.doubleValue = now >= 1 && now <= 100 ? now : 50;
+      self.maxValue.stringValue = @"—";
+    }
+  }
+
+  self.unlockButton.hidden = paid;
+  BOOL rampOn = paid && custom;
+  self.fullAtPicker.enabled = rampOn;
+  if (!paid) {
+    self.fullAtRow.captionField.stringValue = @"Upgrade to Pro to set when the ramp is full.";
+  } else if (!custom) {
+    self.fullAtRow.captionField.stringValue = @"Choose the Custom schedule to use Full at.";
+  } else {
+    self.fullAtRow.captionField.stringValue = @"When warmth reaches Max.";
+  }
+  // Leave the picker alone while it is being typed in.
+  BOOL editing = self.editingFullAt ||
+                 (self.window.firstResponder != nil &&
+                  [self.window.firstResponder isKindOfClass:[NSView class]] &&
+                  [(NSView *)self.window.firstResponder isDescendantOf:self.fullAtPicker]);
+  if (!editing) {
+    BOOL h24 = hourCycleIs24();
+    self.fullAtPicker.locale =
+        [NSLocale localeWithLocaleIdentifier:h24 ? @"en_GB" : @"en_US_POSIX"];
+    int minute = gRampClock >= 0 ? gRampClock : gFullAt;
+    if (minute < 0) {
+      minute = minutesNow();
+    }
+    if (minute < 0) {
+      minute = 0;
+    }
+    NSDateComponents *parts = [[NSDateComponents alloc] init];
+    parts.year = 2001;
+    parts.month = 1;
+    parts.day = 1;
+    parts.hour = minute / 60;
+    parts.minute = minute % 60;
+    NSDate *date = [self.fullAtPicker.calendar dateFromComponents:parts];
+    if (date != nil && ![date isEqualToDate:self.fullAtPicker.dateValue]) {
+      self.fullAtPicker.dateValue = date;
+    }
+  }
+}
+
+- (int)fullAtMinute {
+  NSDateComponents *parts =
+      [self.fullAtPicker.calendar components:NSCalendarUnitHour | NSCalendarUnitMinute
+                                    fromDate:self.fullAtPicker.dateValue];
+  if (parts == nil) {
+    return -1;
+  }
+  return (int)(parts.hour * 60 + parts.minute);
+}
+
+- (void)showMaxValue:(long)value {
+  if (llround(self.maxSlider.doubleValue) != value) {
+    self.maxSlider.doubleValue = value;
+  }
+  self.maxValue.stringValue = [NSString stringWithFormat:@"%ld%%", value];
+}
+
+- (void)showLicensePane:(id)sender {
+  (void)sender;
+  [self applyPage:kPaneLicense];
+}
+
+- (void)openNightShiftSettings:(id)sender {
+  (void)sender;
+  gSettingsKeepsOpenForOtherApp = YES;
+  NSURL *url = [NSURL URLWithString:@"x-apple.systempreferences:com.apple.Displays-Settings."
+                                    @"extension?nightShift"];
+  if (url != nil) {
+    [[NSWorkspace sharedWorkspace] openURL:url];
+  }
+}
+
+// MARK: Displays
+
+static void displayKind(uint32_t display, NSString **text, NSColor **color) {
+  float level = 0;
+  if (CGDisplayIsBuiltin(display)) {
+    *text = @"Built-in backlight";
+    *color = NSColor.secondaryLabelColor;
+  } else if (ddcReady(display)) {
+    *text = @"DDC/CI connected";
+    *color = NSColor.systemGreenColor;
+  } else if (ddcPending(display) || ddcUnconfirmed(display)) {
+    *text = @"Checking DDC/CI…";
+    *color = NSColor.secondaryLabelColor;
+  } else if (readCoreBrightness(display, &level)) {
+    *text = @"Backlight";
+    *color = NSColor.secondaryLabelColor;
+  } else {
+    *text = @"Dimming overlay";
+    *color = NSColor.systemOrangeColor;
+  }
+}
+
+static NSString *displaySignature(uint32_t *ids, int count) {
+  NSMutableString *signature = [NSMutableString string];
+  for (int i = 0; i < count; i++) {
+    NSString *kind = nil;
+    NSColor *color = nil;
+    displayKind(ids[i], &kind, &color);
+    [signature appendFormat:@"%u:%@:%@;", ids[i], displayTitle(ids[i]), kind];
+  }
+  return signature;
+}
+
+- (NSView *)displaysPane {
+  self.displaySections = [NSMutableArray array];
+  self.displayRows = [NSMutableArray array];
+  [self addWords:@"Brightness"];
+  [self addWords:@"Display"];
+  [self addWords:@"DDC/CI"];
+
+  self.keysButton = [NSButton buttonWithTitle:@"Open Accessibility Settings…"
+                                       target:nil
+                                       action:NULL];
+  self.keysButton.bezelStyle = NSBezelStyleRounded;
+  DotView *dot = nil;
+  NSTextField *status = nil;
+  NSStackView *keysState = [self dot:&dot label:&status];
+  self.keysDot = dot;
+  self.keysStatus = status;
+  FormRow *keysRow = [self row:@"Brightness Keys"
+                       caption:@"The brightness keys change the display under the pointer. "
+                               @"They need Accessibility access."
+                       control:keysState];
+  FormRow *keysOpen = [self row:@"" caption:nil control:self.keysButton];
+  NSView *keys = [self section:@"Keyboard"
+                     accessory:nil
+                          rows:@[ keysRow, keysOpen ]
+                        footer:@"The lower half of the range dims the picture after the "
+                               @"backlight is as low as it will go. Turn on DDC/CI in the "
+                               @"monitor's menu to change an external display's backlight."];
+  NSStackView *stack = nil;
+  NSScrollView *page = [self pageWithSections:@[ keys ] stack:&stack];
+  self.displaysStack = stack;
   return page;
+}
+
+- (void)rebuildDisplays:(uint32_t *)ids count:(int)count {
+  for (NSView *section in self.displaySections) {
+    [self.displaysStack removeArrangedSubview:section];
+    [section removeFromSuperview];
+  }
+  [self.displaySections removeAllObjects];
+  [self.displayRows removeAllObjects];
+  NSInteger saved = self.buildingPane;
+  self.buildingPane = kPaneDisplays;
+  for (int i = 0; i < count; i++) {
+    NSString *name = displayTitle(ids[i]);
+    NSString *kind = nil;
+    NSColor *color = nil;
+    displayKind(ids[i], &kind, &color);
+    PillView *pill = [[PillView alloc] initWithText:kind color:color solid:NO];
+    FormRow *control = [self row:@"Control" caption:nil control:pill];
+
+    NSSlider *slider = [self formSlider:200];
+    slider.tag = (NSInteger)ids[i];
+    slider.target = self.brightnessTarget;
+    slider.action = self.brightnessAction;
+    NSTextField *value = [self valueLabel];
+    FormRow *brightness = [self row:@"Brightness"
+                            caption:nil
+                            control:[self hstack:@[ slider, value ] spacing:8]];
+    slider.accessibilityLabel = [NSString stringWithFormat:@"%@ brightness", name];
+    // PHASE 2: Lowest brightness (a floor for the keys and the ramp) and a
+    // DDC/CI Test button join this group.
+    NSView *section = [self section:name
+                          accessory:nil
+                               rows:@[ control, brightness ]
+                             footer:nil];
+    DisplayRow *row = [[DisplayRow alloc] init];
+    row.display = ids[i];
+    row.slider = slider;
+    row.valueLabel = value;
+    [self.displayRows addObject:row];
+    [self.displaySections addObject:section];
+    [self.displaysStack insertArrangedSubview:section atIndex:(NSUInteger)i];
+  }
+  self.buildingPane = saved;
+}
+
+- (void)syncDisplays {
+  uint32_t ids[16];
+  int count = orderedDisplays(ids, 16);
+  NSString *signature = displaySignature(ids, count);
+  if (self.trackingDisplay == 0 && ![signature isEqualToString:self.displaySignature]) {
+    self.displaySignature = signature;
+    [self rebuildDisplays:ids count:count];
+  }
+  for (DisplayRow *row in self.displayRows) {
+    if (row.display == self.trackingDisplay) {
+      continue;
+    }
+    float level = 0;
+    BOOL writable = NO;
+    BOOL readable = readDisplayBrightness(row.display, &level, &writable);
+    row.slider.enabled = readable && writable;
+    if (!readable) {
+      row.valueLabel.stringValue = @"—";
+      continue;
+    }
+    long percent = MAX(0L, MIN(100L, (long)llround(level * 100.0)));
+    [self showBrightness:percent forDisplay:row.display];
+  }
+  BOOL keys = brightnessKeysReady();
+  self.keysDot.color = keys ? NSColor.systemGreenColor : NSColor.systemOrangeColor;
+  self.keysDot.needsDisplay = YES;
+  self.keysStatus.stringValue = keys ? @"Allowed" : @"Not allowed";
+}
+
+- (void)showBrightness:(long)percent forDisplay:(uint32_t)display {
+  for (DisplayRow *row in self.displayRows) {
+    if (row.display == display) {
+      if (llround(row.slider.doubleValue) != percent) {
+        row.slider.doubleValue = percent;
+      }
+      row.valueLabel.stringValue = [NSString stringWithFormat:@"%ld%%", percent];
+      return;
+    }
+  }
+}
+
+- (void)screensChanged:(NSNotification *)notification {
+  (void)notification;
+  if (self.window.isVisible) {
+    [self syncDisplays];
+  }
+}
+
+// MARK: License
+
+static NSString *licenseDay(NSString *until) {
+  NSDateFormatter *parse = [[NSDateFormatter alloc] init];
+  parse.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+  parse.timeZone = [NSTimeZone timeZoneWithAbbreviation:@"UTC"];
+  parse.dateFormat = @"yyyy-MM-dd";
+  NSDate *date = [parse dateFromString:until];
+  if (date == nil) {
+    return until;
+  }
+  NSDateFormatter *show = [[NSDateFormatter alloc] init];
+  show.timeZone = parse.timeZone;
+  show.dateStyle = NSDateFormatterMediumStyle;
+  show.timeStyle = NSDateFormatterNoStyle;
+  return [show stringFromDate:date];
+}
+
+- (NSView *)licensePane {
+  NSImageView *icon =
+      [NSImageView imageViewWithImage:[[IconChoice standard] tileImageOfSize:64]];
+  NSTextField *name = [NSTextField labelWithString:@"Nightshift Pro"];
+  name.font = [NSFont systemFontOfSize:17 weight:NSFontWeightSemibold];
+  DotView *dot = nil;
+  NSTextField *status = nil;
+  NSStackView *state = [self dot:&dot label:&status];
+  self.licenseDot = dot;
+  self.licenseStatus = status;
+  NSStackView *titles = [NSStackView stackViewWithViews:@[ name, state ]];
+  titles.orientation = NSUserInterfaceLayoutOrientationVertical;
+  titles.alignment = NSLayoutAttributeLeading;
+  titles.spacing = 4;
+  NSStackView *hero = [self hstack:@[ icon, titles ] spacing:12];
+  hero.edgeInsets = NSEdgeInsetsMake(12, kFormInset, 12, kFormInset);
+  [hero.widthAnchor constraintEqualToConstant:kFormWidth].active = YES;
+  NSTextField *about =
+      [self captionLabel:@"Pro unlocks the evening ramp, Max and Full at. Warmth, brightness, "
+                         @"Dark mode, and True Tone stay free."
+                   width:kFormWidth - 2 * kFormInset];
+  NSStackView *aboutBox = [NSStackView stackViewWithViews:@[ about ]];
+  aboutBox.edgeInsets = NSEdgeInsetsMake(0, kFormInset, 12, kFormInset);
+  [self addWords:@"Nightshift Pro"];
+  [self addWords:about.stringValue];
+  NSStackView *heroBox = [NSStackView stackViewWithViews:@[ hero, aboutBox ]];
+  heroBox.orientation = NSUserInterfaceLayoutOrientationVertical;
+  heroBox.alignment = NSLayoutAttributeLeading;
+  heroBox.spacing = 0;
+  NSView *summary = [self section:nil accessory:nil rows:@[ heroBox ] footer:nil];
+
+  self.buyButton = [NSButton buttonWithTitle:@"Unlock the ramp" target:nil action:NULL];
+  self.buyButton.bezelStyle = NSBezelStyleRounded;
+  self.buyButton.keyEquivalent = @"";
+  self.buySection = [self section:@"Purchase"
+                        accessory:nil
+                             rows:@[ [self row:@"Nightshift Pro"
+                                         caption:@"Opens checkout in your browser. Nightshift "
+                                                 @"picks up the license when you finish."
+                                         control:self.buyButton] ]
+                           footer:nil];
+  // TODO: Manage Subscription. The billing portal only comes back from
+  // /checkout as a 409 when no license is saved here (rampBeginPurchase sets
+  // portal), so there is no way to open it for an active license yet. Add a
+  // row here once the server has a portal endpoint for a saved license.
+
+  self.installIDLabel = [NSTextField labelWithString:rampInstallID() ?: @"—"];
+  self.installIDLabel.font = [NSFont monospacedSystemFontOfSize:NSFont.smallSystemFontSize
+                                                         weight:NSFontWeightRegular];
+  self.installIDLabel.textColor = NSColor.secondaryLabelColor;
+  self.installIDLabel.lineBreakMode = NSLineBreakByTruncatingMiddle;
+  self.installIDLabel.selectable = YES;
+  [self.installIDLabel.widthAnchor constraintLessThanOrEqualToConstant:230].active = YES;
+  [self.installIDLabel
+      setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow
+                               forOrientation:NSLayoutConstraintOrientationHorizontal];
+  NSImage *copyImage = [NSImage imageWithSystemSymbolName:@"doc.on.doc"
+                                 accessibilityDescription:@"Copy Install ID"];
+  self.installIDCopyButton = [NSButton buttonWithImage:copyImage
+                                       target:self
+                                       action:@selector(copyInstallID:)];
+  self.installIDCopyButton.bezelStyle = NSBezelStyleRounded;
+  self.installIDCopyButton.toolTip = @"Copy";
+  NSView *mac = [self section:@"This Mac"
+                    accessory:nil
+                         rows:@[ [self row:@"Install ID"
+                                     caption:@"Support may ask for this."
+                                     control:[self hstack:@[ self.installIDLabel, self.installIDCopyButton ]
+                                                  spacing:6]] ]
+                       footer:nil];
+  return [self pageWithSections:@[ summary, self.buySection, mac ] stack:NULL];
+}
+
+- (void)syncLicense {
+  NSString *text = nil;
+  NSColor *color = nil;
+  if (self.buying) {
+    text = @"Waiting for checkout…";
+    color = NSColor.systemOrangeColor;
+  } else if (self.paid && self.until != nil && self.soon) {
+    text = [NSString stringWithFormat:@"Ends %@", licenseDay(self.until)];
+    color = NSColor.systemOrangeColor;
+  } else if (self.paid && self.until != nil) {
+    text = [NSString stringWithFormat:@"Active through %@", licenseDay(self.until)];
+    color = NSColor.systemGreenColor;
+  } else if (self.paid) {
+    text = @"Active";
+    color = NSColor.systemGreenColor;
+  } else {
+    text = @"Not active";
+    color = NSColor.secondaryLabelColor;
+  }
+  self.licenseStatus.stringValue = text;
+  self.licenseDot.color = color;
+  self.licenseDot.needsDisplay = YES;
+  self.buySection.hidden = self.paid && !self.soon;
+  self.buyButton.title = self.soon ? @"Renew…" : @"Buy…";
+  self.buyButton.enabled = !self.buying;
+  NSString *installID = rampInstallID();
+  if (installID.length > 0 && ![installID isEqualToString:self.installIDLabel.stringValue]) {
+    self.installIDLabel.stringValue = installID;
+  }
+  self.installIDCopyButton.enabled = installID.length > 0;
+}
+
+- (void)copyInstallID:(id)sender {
+  (void)sender;
+  NSString *installID = rampInstallID();
+  if (installID.length == 0) {
+    return;
+  }
+  NSPasteboard *board = NSPasteboard.generalPasteboard;
+  [board clearContents];
+  [board setString:installID forType:NSPasteboardTypeString];
+  NSButton *button = self.installIDCopyButton;
+  button.image = [NSImage imageWithSystemSymbolName:@"checkmark"
+                           accessibilityDescription:@"Copied"];
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+                 dispatch_get_main_queue(), ^{
+                   button.image = [NSImage imageWithSystemSymbolName:@"doc.on.doc"
+                                            accessibilityDescription:@"Copy Install ID"];
+                 });
+}
+
+// MARK: About
+
+- (NSView *)aboutPane {
+  NSImageView *icon =
+      [NSImageView imageViewWithImage:[[IconChoice standard] tileImageOfSize:96]];
+  NSTextField *name = [NSTextField labelWithString:@"Nightshift"];
+  name.font = [NSFont systemFontOfSize:22 weight:NSFontWeightSemibold];
+  NSDictionary *info = NSBundle.mainBundle.infoDictionary;
+  NSString *version = info[@"CFBundleShortVersionString"];
+  NSString *build = info[@"CFBundleVersion"];
+  NSString *versionText = version == nil ? @"Development build"
+                          : build == nil ? [NSString stringWithFormat:@"Version %@", version]
+                                         : [NSString stringWithFormat:@"Version %@ (%@)",
+                                                                      version, build];
+  NSTextField *versionLabel = [self secondaryLabel:versionText];
+  versionLabel.selectable = YES;
+  NSStackView *hero = [NSStackView stackViewWithViews:@[ icon, name, versionLabel ]];
+  hero.orientation = NSUserInterfaceLayoutOrientationVertical;
+  hero.alignment = NSLayoutAttributeCenterX;
+  hero.spacing = 4;
+  [hero setCustomSpacing:8 afterView:icon];
+  hero.edgeInsets = NSEdgeInsetsMake(10, 0, 4, 0);
+  [hero.widthAnchor constraintEqualToConstant:kFormWidth].active = YES;
+  [self addWords:@"Version"];
+
+  NSButton *github = [self pushButton:@"GitHub" action:@selector(openLink:)];
+  github.identifier = @"https://github.com/freechie/nightshift";
+  NSButton *issues = [self pushButton:@"Report an Issue…" action:@selector(openLink:)];
+  issues.identifier = @"https://github.com/freechie/nightshift/issues";
+  // TODO: a Privacy link once a privacy page exists. No Acknowledgements row:
+  // Nightshift ships no third-party code.
+  NSView *links = [self section:@"Links"
+                      accessory:nil
+                           rows:@[
+                             [self row:@"Source code" caption:nil control:github],
+                             [self row:@"Feedback" caption:nil control:issues],
+                           ]
+                         footer:nil];
+  NSView *legal = [self section:@"License"
+                      accessory:nil
+                           rows:@[ [self row:@"Copyright 2026 John."
+                                        caption:@"Licensed under the Apache License 2.0."
+                                        control:nil] ]
+                         footer:nil];
+  // No Check for Updates: Nightshift has no updater. Add it here with one.
+  return [self pageWithSections:@[ hero, links, legal ] stack:NULL];
+}
+
+- (void)openLink:(NSButton *)sender {
+  NSURL *url = [NSURL URLWithString:sender.identifier];
+  if (url != nil) {
+    [[NSWorkspace sharedWorkspace] openURL:url];
+  }
+}
+
+// MARK: Window
+
+static NSString *paneTitle(NSInteger pane) {
+  switch (pane) {
+    case kPaneGeneral: return @"General";
+    case kPaneNightShift: return @"Night Shift";
+    case kPaneDisplays: return @"Displays";
+    case kPaneLicense: return @"License";
+    case kPaneAbout: return @"About";
+    default: return @"";
+  }
+}
+
+static NSString *paneSymbol(NSInteger pane) {
+  switch (pane) {
+    case kPaneGeneral: return @"gearshape.fill";
+    case kPaneNightShift: return @"sun.horizon.fill";
+    case kPaneDisplays: return @"display";
+    case kPaneLicense: return @"checkmark.seal.fill";
+    case kPaneAbout: return @"info.circle.fill";
+    default: return @"questionmark";
+  }
+}
+
+static NSColor *paneColor(NSInteger pane) {
+  switch (pane) {
+    case kPaneGeneral: return NSColor.systemGrayColor;
+    case kPaneNightShift: return NSColor.systemOrangeColor;
+    case kPaneDisplays: return NSColor.systemBlueColor;
+    case kPaneLicense: return NSColor.systemGreenColor;
+    case kPaneAbout: return NSColor.systemGrayColor;
+    default: return NSColor.systemGrayColor;
+  }
+}
+
+// A System Settings sidebar tile: a white symbol on a colored rounded square.
+static NSImage *sidebarTile(NSInteger pane, CGFloat size) {
+  NSString *symbolName = paneSymbol(pane);
+  NSColor *color = paneColor(pane);
+  return [NSImage imageWithSize:NSMakeSize(size, size)
+                        flipped:NO
+                 drawingHandler:^BOOL(NSRect rect) {
+                   NSBezierPath *tile = [NSBezierPath bezierPathWithRoundedRect:rect
+                                                                        xRadius:size * 0.225
+                                                                        yRadius:size * 0.225];
+                   [[color blendedColorWithFraction:0.18 ofColor:NSColor.whiteColor] setFill];
+                   [tile fill];
+                   NSGradient *shade = [[NSGradient alloc]
+                       initWithStartingColor:[NSColor colorWithWhite:1 alpha:0.0]
+                                 endingColor:[NSColor colorWithWhite:0 alpha:0.12]];
+                   [shade drawInBezierPath:tile angle:-90];
+                   NSImageSymbolConfiguration *config = [[NSImageSymbolConfiguration
+                       configurationWithPointSize:size * 0.55
+                                           weight:NSFontWeightMedium]
+                       configurationByApplyingConfiguration:
+                           [NSImageSymbolConfiguration
+                               configurationWithPaletteColors:@[ NSColor.whiteColor ]]];
+                   NSImage *symbol = [[NSImage imageWithSystemSymbolName:symbolName
+                                                 accessibilityDescription:nil]
+                       imageWithSymbolConfiguration:config];
+                   if (symbol != nil) {
+                     NSSize s = symbol.size;
+                     CGFloat fit = MIN(1, size * 0.68 / MAX(s.width, s.height));
+                     s = NSMakeSize(s.width * fit, s.height * fit);
+                     [symbol drawInRect:NSMakeRect(NSMidX(rect) - s.width / 2,
+                                                   NSMidY(rect) - s.height / 2, s.width,
+                                                   s.height)
+                               fromRect:NSZeroRect
+                              operation:NSCompositingOperationSourceOver
+                               fraction:1];
+                   }
+                   return YES;
+                 }];
 }
 
 - (instancetype)init {
@@ -5034,216 +6647,293 @@ static void openBrightnessKeyAccess(void) {
   if (self == nil) {
     return nil;
   }
-  self.loginCheck = [NSButton checkboxWithTitle:@"Open at login" target:nil action:NULL];
-  self.loginCheck.font = [NSFont systemFontOfSize:NSFont.systemFontSize];
-  self.cycleCheck = [NSButton checkboxWithTitle:@"24-hour time" target:nil action:NULL];
-  self.cycleCheck.font = [NSFont systemFontOfSize:NSFont.systemFontSize];
-  NSButton *notifications = [NSButton buttonWithTitle:@"Notification style"
-                                               target:self
-                                               action:@selector(openNotifications:)];
-  notifications.bezelStyle = NSBezelStyleRounded;
-  NSTextField *loginBody =
-      [self bodyLabel:@"Nightshift starts when you log in and keeps the evening ramp running."];
-  NSTextField *clockBody = [self bodyLabel:@"Full at in the menu uses 24-hour time."];
-  NSView *general = [self pageWithViews:@[
-    [self heading:@"Startup"], self.loginCheck, loginBody, [self heading:@"Clock"],
-    self.cycleCheck, clockBody, [self heading:@"Notifications"], notifications,
-    [self bodyLabel:@"Warmth banners can stay on screen. Choose Alerts for Nightshift."]
-  ]];
-  NSStackView *generalStack = general.subviews.firstObject;
-  [generalStack setCustomSpacing:18 afterView:loginBody];
-  [generalStack setCustomSpacing:18 afterView:clockBody];
+  self.pages = [NSMutableArray array];
+  self.paneWords = [NSMutableArray array];
+  for (NSInteger pane = 0; pane < kPaneCount; pane++) {
+    [self.paneWords addObject:[NSMutableArray arrayWithObject:paneTitle(pane)]];
+  }
+  self.visiblePanes = @[ @(kPaneGeneral), @(kPaneNightShift), @(kPaneDisplays), @(kPaneLicense),
+                         @(kPaneAbout) ];
+  self.page = -1;
 
-  self.keysStatus = [NSTextField wrappingLabelWithString:@"Brightness keys need Accessibility."];
-  self.keysStatus.font = [NSFont systemFontOfSize:NSFont.systemFontSize];
-  self.keysStatus.preferredMaxLayoutWidth = 350;
-  self.keysButton = [NSButton buttonWithTitle:@"Allow brightness keys" target:nil action:NULL];
-  self.keysButton.bezelStyle = NSBezelStyleRounded;
-  NSTextField *keysBody = [self
-      bodyLabel:@"The brightness keys change the display under the pointer."];
-  NSView *displays = [self pageWithViews:@[
-    [self heading:@"Brightness keys"], self.keysStatus, self.keysButton, keysBody,
-    [self heading:@"External displays"],
-    [self bodyLabel:@"The lower half of the range dims the picture after the backlight "
-                    @"is as low as it will go. Turn on DDC/CI in the monitor menu to change "
-                    @"the backlight."]
-  ]];
-  NSStackView *displaysStack = displays.subviews.firstObject;
-  [displaysStack setCustomSpacing:18 afterView:keysBody];
+  // Shortcuts has no pane: there are no shortcuts to set yet, and an empty
+  // "coming soon" page reads as unfinished. Add kPaneShortcuts with the feature.
+  for (NSInteger pane = 0; pane < kPaneCount; pane++) {
+    self.buildingPane = pane;
+    NSView *page = nil;
+    switch (pane) {
+      case kPaneGeneral: page = [self generalPane]; break;
+      case kPaneNightShift: page = [self nightShiftPane]; break;
+      case kPaneDisplays: page = [self displaysPane]; break;
+      case kPaneLicense: page = [self licensePane]; break;
+      default: page = [self aboutPane]; break;
+    }
+    [self.pages addObject:page];
+  }
+  self.buildingPane = -1;
 
-  self.licenseStatus = [NSTextField wrappingLabelWithString:@"The ramp is a paid feature."];
-  self.licenseStatus.font = [NSFont systemFontOfSize:NSFont.systemFontSize];
-  self.licenseStatus.preferredMaxLayoutWidth = 350;
-  self.buyButton = [NSButton buttonWithTitle:@"Unlock the ramp" target:nil action:NULL];
-  self.buyButton.bezelStyle = NSBezelStyleRounded;
-  NSView *pro = [self pageWithViews:@[
-    self.licenseStatus,
-    [self bodyLabel:@"Pro unlocks the evening ramp. On a Custom schedule, warmth starts at 1 "
-                    @"and climbs to Max over two hours, or by Full at. After Full at, Current "
-                    @"and Max move together. Warmth, brightness, Dark mode, and True Tone stay free."],
-    self.buyButton
-  ]];
-
-  self.generalPage = general;
-  self.displaysPage = displays;
-  self.proPage = pro;
-  self.generalButton = [self sidebarButton:@"General" page:0];
-  self.displaysButton = [self sidebarButton:@"Displays" page:1];
-  self.proButton = [self sidebarButton:@"Nightshift Pro" page:2];
-
-  SidebarHost *sidebar = [[SidebarHost alloc] initWithFrame:NSZeroRect];
-  sidebar.material = NSVisualEffectMaterialSidebar;
-  sidebar.blendingMode = NSVisualEffectBlendingModeBehindWindow;
-  sidebar.translatesAutoresizingMaskIntoConstraints = NO;
-  NSStackView *rows = [NSStackView
-      stackViewWithViews:@[ self.generalButton, self.displaysButton, self.proButton ]];
-  rows.orientation = NSUserInterfaceLayoutOrientationVertical;
-  rows.alignment = NSLayoutAttributeLeading;
-  rows.spacing = 2;
-  rows.edgeInsets = NSEdgeInsetsMake(12, 8, 12, 8);
-  rows.translatesAutoresizingMaskIntoConstraints = NO;
-  [sidebar addSubview:rows];
-
-  NSBox *divider = [[NSBox alloc] initWithFrame:NSZeroRect];
-  divider.boxType = NSBoxSeparator;
-  divider.translatesAutoresizingMaskIntoConstraints = NO;
-
-  NSView *host = [[NSView alloc] initWithFrame:NSZeroRect];
-  host.translatesAutoresizingMaskIntoConstraints = NO;
-  for (NSView *page in @[ general, displays, pro ]) {
+  // Content: every page stacked in one view, one shown at a time.
+  NSView *content = [[NSView alloc] initWithFrame:NSZeroRect];
+  for (NSView *page in self.pages) {
     page.translatesAutoresizingMaskIntoConstraints = NO;
-    [host addSubview:page];
+    [content addSubview:page];
     [NSLayoutConstraint activateConstraints:@[
-      [page.leadingAnchor constraintEqualToAnchor:host.leadingAnchor],
-      [page.trailingAnchor constraintEqualToAnchor:host.trailingAnchor],
-      [page.topAnchor constraintEqualToAnchor:host.topAnchor],
-      [page.bottomAnchor constraintEqualToAnchor:host.bottomAnchor],
+      [page.leadingAnchor constraintEqualToAnchor:content.leadingAnchor],
+      [page.trailingAnchor constraintEqualToAnchor:content.trailingAnchor],
+      [page.topAnchor constraintEqualToAnchor:content.topAnchor],
+      [page.bottomAnchor constraintEqualToAnchor:content.bottomAnchor],
     ]];
   }
+  NSViewController *contentController = [[NSViewController alloc] init];
+  contentController.view = content;
 
-  NSView *root = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 560, 420)];
-  root.translatesAutoresizingMaskIntoConstraints = NO;
-  [root addSubview:sidebar];
-  [root addSubview:divider];
-  [root addSubview:host];
+  // Sidebar: search field over a source list.
+  self.searchField = [[NSSearchField alloc] initWithFrame:NSZeroRect];
+  self.searchField.placeholderString = @"Search";
+  self.searchField.sendsSearchStringImmediately = YES;
+  self.searchField.target = self;
+  self.searchField.action = @selector(searchChanged:);
+  self.searchField.translatesAutoresizingMaskIntoConstraints = NO;
+  self.sidebarTable = [[NSTableView alloc] initWithFrame:NSZeroRect];
+  NSTableColumn *column = [[NSTableColumn alloc] initWithIdentifier:@"pane"];
+  [self.sidebarTable addTableColumn:column];
+  self.sidebarTable.headerView = nil;
+  self.sidebarTable.style = NSTableViewStyleSourceList;
+  self.sidebarTable.rowHeight = 30;
+  self.sidebarTable.intercellSpacing = NSMakeSize(0, 2);
+  self.sidebarTable.backgroundColor = NSColor.clearColor;
+  self.sidebarTable.allowsEmptySelection = YES;
+  self.sidebarTable.dataSource = self;
+  self.sidebarTable.delegate = self;
+  self.sidebarTable.accessibilityLabel = @"Settings sections";
+  NSScrollView *tableScroll = [[NSScrollView alloc] initWithFrame:NSZeroRect];
+  tableScroll.documentView = self.sidebarTable;
+  tableScroll.drawsBackground = NO;
+  tableScroll.hasVerticalScroller = YES;
+  tableScroll.autohidesScrollers = YES;
+  tableScroll.automaticallyAdjustsContentInsets = NO;
+  tableScroll.translatesAutoresizingMaskIntoConstraints = NO;
+  NSView *sidebar = [[NSView alloc] initWithFrame:NSZeroRect];
+  [sidebar addSubview:self.searchField];
+  [sidebar addSubview:tableScroll];
   [NSLayoutConstraint activateConstraints:@[
-    [root.widthAnchor constraintEqualToConstant:560],
-    [root.heightAnchor constraintEqualToConstant:420],
-    [sidebar.leadingAnchor constraintEqualToAnchor:root.leadingAnchor],
-    [sidebar.topAnchor constraintEqualToAnchor:root.topAnchor],
-    [sidebar.bottomAnchor constraintEqualToAnchor:root.bottomAnchor],
-    [sidebar.widthAnchor constraintEqualToConstant:168],
-    [rows.leadingAnchor constraintEqualToAnchor:sidebar.leadingAnchor],
-    [rows.trailingAnchor constraintEqualToAnchor:sidebar.trailingAnchor],
-    [rows.topAnchor constraintEqualToAnchor:sidebar.topAnchor],
-    [divider.leadingAnchor constraintEqualToAnchor:sidebar.trailingAnchor],
-    [divider.topAnchor constraintEqualToAnchor:root.topAnchor],
-    [divider.bottomAnchor constraintEqualToAnchor:root.bottomAnchor],
-    [divider.widthAnchor constraintEqualToConstant:1],
-    [host.leadingAnchor constraintEqualToAnchor:divider.trailingAnchor],
-    [host.trailingAnchor constraintEqualToAnchor:root.trailingAnchor],
-    [host.topAnchor constraintEqualToAnchor:root.topAnchor],
-    [host.bottomAnchor constraintEqualToAnchor:root.bottomAnchor],
+    [self.searchField.topAnchor constraintEqualToAnchor:sidebar.safeAreaLayoutGuide.topAnchor
+                                               constant:4],
+    [self.searchField.leadingAnchor constraintEqualToAnchor:sidebar.leadingAnchor constant:10],
+    [self.searchField.trailingAnchor constraintEqualToAnchor:sidebar.trailingAnchor
+                                                    constant:-10],
+    [tableScroll.topAnchor constraintEqualToAnchor:self.searchField.bottomAnchor constant:8],
+    [tableScroll.leadingAnchor constraintEqualToAnchor:sidebar.leadingAnchor],
+    [tableScroll.trailingAnchor constraintEqualToAnchor:sidebar.trailingAnchor],
+    [tableScroll.bottomAnchor constraintEqualToAnchor:sidebar.bottomAnchor],
   ]];
+  NSViewController *sidebarController = [[NSViewController alloc] init];
+  sidebarController.view = sidebar;
 
-  NSViewController *controller = [[NSViewController alloc] init];
-  controller.view = root;
-  controller.preferredContentSize = NSMakeSize(560, 420);
+  NSSplitViewController *split = [[NSSplitViewController alloc] init];
+  NSSplitViewItem *sidebarItem = [NSSplitViewItem sidebarWithViewController:sidebarController];
+  sidebarItem.minimumThickness = kSettingsSidebarWidth;
+  sidebarItem.maximumThickness = kSettingsSidebarWidth;
+  sidebarItem.canCollapse = NO;
+  NSSplitViewItem *contentItem = [NSSplitViewItem splitViewItemWithViewController:contentController];
+  [split addSplitViewItem:sidebarItem];
+  [split addSplitViewItem:contentItem];
+
   self.window = [[NSWindow alloc]
-      initWithContentRect:NSMakeRect(0, 0, 560, 420)
+      initWithContentRect:NSMakeRect(0, 0, kSettingsWidth, kSettingsHeight)
                 styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
-                          NSWindowStyleMaskMiniaturizable
+                          NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskFullSizeContentView
                   backing:NSBackingStoreBuffered
                     defer:NO];
+  self.window.contentViewController = split;
+  [self.window setContentSize:NSMakeSize(kSettingsWidth, kSettingsHeight)];
+  self.window.contentMinSize = NSMakeSize(kSettingsWidth, kSettingsHeight);
+  self.window.contentMaxSize = NSMakeSize(kSettingsWidth, kSettingsHeight);
+  self.window.identifier = kSettingsWindowID;
   self.window.title = @"Nightshift Settings";
+  self.window.titlebarAppearsTransparent = NO;
+  self.window.toolbarStyle = NSWindowToolbarStyleUnified;
+  NSToolbar *toolbar = [[NSToolbar alloc] initWithIdentifier:@"NightshiftSettingsToolbar"];
+  toolbar.delegate = self;
+  toolbar.displayMode = NSToolbarDisplayModeIconOnly;
+  toolbar.allowsUserCustomization = NO;
+  self.window.toolbar = toolbar;
   self.window.releasedWhenClosed = NO;
   self.window.hidesOnDeactivate = NO;
   self.window.canHide = NO;
-  self.window.opaque = YES;
-  self.window.backgroundColor = NSColor.windowBackgroundColor;
-  self.window.contentMinSize = NSMakeSize(560, 420);
-  self.window.contentViewController = controller;
   self.window.delegate = self;
   [[NSNotificationCenter defaultCenter]
       addObserver:self
          selector:@selector(appResigned:)
              name:NSApplicationDidResignActiveNotification
            object:nil];
+  [[NSNotificationCenter defaultCenter]
+      addObserver:self
+         selector:@selector(screensChanged:)
+             name:NSApplicationDidChangeScreenParametersNotification
+           object:nil];
+  [self.sidebarTable reloadData];
   [self.window center];
-  [self applyPage:0];
-  __weak SettingsPanel *panel = self;
-  sidebar.appearanceChanged = ^{
-    [panel paintSidebar];
-  };
+  [self applyPage:kPaneGeneral];
   return self;
 }
 
-- (NSButton *)sidebarButton:(NSString *)title page:(NSInteger)page {
-  NSButton *button = [NSButton buttonWithTitle:title target:self action:@selector(sidebarClicked:)];
-  button.tag = page;
-  button.identifier = title;
-  button.bordered = NO;
-  button.alignment = NSTextAlignmentLeft;
-  button.lineBreakMode = NSLineBreakByTruncatingTail;
-  button.font = [NSFont systemFontOfSize:13];
-  button.wantsLayer = YES;
-  button.layer.cornerRadius = 6;
-  button.translatesAutoresizingMaskIntoConstraints = NO;
-  [button setContentCompressionResistancePriority:NSLayoutPriorityRequired
-                                   forOrientation:NSLayoutConstraintOrientationHorizontal];
-  [button.widthAnchor constraintEqualToConstant:152].active = YES;
-  [button.heightAnchor constraintEqualToConstant:28].active = YES;
-  return button;
+// The toolbar only carries the sidebar separator, so the pane title sits over
+// the content as in System Settings.
+- (NSArray<NSToolbarItemIdentifier> *)toolbarDefaultItemIdentifiers:(NSToolbar *)toolbar {
+  (void)toolbar;
+  return @[ NSToolbarSidebarTrackingSeparatorItemIdentifier ];
 }
 
-- (void)sidebarClicked:(NSButton *)button {
-  [self applyPage:button.tag];
+- (NSArray<NSToolbarItemIdentifier> *)toolbarAllowedItemIdentifiers:(NSToolbar *)toolbar {
+  (void)toolbar;
+  return @[ NSToolbarSidebarTrackingSeparatorItemIdentifier ];
+}
+
+- (NSToolbarItem *)toolbar:(NSToolbar *)toolbar
+        itemForItemIdentifier:(NSToolbarItemIdentifier)identifier
+    willBeInsertedIntoToolbar:(BOOL)flag {
+  (void)toolbar;
+  (void)identifier;
+  (void)flag;
+  return nil;
+}
+
+- (NSInteger)numberOfRowsInTableView:(NSTableView *)tableView {
+  (void)tableView;
+  return (NSInteger)self.visiblePanes.count;
+}
+
+- (NSView *)tableView:(NSTableView *)tableView
+    viewForTableColumn:(NSTableColumn *)tableColumn
+                   row:(NSInteger)row {
+  (void)tableColumn;
+  NSInteger pane = self.visiblePanes[(NSUInteger)row].integerValue;
+  NSTableCellView *cell = [tableView makeViewWithIdentifier:@"paneCell" owner:self];
+  if (cell == nil) {
+    cell = [[NSTableCellView alloc] initWithFrame:NSZeroRect];
+    cell.identifier = @"paneCell";
+    NSImageView *image = [[NSImageView alloc] initWithFrame:NSZeroRect];
+    image.translatesAutoresizingMaskIntoConstraints = NO;
+    NSTextField *text = [NSTextField labelWithString:@""];
+    text.font = [NSFont systemFontOfSize:NSFont.systemFontSize];
+    text.lineBreakMode = NSLineBreakByTruncatingTail;
+    text.translatesAutoresizingMaskIntoConstraints = NO;
+    [cell addSubview:image];
+    [cell addSubview:text];
+    cell.imageView = image;
+    cell.textField = text;
+    [NSLayoutConstraint activateConstraints:@[
+      [image.leadingAnchor constraintEqualToAnchor:cell.leadingAnchor constant:4],
+      [image.centerYAnchor constraintEqualToAnchor:cell.centerYAnchor],
+      [image.widthAnchor constraintEqualToConstant:20],
+      [image.heightAnchor constraintEqualToConstant:20],
+      [text.leadingAnchor constraintEqualToAnchor:image.trailingAnchor constant:8],
+      [text.trailingAnchor constraintLessThanOrEqualToAnchor:cell.trailingAnchor constant:-4],
+      [text.centerYAnchor constraintEqualToAnchor:cell.centerYAnchor],
+    ]];
+  }
+  cell.imageView.image = sidebarTile(pane, 20);
+  cell.textField.stringValue = paneTitle(pane);
+  return cell;
+}
+
+- (void)tableViewSelectionDidChange:(NSNotification *)notification {
+  (void)notification;
+  if (self.selectingRow) {
+    return;
+  }
+  NSInteger row = self.sidebarTable.selectedRow;
+  if (row >= 0 && row < (NSInteger)self.visiblePanes.count) {
+    [self applyPage:self.visiblePanes[(NSUInteger)row].integerValue];
+  }
+}
+
+- (void)searchChanged:(NSSearchField *)field {
+  NSString *query = [field.stringValue
+      stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+  NSMutableArray<NSNumber *> *panes = [NSMutableArray array];
+  for (NSInteger pane = 0; pane < kPaneCount; pane++) {
+    BOOL match = query.length == 0;
+    for (NSString *words in self.paneWords[(NSUInteger)pane]) {
+      if (match) {
+        break;
+      }
+      match = [words rangeOfString:query
+                           options:NSCaseInsensitiveSearch | NSDiacriticInsensitiveSearch]
+                  .location != NSNotFound;
+    }
+    if (match) {
+      [panes addObject:@(pane)];
+    }
+  }
+  self.visiblePanes = panes;
+  [self.sidebarTable reloadData];
+  if (panes.count > 0 && ![panes containsObject:@(self.page)]) {
+    [self applyPage:panes.firstObject.integerValue];
+  } else {
+    [self selectPageRow];
+  }
+}
+
+- (void)selectPageRow {
+  NSUInteger row = [self.visiblePanes indexOfObject:@(self.page)];
+  self.selectingRow = YES;
+  if (row == NSNotFound) {
+    [self.sidebarTable deselectAll:nil];
+  } else {
+    [self.sidebarTable selectRowIndexes:[NSIndexSet indexSetWithIndex:row]
+                   byExtendingSelection:NO];
+  }
+  self.selectingRow = NO;
 }
 
 - (void)applyPage:(NSInteger)index {
-  if (index < 0 || index > 2) {
-    index = 0;
+  if (index < 0 || index >= kPaneCount) {
+    index = kPaneGeneral;
   }
   self.page = index;
-  self.generalPage.hidden = self.page != 0;
-  self.displaysPage.hidden = self.page != 1;
-  self.proPage.hidden = self.page != 2;
-  [self paintSidebar];
+  for (NSUInteger i = 0; i < self.pages.count; i++) {
+    self.pages[i].hidden = (NSInteger)i != index;
+  }
+  self.window.title = paneTitle(index);
+  [self selectPageRow];
 }
 
 - (void)paintSidebar {
-  [self.window.effectiveAppearance performAsCurrentDrawingAppearance:^{
-    [self paintButton:self.generalButton selected:self.page == 0];
-    [self paintButton:self.displaysButton selected:self.page == 1];
-    [self paintButton:self.proButton selected:self.page == 2];
-  }];
-}
-
-- (void)paintButton:(NSButton *)button selected:(BOOL)selected {
-  NSColor *fill = selected ? NSColor.selectedContentBackgroundColor : NSColor.clearColor;
-  button.layer.backgroundColor = fill.CGColor;
-  NSColor *text = selected ? NSColor.alternateSelectedControlTextColor : NSColor.labelColor;
-  NSMutableParagraphStyle *style = [[NSMutableParagraphStyle alloc] init];
-  style.alignment = NSTextAlignmentLeft;
-  style.lineBreakMode = NSLineBreakByTruncatingTail;
-  style.firstLineHeadIndent = 10;
-  button.attributedTitle = [[NSAttributedString alloc]
-      initWithString:button.identifier
-          attributes:@{
-            NSFontAttributeName : [NSFont systemFontOfSize:13
-                                                    weight:selected ? NSFontWeightSemibold
-                                                                    : NSFontWeightRegular],
-            NSForegroundColorAttributeName : text,
-            NSParagraphStyleAttributeName : style,
-          }];
+  [self.sidebarTable reloadData];
+  [self selectPageRow];
+  tintSlider(self.maxSlider);
+  for (DisplayRow *row in self.displayRows) {
+    tintSlider(row.slider);
+  }
+  for (IconTile *tile in self.iconTiles) {
+    tile.needsDisplay = YES;
+  }
 }
 
 - (void)showPage:(NSInteger)index {
   [self applyPage:index];
   self.stayOpen = YES;
+  // A regular app while Settings is open, so it gets a Dock icon and a
+  // Cmd-Tab entry and stays put when you click into another app.
+  [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+  installSettingsMenu();
   [NSApp activate];
   [self.window makeKeyAndOrderFront:nil];
-  [self watchOutsideClicks];
+  if (self.syncTimer == nil) {
+    __weak SettingsPanel *panel = self;
+    self.syncTimer = [NSTimer scheduledTimerWithTimeInterval:2
+                                                     repeats:YES
+                                                       block:^(NSTimer *timer) {
+                                                         (void)timer;
+                                                         SettingsPanel *strong = panel;
+                                                         if (strong.needsSync != nil &&
+                                                             strong.window.isVisible) {
+                                                           strong.needsSync();
+                                                         }
+                                                       }];
+  }
 }
 
 - (void)watchOutsideClicks {
@@ -5299,16 +6989,6 @@ static void openBrightnessKeyAccess(void) {
 
 - (void)appResigned:(NSNotification *)notification {
   (void)notification;
-  if (!self.stayOpen) {
-    return;
-  }
-  NSWindow *window = self.window;
-  dispatch_async(dispatch_get_main_queue(), ^{
-    if (!self.stayOpen || window.isVisible) {
-      return;
-    }
-    [window orderFrontRegardless];
-  });
 }
 
 - (void)windowWillClose:(NSNotification *)notification {
@@ -5316,30 +6996,27 @@ static void openBrightnessKeyAccess(void) {
   self.stayOpen = NO;
   gSettingsKeepsOpenForOtherApp = NO;
   [self stopOutsideClicks];
+  [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
+  [self.syncTimer invalidate];
+  self.syncTimer = nil;
 }
 
 - (void)syncPaid:(BOOL)paid
             soon:(BOOL)soon
            until:(NSString *)until
          buying:(BOOL)buying {
-  if (paid && until == nil) {
-    self.licenseStatus.stringValue = @"Nightshift Pro is unlocked.";
-  } else if (until != nil) {
-    self.licenseStatus.stringValue =
-        [NSString stringWithFormat:@"Ramp through %@.", until];
-  } else {
-    self.licenseStatus.stringValue = @"The ramp is a paid feature.";
-  }
-  self.buyButton.hidden = paid && !soon;
-  self.buyButton.title = soon ? @"Renew the ramp" : @"Unlock the ramp";
-  self.buyButton.enabled = !buying;
-  self.loginCheck.state =
-      loginItemOn() ? NSControlStateValueOn : NSControlStateValueOff;
-  self.cycleCheck.state =
-      hourCycleIs24() ? NSControlStateValueOn : NSControlStateValueOff;
-  BOOL keys = brightnessKeysReady();
-  self.keysStatus.stringValue =
-      keys ? @"Brightness keys are allowed." : @"Brightness keys need Accessibility.";
+  self.paid = paid;
+  self.soon = soon;
+  self.until = until;
+  self.buying = buying;
+  self.loginSwitch.state = loginItemOn() ? NSControlStateValueOn : NSControlStateValueOff;
+  self.cycleSwitch.state = hourCycleIs24() ? NSControlStateValueOn : NSControlStateValueOff;
+  self.warmthSwitch.state =
+      menuBarShowsWarmth() ? NSControlStateValueOn : NSControlStateValueOff;
+  [self syncIconTiles];
+  [self syncNightShift];
+  [self syncDisplays];
+  [self syncLicense];
 }
 
 - (void)windowDidBecomeKey:(NSNotification *)notification {
@@ -5369,8 +7046,12 @@ static void openBrightnessKeyAccess(void) {
 @property(nonatomic) long pendingMax;
 @property(nonatomic, strong) id clockKeyMonitor;
 @property(nonatomic, strong) SettingsPanel *settings;
+@property(nonatomic) NSTimeInterval settingsReleaseTime;
+@property(nonatomic) BOOL settingsMaxTracking;
+@property(nonatomic, copy) NSString *statusIconID;
 - (void)refresh;
 - (void)syncLoginItem;
+- (void)syncStatusItem;
 @end
 
 @implementation MenuBar
@@ -5379,22 +7060,12 @@ static void openBrightnessKeyAccess(void) {
   if (self == nil) {
     return nil;
   }
-  NSImageSymbolConfiguration *symbol = [NSImageSymbolConfiguration
-      configurationWithPointSize:16
-                          weight:NSFontWeightRegular];
-  NSImage *image = [[NSImage imageWithSystemSymbolName:@"sun.horizon"
-                              accessibilityDescription:@"Nightshift"]
-      imageWithSymbolConfiguration:symbol];
   self.item = [[NSStatusBar systemStatusBar]
-      statusItemWithLength:NSSquareStatusItemLength];
+      statusItemWithLength:NSVariableStatusItemLength];
   self.item.autosaveName = @"nightshift";
   self.item.button.toolTip = @"Nightshift";
-  if (image != nil) {
-    image.template = YES;
-    self.item.button.image = image;
-  } else {
-    self.item.button.title = @"NS";
-  }
+  self.item.button.imagePosition = NSImageLeading;
+  [self syncStatusItem];
 
   self.panel = [[StatusPanel alloc] initWithNibName:nil bundle:nil];
   (void)self.panel.view;
@@ -5632,30 +7303,103 @@ static void openBrightnessKeyAccess(void) {
   [self.panel syncDisplay];
   [self attachBrightnessSliders];
   [self syncLoginItem];
+  [self syncStatusItem];
   [self sizeMenuView];
+}
+
+// The menu bar icon, and the warmth next to it when General asks for it.
+- (void)syncStatusItem {
+  NSStatusBarButton *button = self.item.button;
+  if (button == nil) {
+    return;
+  }
+  NSImage *image = [[IconChoice current] menuImage];
+  if (image == nil) {
+    image = [[IconChoice standard] menuImage];
+  }
+  NSString *ident = [IconChoice current].ident;
+  if (![ident isEqualToString:self.statusIconID] || button.image == nil) {
+    self.statusIconID = ident;
+    button.image = image;
+  }
+  NSString *title = @"";
+  if (menuBarShowsWarmth()) {
+    long now = 0;
+    long maxv = 0;
+    const char *state = NULL;
+    int full = -1;
+    if (warmthStatus(&now, &maxv, &state, &full)) {
+      title = strcmp(state, "off") == 0 ? @"Off" : [NSString stringWithFormat:@"%ld%%", now];
+    }
+  } else if (image == nil) {
+    title = @"NS";
+  }
+  if (![button.title isEqualToString:title]) {
+    if (title.length == 0) {
+      button.title = @"";
+    } else {
+      button.attributedTitle = [[NSAttributedString alloc]
+          initWithString:title
+              attributes:@{
+                NSFontAttributeName : [NSFont
+                    monospacedDigitSystemFontOfSize:[NSFont systemFontSizeForControlSize:
+                                                                NSControlSizeRegular]
+                                             weight:NSFontWeightRegular],
+              }];
+    }
+  }
+  button.imagePosition = title.length == 0 ? NSImageOnly : NSImageLeading;
 }
 
 - (SettingsPanel *)makeSettings {
   if (self.settings == nil) {
-    self.settings = [[SettingsPanel alloc] init];
-    self.settings.loginCheck.target = self;
-    self.settings.loginCheck.action = @selector(toggleLogin:);
-    self.settings.cycleCheck.target = self;
-    self.settings.cycleCheck.action = @selector(toggleCycle:);
-    self.settings.keysButton.target = self;
-    self.settings.keysButton.action = @selector(allowKeys:);
-    self.settings.buyButton.target = self;
-    self.settings.buyButton.action = @selector(buyRamp:);
+    SettingsPanel *settings = [[SettingsPanel alloc] init];
+    self.settings = settings;
+    // Display groups are built on the first sync, after this.
+    settings.brightnessTarget = self;
+    settings.brightnessAction = @selector(settingsBrightMoved:);
+    settings.loginSwitch.target = self;
+    settings.loginSwitch.action = @selector(toggleLogin:);
+    settings.cycleSwitch.target = self;
+    settings.cycleSwitch.action = @selector(toggleCycle:);
+    settings.warmthSwitch.target = self;
+    settings.warmthSwitch.action = @selector(settingsWarmthToggled:);
+    settings.keysButton.target = self;
+    settings.keysButton.action = @selector(allowKeys:);
+    settings.buyButton.target = self;
+    settings.buyButton.action = @selector(buyRamp:);
+    settings.schedulePopup.target = self;
+    settings.schedulePopup.action = @selector(settingsScheduleChanged:);
+    settings.maxSlider.target = self;
+    settings.maxSlider.action = @selector(settingsMaxMoved:);
+    settings.fullAtPicker.target = self;
+    settings.fullAtPicker.action = @selector(settingsFullAtChanged:);
     __weak MenuBar *menu = self;
-    self.settings.becameKey = ^{
+    settings.becameKey = ^{
+      probeDDC();
       [menu syncLoginItem];
+    };
+    settings.needsSync = ^{
+      MenuBar *strong = menu;
+      if (strong != nil && !strong.settingsMaxTracking && strong.settings.trackingDisplay == 0) {
+        [strong syncLoginItem];
+      }
+    };
+    settings.iconPicked = ^(IconChoice *choice) {
+      MenuBar *strong = menu;
+      if (strong == nil || [choice.ident isEqualToString:[IconChoice current].ident]) {
+        return;
+      }
+      setMenuBarPref(@"icon", choice.ident);
+      [strong syncStatusItem];
+      [strong syncLoginItem];
     };
   }
   return self.settings;
 }
 
 - (void)syncLoginItem {
-  if (self.settings == nil) {
+  if (self.settings == nil || !self.settings.window.isVisible) {
     return;
   }
   [self.settings syncPaid:rampLicensed()
@@ -5666,14 +7410,124 @@ static void openBrightnessKeyAccess(void) {
 
 - (void)showSettings:(id)sender {
   (void)sender;
-  [[self makeSettings] showPage:0];
+  [[self makeSettings] showPage:kPaneGeneral];
   [self syncLoginItem];
 }
 
 - (void)showPro:(id)sender {
   (void)sender;
-  [[self makeSettings] showPage:2];
+  [[self makeSettings] showPage:kPaneLicense];
   [self syncLoginItem];
+}
+
+- (void)settingsWarmthToggled:(NSSwitch *)sender {
+  BOOL on = sender.state == NSControlStateValueOn;
+  if (!setMenuBarPref(@"warmth", on ? @"on" : @"off")) {
+    sender.state = on ? NSControlStateValueOff : NSControlStateValueOn;
+  }
+  [self syncStatusItem];
+}
+
+- (void)settingsScheduleChanged:(NSPopUpButton *)popup {
+  NSInteger mode = popup.selectedTag;
+  if (mode == 0 || mode == 1 || mode == 2) {
+    setBlueLightMode((int)mode);
+  }
+  [self refresh];
+  [self syncLoginItem];
+}
+
+// Max in Settings follows the menu's Max: the value shows while dragging and
+// is committed once, on release.
+- (void)settingsMaxMoved:(NSSlider *)slider {
+  if (!rampLicensed()) {
+    [self syncLoginItem];
+    return;
+  }
+  long value = (long)llround(slider.doubleValue);
+  [self.settings showMaxValue:value];
+  if (!sliderSettled()) {
+    self.settingsMaxTracking = YES;
+    return;
+  }
+  if ([self settingsReleaseHandled]) {
+    return;
+  }
+  self.settingsMaxTracking = NO;
+  long live = 0;
+  long maxv = 0;
+  const char *state = NULL;
+  int full = -1;
+  BOOL known = warmthStatus(&live, &maxv, &state, &full);
+  [self.panel syncSliders];
+  [self finishMax:value known:known live:live];
+  [self syncLoginItem];
+}
+
+- (void)settingsFullAtChanged:(NSDatePicker *)picker {
+  (void)picker;
+  self.settings.editingFullAt = YES;
+  [NSObject cancelPreviousPerformRequestsWithTarget:self
+                                           selector:@selector(commitSettingsFullAt)
+                                             object:nil];
+  [self performSelector:@selector(commitSettingsFullAt) withObject:nil afterDelay:0.8];
+}
+
+- (void)commitSettingsFullAt {
+  self.settings.editingFullAt = NO;
+  if (!rampLicensed() || !customSchedule()) {
+    [self syncLoginItem];
+    return;
+  }
+  int minute = [self.settings fullAtMinute];
+  if (minute >= 0 && minute != gRampClock && !setRampClock(minute)) {
+    notifyPlain(@"Could not set Full at");
+  }
+  [self refresh];
+  [self syncLoginItem];
+}
+
+// Like brightReleaseHandled, for the Settings sliders, which live outside
+// the menu and so always settle on mouse-up.
+- (BOOL)settingsReleaseHandled {
+  NSEvent *event = NSApp.currentEvent;
+  if (event == nil || event.type != NSEventTypeLeftMouseUp) {
+    return NO;
+  }
+  if (event.timestamp == self.settingsReleaseTime) {
+    return YES;
+  }
+  self.settingsReleaseTime = event.timestamp;
+  return NO;
+}
+
+// Brightness from Settings: the same paths as the menu. The built-in and a
+// confirmed DDC display follow the knob; every display saves once on release.
+- (void)settingsBrightMoved:(NSSlider *)slider {
+  uint32_t display = (uint32_t)slider.tag;
+  BOOL settled = sliderSettled();
+  if (settled && [self settingsReleaseHandled]) {
+    return;
+  }
+  long value = softwareDimPercent(display, (long)llround(slider.doubleValue));
+  [self.settings showBrightness:value forDisplay:display];
+  if (!settled) {
+    self.settings.trackingDisplay = display;
+    if (CGDisplayIsBuiltin(display) || ddcReady(display)) {
+      holdBrightnessTick(display, value);
+    }
+    return;
+  }
+  self.settings.trackingDisplay = 0;
+  if (!endBrightnessDrag(display, value)) {
+    [self syncLoginItem];
+    return;
+  }
+  long shown = readPercent(display);
+  if (shown >= 0) {
+    [self.settings showBrightness:shown forDisplay:display];
+  }
+  [self refresh];
 }
 
 - (void)attachBrightnessSliders {
@@ -5941,8 +7795,8 @@ static void openBrightnessKeyAccess(void) {
   [NSApp terminate:sender];
 }
 
-- (void)toggleCycle:(NSButton *)button {
-  (void)button;
+- (void)toggleCycle:(id)sender {
+  (void)sender;
   int cycle = hourCycleIs24() ? 12 : 24;
   if (!writeHourCycle(cycle)) {
     [self refresh];
@@ -5971,6 +7825,7 @@ static NSRect menuBarIconFrame(void) {
 }
 
 static void refreshMenu(void) {
+  [gMenu syncStatusItem];
   if (gMenu == nil || !gMenu.menuOpen) {
     return;
   }
@@ -6293,24 +8148,7 @@ static long readPercent(uint32_t display) {
 }
 
 static long steppedPercent(long percent, int direction, long stops) {
-  long steps = (percent * stops + stops / 2) / 100 + direction;
-  if (steps < 0) {
-    steps = 0;
-  }
-  if (steps > stops) {
-    steps = stops;
-  }
-  long next = (steps * 100 + stops / 2) / stops;
-  if (next == percent) {
-    next = percent + direction;
-  }
-  if (next < 0) {
-    next = 0;
-  }
-  if (next > 100) {
-    next = 100;
-  }
-  return next;
+  return nsSteppedPercent(percent, direction, stops);
 }
 
 static void rememberBuiltin(void) {
@@ -6358,6 +8196,7 @@ static BOOL stepActiveBrightness(int direction) {
     }
   }
   rememberBuiltin();
+  refreshKeyDisplays();
   showBrightnessHUD(display, shown);
   if (gMenu != nil && gMenu.menuOpen && !gMenu.tracking) {
     [gMenu refresh];
@@ -6411,6 +8250,103 @@ static int brightnessDirection(NSEvent *key) {
   return 0;
 }
 
+// Finding 5: the key tap is an active filter on every key-down in the
+// session, so it runs on its own thread and never waits on the main one.
+// Whether to swallow a brightness key is decided from this copy of the
+// displays the main thread can step (readPercent works, or a DDC probe is
+// pending), refreshed on main by refreshKeyDisplays.
+static pthread_mutex_t gKeyLock = PTHREAD_MUTEX_INITIALIZER;
+static uint32_t gKeyDisplays[16];
+static int gKeyDisplayCount = 0;
+static CFRunLoopRef gTapRunLoop = NULL;
+
+static void refreshKeyDisplays(void) {
+  uint32_t ids[16];
+  int count = orderedDisplays(ids, 16);
+  uint32_t handled[16];
+  int kept = 0;
+  for (int i = 0; i < count; i++) {
+    if (readPercent(ids[i]) >= 0 || ddcPending(ids[i])) {
+      handled[kept++] = ids[i];
+    }
+  }
+  pthread_mutex_lock(&gKeyLock);
+  memcpy(gKeyDisplays, handled, sizeof(handled[0]) * (size_t)kept);
+  gKeyDisplayCount = kept;
+  pthread_mutex_unlock(&gKeyLock);
+}
+
+// Main thread. N5: a display whose step just failed stays out of the list
+// until the next refresh finds it working.
+static void dropKeyDisplay(uint32_t display) {
+  pthread_mutex_lock(&gKeyLock);
+  for (int i = 0; i < gKeyDisplayCount; i++) {
+    if (gKeyDisplays[i] == display) {
+      gKeyDisplays[i] = gKeyDisplays[--gKeyDisplayCount];
+      break;
+    }
+  }
+  pthread_mutex_unlock(&gKeyLock);
+}
+
+// Marks a key the tap swallowed and then handed back, so the taps let it
+// through the second time.
+static const int64_t kKeyReposted = 0x4e53686b;  // "NShk"
+
+// Tap thread. Whether the display under the event is one the main thread
+// can step; display is set to it either way.
+static BOOL keyDisplayHandled(CGEventRef event, uint32_t *displayOut) {
+  CGDirectDisplayID display = 0;
+  uint32_t found = 0;
+  *displayOut = 0;
+  if (CGGetDisplaysWithPoint(CGEventGetLocation(event), 1, &display, &found) != kCGErrorSuccess ||
+      found == 0) {
+    return NO;
+  }
+  *displayOut = display;
+  BOOL handled = NO;
+  pthread_mutex_lock(&gKeyLock);
+  for (int i = 0; i < gKeyDisplayCount; i++) {
+    if (gKeyDisplays[i] == display) {
+      handled = YES;
+      break;
+    }
+  }
+  pthread_mutex_unlock(&gKeyLock);
+  return handled;
+}
+
+// Main thread. Steps for a key the tap swallowed. When the step fails (a
+// stale list, a write error, a slot just demoted) the display is dropped
+// from the list and the key goes back to macOS, as if never tapped.
+static void deliverTappedKey(int direction, uint32_t display, CGEventRef copy) {
+  if (!deliverBrightness(direction)) {
+    refreshKeyDisplays();
+    dropKeyDisplay(display);
+    if (copy != NULL) {
+      CGEventSetIntegerValueField(copy, kCGEventSourceUserData, kKeyReposted);
+      CGEventPost(kCGHIDEventTap, copy);
+    }
+  }
+  if (copy != NULL) {
+    CFRelease(copy);
+  }
+}
+
+// Tap thread. Same rules as brightnessDirection, without NSEvent for plain
+// key-downs.
+static int tapDirection(CGEventType type, CGEventRef event) {
+  if (type == kCGEventKeyDown) {
+    int64_t code = CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode);
+    return code == 144 ? 1 : code == 145 ? -1 : 0;
+  }
+  if (type != (CGEventType)NSEventTypeSystemDefined) {
+    return 0;
+  }
+  NSEvent *key = [NSEvent eventWithCGEvent:event];
+  return key == nil ? 0 : brightnessDirection(key);
+}
+
 static CGEventRef brightnessKey(CGEventTapProxy proxy, CGEventType type,
                                 CGEventRef event, void *user) {
   (void)proxy;
@@ -6424,12 +8360,57 @@ static CGEventRef brightnessKey(CGEventTapProxy proxy, CGEventType type,
     }
     return event;
   }
-  NSEvent *key = [NSEvent eventWithCGEvent:event];
-  int direction = key == nil ? 0 : brightnessDirection(key);
-  if (direction == 0) {
-    return event;
+  @autoreleasepool {
+    if (CGEventGetIntegerValueField(event, kCGEventSourceUserData) == kKeyReposted) {
+      return event;
+    }
+    int direction = tapDirection(type, event);
+    uint32_t display = 0;
+    if (direction == 0 || !keyDisplayHandled(event, &display)) {
+      return event;
+    }
+    // The three taps see the same press; only the first one steps.
+    static CFAbsoluteTime last = 0;
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (now - last >= 0.02) {
+      last = now;
+      // N5: swallowed on the strength of the cached list, so keep a copy to
+      // hand back to macOS if the step fails.
+      CGEventRef copy = CGEventCreateCopy(event);
+      dispatch_async(dispatch_get_main_queue(), ^{
+        deliverTappedKey(direction, display, copy);
+      });
+    }
+    return NULL;
   }
-  return deliverBrightness(direction) ? NULL : event;
+}
+
+// The run loop the key taps run on, started once.
+static CFRunLoopRef tapRunLoop(void) {
+  static dispatch_once_t once;
+  dispatch_once(&once, ^{
+    dispatch_semaphore_t ready = dispatch_semaphore_create(0);
+    NSThread *thread = [[NSThread alloc] initWithBlock:^{
+      gTapRunLoop = (CFRunLoopRef)CFRetain(CFRunLoopGetCurrent());
+      // Keeps CFRunLoopRun from returning before the first tap is added.
+      CFRunLoopTimerRef keep = CFRunLoopTimerCreateWithHandler(
+          kCFAllocatorDefault, CFAbsoluteTimeGetCurrent() + 1e9, 1e9, 0, 0,
+          ^(CFRunLoopTimerRef timer) {
+            (void)timer;
+          });
+      CFRunLoopAddTimer(gTapRunLoop, keep, kCFRunLoopCommonModes);
+      CFRelease(keep);
+      dispatch_semaphore_signal(ready);
+      while (YES) {
+        CFRunLoopRun();
+      }
+    }];
+    thread.name = @"nightshift.keys";
+    thread.qualityOfService = NSQualityOfServiceUserInteractive;
+    [thread start];
+    dispatch_semaphore_wait(ready, DISPATCH_TIME_FOREVER);
+  });
+  return gTapRunLoop;
 }
 
 static void considerBrightnessEvent(IOHIDEventRef event) {
@@ -6480,6 +8461,8 @@ static BOOL installBrightnessTap(void) {
                      CGEventMaskBit(kCGEventKeyDown);
   CGEventTapLocation places[3] = {kCGSessionEventTap, kCGHIDEventTap,
                                   kCGAnnotatedSessionEventTap};
+  refreshKeyDisplays();
+  CFRunLoopRef loop = tapRunLoop();
   for (int i = 0; i < 3; i++) {
     CFMachPortRef tap = CGEventTapCreate(places[i], kCGHeadInsertEventTap,
                                          kCGEventTapOptionDefault, mask, brightnessKey,
@@ -6488,11 +8471,12 @@ static BOOL installBrightnessTap(void) {
       continue;
     }
     CFRunLoopSourceRef source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0);
-    CFRunLoopAddSource(CFRunLoopGetMain(), source, kCFRunLoopCommonModes);
+    gBrightnessTaps[gBrightnessTapCount++] = tap;
+    CFRunLoopAddSource(loop, source, kCFRunLoopCommonModes);
     CFRelease(source);
     CGEventTapEnable(tap, true);
-    gBrightnessTaps[gBrightnessTapCount++] = tap;
   }
+  CFRunLoopWakeUp(loop);
   return gBrightnessTapCount > 0;
 }
 
@@ -6525,6 +8509,14 @@ static void startBrightnessKeys(void) {
                  });
 }
 
+// Main thread. Re-reads every DDC channel, the confirmed ones included, as
+// soon as the queue is free.
+static void ddcRevalidate(void) {
+  gDDCRevalidate = YES;
+  gDDCLast = 0;
+  probeDDC();
+}
+
 static void installMenu(void) {
   [NSApplication sharedApplication];
   [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
@@ -6537,8 +8529,29 @@ static void installMenu(void) {
               usingBlock:^(NSNotification *note) {
                 (void)note;
                 refitDimWindows();
-                probeDDC();
+                // Finding 4: drop slots for displays that left now, even
+                // when the probe below is throttled or busy, and re-read
+                // the ones that stayed, since a quick replug can keep the
+                // display ID with a new service behind it.
+                forgetOfflineDisplays();
+                ddcRevalidate();
+                refreshKeyDisplays();
               }];
+  NSNotificationCenter *workspace = NSWorkspace.sharedWorkspace.notificationCenter;
+  for (NSNotificationName name in @[ NSWorkspaceDidWakeNotification,
+                                     NSWorkspaceScreensDidWakeNotification ]) {
+    [workspace addObserverForName:name
+                           object:nil
+                            queue:NSOperationQueue.mainQueue
+                       usingBlock:^(NSNotification *note) {
+                         (void)note;
+                         gWokeAt = CFAbsoluteTimeGetCurrent();
+                         // Finding 4: monitors may have power-cycled.
+                         forgetOfflineDisplays();
+                         ddcRevalidate();
+                         refreshKeyDisplays();
+                       }];
+  }
   gMenu = [[MenuBar alloc] init];
   startBrightnessKeys();
   [gMenu refresh];
@@ -6564,6 +8577,10 @@ static void teardownDaemon(void) {
       gDDC[i].saveWaiting = NO;
       noteBrightness(gDDC[i].display, gDDC[i].savePercent);
     }
+    if (gDDC[i].display != 0 && gDDC[i].applyWaiting) {
+      gDDC[i].applyWaiting = NO;
+      noteBrightness(gDDC[i].display, gDDC[i].applyPercent);
+    }
   }
   if (gShades != nil) {
     for (NSNumber *key in gShades.allKeys) {
@@ -6588,12 +8605,44 @@ static void teardownDaemon(void) {
                           dispatch_time(DISPATCH_TIME_NOW, (int64_t)(300 * NSEC_PER_MSEC)));
 }
 
-static void stopDaemon(int sig) {
-  (void)sig;
-  if (gSockPath[0] != '\0') {
-    unlink(gSockPath);
+// Finding 12: SIGINT and SIGTERM (logout, launchctl, kill) run the same
+// teardown as Quit, so held and pending brightness is saved and the shades
+// and cursor are put back. Handled on the main queue through dispatch
+// sources, not in a signal handler, so teardown may use Cocoa.
+static dispatch_source_t gSignalSources[2];
+
+static void watchStopSignals(void) {
+  int signals[2] = {SIGINT, SIGTERM};
+  for (int i = 0; i < 2; i++) {
+    signal(signals[i], SIG_IGN);
+    dispatch_source_t source = dispatch_source_create(
+        DISPATCH_SOURCE_TYPE_SIGNAL, (uintptr_t)signals[i], 0, dispatch_get_main_queue());
+    dispatch_source_set_event_handler(source, ^{
+      teardownDaemon();
+      exit(0);
+    });
+    dispatch_resume(source);
+    gSignalSources[i] = source;
   }
-  _exit(0);
+}
+
+// Finding 13: one daemon per user. The lock is taken before the socket is
+// touched and held until exit (the kernel drops it if the process dies), so
+// two daemons started together can't both unlink and bind the socket.
+static int gInstanceLock = -1;
+
+static BOOL holdInstanceLock(NSString *dir) {
+  NSString *path = [dir stringByAppendingPathComponent:@"nightshiftd.lock"];
+  int fd = open(path.fileSystemRepresentation, O_RDWR | O_CREAT | O_CLOEXEC, S_IRUSR | S_IWUSR);
+  if (fd < 0) {
+    return NO;
+  }
+  if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+    close(fd);
+    return NO;
+  }
+  gInstanceLock = fd;
+  return YES;
 }
 
 static BOOL daemonAlreadyRunning(const char *path) {
@@ -6758,6 +8807,10 @@ int main(void) {
     readHourCycle();
 
     NSString *sock = [dir stringByAppendingPathComponent:@"nightshiftd.sock"];
+    if (!holdInstanceLock(dir)) {
+      fprintf(stderr, "Night Shift is already running\n");
+      return 1;
+    }
     int server = listenSocket(sock.fileSystemRepresentation);
     if (server < 0) {
       fprintf(stderr, "failed to listen on %s\n",
@@ -6775,11 +8828,7 @@ int main(void) {
     }
 
     strncpy(gSockPath, sock.fileSystemRepresentation, sizeof(gSockPath) - 1);
-    struct sigaction stop;
-    memset(&stop, 0, sizeof(stop));
-    stop.sa_handler = stopDaemon;
-    sigaction(SIGINT, &stop, NULL);
-    sigaction(SIGTERM, &stop, NULL);
+    watchStopSignals();
 
     gTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
                                    dispatch_get_main_queue());
@@ -6788,12 +8837,19 @@ int main(void) {
     dispatch_source_set_event_handler(gTimer, ^{
       rampTick();
       refreshMenu();
+      refreshKeyDisplays();
     });
     dispatch_resume(gTimer);
 
+    // Finding 5: accept and read off the main thread, so a client that
+    // connects and stalls can't freeze the menu or the brightness keys.
+    // Only the parsed line is handled on main. Connections are read one at
+    // a time on this one serial queue: a stalled client holds it for at most
+    // the 2 s read timeout, and waiting clients stay in the listen backlog
+    // instead of each taking a thread.
+    dispatch_queue_t socketQueue = dispatch_queue_create("nightshift.socket", DISPATCH_QUEUE_SERIAL);
     gListener = dispatch_source_create(
-        DISPATCH_SOURCE_TYPE_READ, (uintptr_t)server, 0,
-        dispatch_get_main_queue());
+        DISPATCH_SOURCE_TYPE_READ, (uintptr_t)server, 0, socketQueue);
     dispatch_source_set_event_handler(gListener, ^{
       int connection = accept(server, NULL, NULL);
       if (connection < 0) {
@@ -6812,20 +8868,36 @@ int main(void) {
         close(connection);
         return;
       }
+      int noSigPipe = 1;
+      setsockopt(connection, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, sizeof(noSigPipe));
       struct timeval tv = {.tv_sec = 2, .tv_usec = 0};
       setsockopt(connection, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+      setsockopt(connection, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
       char buf[128];
       if (!readMessage(connection, buf, sizeof(buf))) {
         dprintf(connection, "failed\n");
         close(connection);
         return;
       }
-      handleLine(buf, connection);
-      refreshMenu();
-      if (gMenu != nil) {
-        [gMenu syncLoginItem];
+      char *line = strdup(buf);
+      if (line == NULL) {
+        close(connection);
+        return;
       }
-      close(connection);
+      dispatch_async(dispatch_get_main_queue(), ^{
+        gKeepConnection = NO;
+        handleLine(line, connection);
+        BOOL keep = gKeepConnection;
+        gKeepConnection = NO;
+        free(line);
+        refreshMenu();
+        if (gMenu != nil) {
+          [gMenu syncLoginItem];
+        }
+        if (!keep) {
+          close(connection);
+        }
+      });
     });
     dispatch_resume(gListener);
     installMenu();

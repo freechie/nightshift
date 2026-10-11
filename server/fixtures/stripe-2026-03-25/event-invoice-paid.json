@@ -1,0 +1,191 @@
+{
+  "id": "evt_fixture0003",
+  "object": "event",
+  "api_version": "2026-03-25.dahlia",
+  "created": 1791691417,
+  "data": {
+    "object": {
+      "id": "in_fixture0001",
+      "object": "invoice",
+      "account_country": "US",
+      "account_name": null,
+      "account_tax_ids": null,
+      "amount_due": 2000,
+      "amount_overpaid": 0,
+      "amount_paid": 2000,
+      "amount_remaining": 0,
+      "amount_shipping": 0,
+      "application": null,
+      "attempt_count": 0,
+      "attempted": true,
+      "auto_advance": false,
+      "automatic_tax": {
+        "disabled_reason": null,
+        "enabled": false,
+        "liability": null,
+        "provider": null,
+        "status": null
+      },
+      "automatically_finalizes_at": null,
+      "billing_reason": "subscription_create",
+      "collection_method": "charge_automatically",
+      "created": 1791691414,
+      "currency": "usd",
+      "custom_fields": null,
+      "customer": "cus_fixture0001",
+      "customer_account": "acct_fixture0001",
+      "customer_address": {
+        "city": null,
+        "country": "US",
+        "line1": null,
+        "line2": null,
+        "postal_code": null,
+        "state": null
+      },
+      "customer_email": "buyer@example.invalid",
+      "customer_name": null,
+      "customer_phone": null,
+      "customer_shipping": null,
+      "customer_tax_exempt": "none",
+      "customer_tax_ids": [],
+      "default_payment_method": null,
+      "default_source": null,
+      "default_tax_rates": [],
+      "description": null,
+      "discounts": [],
+      "due_date": null,
+      "effective_at": 1791691414,
+      "ending_balance": 0,
+      "footer": null,
+      "from_invoice": null,
+      "hosted_invoice_url": "https://example.invalid/hosted_invoice_url",
+      "invoice_pdf": "https://example.invalid/invoice_pdf",
+      "issuer": null,
+      "last_finalization_error": null,
+      "latest_revision": null,
+      "lines": {
+        "object": "list",
+        "data": [
+          {
+            "id": "il_fixture0001",
+            "object": "line_item",
+            "amount": 2000,
+            "currency": "usd",
+            "description": "1 × Nightshift ramp (at $20.00 / year)",
+            "discount_amounts": [],
+            "discountable": true,
+            "discounts": [],
+            "invoice": "in_fixture0001",
+            "livemode": false,
+            "metadata": {
+              "install_id": "00000000-0000-4000-8000-00000000000a",
+              "secret_hash": "0000000000000000000000000000000000000000000000000000000000000000"
+            },
+            "parent": {
+              "invoice_item_details": null,
+              "subscription_item_details": {
+                "invoice_item": null,
+                "proration": false,
+                "proration_details": {
+                  "credited_items": null
+                },
+                "subscription": "sub_fixture0001",
+                "subscription_item": "si_fixture0002"
+              },
+              "type": "subscription_item_details"
+            },
+            "period": {
+              "end": 1823227414,
+              "start": 1791691414
+            },
+            "pretax_credit_amounts": [],
+            "pricing": {
+              "price_details": {
+                "price": "price_fixture0001",
+                "product": "prod_fixture0001"
+              },
+              "type": "price_details",
+              "unit_amount_decimal": "2000"
+            },
+            "quantity": 1,
+            "quantity_decimal": "1",
+            "subtotal": 2000,
+            "taxes": []
+          }
+        ],
+        "has_more": false,
+        "total_count": 1,
+        "url": "https://example.invalid/url"
+      },
+      "livemode": false,
+      "metadata": {},
+      "next_payment_attempt": null,
+      "number": null,
+      "on_behalf_of": null,
+      "parent": {
+        "quote_details": null,
+        "subscription_details": {
+          "metadata": {
+            "install_id": "00000000-0000-4000-8000-00000000000a",
+            "secret_hash": "0000000000000000000000000000000000000000000000000000000000000000"
+          },
+          "subscription": "sub_fixture0001"
+        },
+        "type": "subscription_details"
+      },
+      "payment_settings": {
+        "default_mandate": null,
+        "payment_method_options": {
+          "acss_debit": null,
+          "bancontact": null,
+          "billie": null,
+          "blik": null,
+          "card": {
+            "request_three_d_secure": "automatic"
+          },
+          "customer_balance": null,
+          "konbini": null,
+          "payto": null,
+          "pix": null,
+          "sepa_debit": null,
+          "upi": null,
+          "us_bank_account": null
+        },
+        "payment_method_types": null
+      },
+      "period_end": 1791691414,
+      "period_start": 1791691414,
+      "post_payment_credit_notes_amount": 0,
+      "pre_payment_credit_notes_amount": 0,
+      "receipt_number": null,
+      "rendering": null,
+      "shipping_cost": null,
+      "shipping_details": null,
+      "starting_balance": 0,
+      "statement_descriptor": null,
+      "status": "paid",
+      "status_transitions": {
+        "finalized_at": 1791691414,
+        "marked_uncollectible_at": null,
+        "paid_at": 1791691415,
+        "voided_at": null
+      },
+      "subtotal": 2000,
+      "subtotal_excluding_tax": 2000,
+      "test_clock": null,
+      "total": 2000,
+      "total_discount_amounts": [],
+      "total_excluding_tax": 2000,
+      "total_pretax_credit_amounts": [],
+      "total_taxes": [],
+      "webhooks_delivered_at": null
+    }
+  },
+  "livemode": false,
+  "pending_webhooks": 0,
+  "request": {
+    "id": null,
+    "idempotency_key": "00000000-0000-4000-8000-000000000002"
+  },
+  "type": "invoice.paid"
+}

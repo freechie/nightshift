@@ -18,6 +18,7 @@
 #import <fcntl.h>
 #import <limits.h>
 #import <mach-o/dyld.h>
+#import <readpassphrase.h>
 #import <spawn.h>
 #import <string.h>
 #import <sys/socket.h>
@@ -82,6 +83,12 @@ static BOOL startDaemon(void) {
   return rc == 0;
 }
 
+// The daemon answers a brightness change once the monitor has taken it, at
+// the latest after 8 s (kBrightnessReplyWait in nightshiftd.m).
+static const int kReplyTimeout = 2;
+static const int kBrightnessTimeout = 10;
+static int gReplyTimeout = kReplyTimeout;
+
 static int talk(const char *line, char *reply, size_t cap, BOOL whole) {
   NSString *sock = [[NSHomeDirectory()
       stringByAppendingPathComponent:@"Library/Application Support/nightshift"]
@@ -103,7 +110,8 @@ static int talk(const char *line, char *reply, size_t cap, BOOL whole) {
   int one = 1;
   setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
   struct timeval tv = {.tv_sec = 2, .tv_usec = 0};
-  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  struct timeval replyTv = {.tv_sec = gReplyTimeout, .tv_usec = 0};
+  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &replyTv, sizeof(replyTv));
   setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
   struct sockaddr_un addr;
@@ -260,6 +268,10 @@ static void help(void) {
       "  nightshift max 60      Set the warmth the evening ramp climbs to\n"
       "  nightshift ramp 8:30pm Reach the max at 8:30 PM\n"
       "  nightshift license     Show whether the ramp is unlocked\n"
+      "  nightshift license id  Show this Mac's install ID, for support\n"
+      "  nightshift license secret [--replace]\n"
+      "                         Enter the install secret support gave you\n"
+
       "  nightshift buy         Pay for a year of the ramp\n"
       "  nightshift schedule    Show off, custom, or sunset\n"
       "  nightshift schedule custom\n"
@@ -285,7 +297,10 @@ static void help(void) {
       "  Setting a warmth is free. The evening ramp is paid: nightshift max,\n"
       "  nightshift ramp, and the climb to the max. nightshift buy opens\n"
       "  checkout and saves the token. nightshift license <token> saves one\n"
-      "  you already have.\n"
+      "  you already have. nightshift license secret reads a secret from\n"
+      "  support from the keyboard (not shown) or one line of a pipe, never\n"
+      "  the command line, saves it, and fetches the license. It won't\n"
+      "  replace a secret this Mac already has without --replace.\n"
       "\n"
       "Evening ramp:\n"
       "  With a Custom schedule (nightshift schedule custom), warmth starts\n"
@@ -323,6 +338,66 @@ static void help(void) {
       "  nightshiftd.sock  How the command talks to Nightshift.app\n");
 }
 
+// One line of input for `nightshift license secret`: typed with echo off
+// when stdin is a terminal, else the first line of the pipe. The secret is
+// never an argument, which would leave it in shell history and ps.
+static BOOL readSecretLine(char *buf, size_t size) {
+  if (isatty(STDIN_FILENO)) {
+    return readpassphrase("Install secret: ", buf, size, RPP_ECHO_OFF | RPP_REQUIRE_TTY) != NULL;
+  }
+  size_t used = 0;
+  int c;
+  while ((c = getchar()) != EOF && c != '\n') {
+    if (used + 1 >= size) {
+      return NO;
+    }
+    buf[used++] = (char)c;
+  }
+  buf[used] = '\0';
+  return used > 0;
+}
+
+static void wipe(char *buf, size_t size) {
+  volatile char *p = buf;
+  while (size-- > 0) {
+    *p++ = 0;
+  }
+}
+
+static int licenseSecret(BOOL replace) {
+  char line[256];
+  BOOL got = readSecretLine(line, sizeof(line));
+  NSString *value = got ? [NSString stringWithUTF8String:line] : nil;
+  wipe(line, sizeof(line));
+  if (value == nil) {
+    fprintf(stderr, "no install secret was entered\n");
+    return 1;
+  }
+  NSString *err = nil;
+  if (!rampSaveInstallSecret(value, replace, &err)) {
+    fprintf(stderr, "%s\n", (err != nil ? err : @"couldn't save the install secret").UTF8String);
+    return 1;
+  }
+  printf("Saved the install secret\n");
+  NSString *out = nil;
+  err = nil;
+  int fetched = rampTakeLicenseUpdate(&out, &err);
+  if (fetched == 0) {
+    if (out != nil) {
+      printf("%s\n", out.UTF8String);
+    }
+    return 0;
+  }
+  if (fetched == 2) {
+    fprintf(stderr, "%s\n", (err != nil ? err : @"could not save the license").UTF8String);
+    return 1;
+  }
+  fprintf(stderr,
+          "No license came with this secret yet. Check that support has this Mac's\n"
+          "install ID (nightshift license id), or try nightshift license later.\n");
+  return 1;
+}
+
 static BOOL parseValue(const char *s, long min, long max, long *out) {
   char *end = NULL;
   long value = strtol(s, &end, 10);
@@ -352,6 +427,41 @@ int main(int argc, const char *argv[]) {
          strcmp(argv[1], "help") == 0)) {
       help();
       return 0;
+    }
+
+    if (argc == 3 && strcmp(argv[1], "license") == 0 && strcmp(argv[2], "id") == 0) {
+      NSString *installID = rampInstallID();
+      if (installID == nil) {
+        fprintf(stderr, "could not read the install ID in %s; it was left as is\n",
+                rampInstallIDPath().fileSystemRepresentation);
+        return 1;
+      }
+      printf("%s\n", installID.UTF8String);
+      return 0;
+    }
+
+    // A license moves to a new install ID only through support, who check
+    // the purchase first: install IDs aren't secret (patch review v2, R1).
+    if ((argc == 3 || argc == 4) && strcmp(argv[1], "license") == 0 &&
+        strcmp(argv[2], "rebind") == 0) {
+      fprintf(stderr,
+              "To move a license to this Mac, contact support with the email you paid with\n"
+              "and this Mac's install ID (nightshift license id).\n");
+      return 1;
+    }
+
+    if (argc >= 3 && strcmp(argv[1], "license") == 0 && strcmp(argv[2], "secret") == 0) {
+      if (argc == 3) {
+        return licenseSecret(NO);
+      }
+      if (argc == 4 && strcmp(argv[3], "--replace") == 0) {
+        return licenseSecret(YES);
+      }
+      fprintf(stderr,
+              "nightshift license secret takes no value: it reads the secret from the\n"
+              "keyboard or a pipe, so it stays out of shell history and ps.\n"
+              "usage: nightshift license secret [--replace] < file\n");
+      return 1;
     }
 
     if ((argc == 2 || argc == 3) && strcmp(argv[1], "license") == 0) {
@@ -583,6 +693,7 @@ int main(int argc, const char *argv[]) {
       char line[64];
       char reply[64];
       snprintf(line, sizeof(line), "brightness %u %ld\n", display, percent);
+      gReplyTimeout = kBrightnessTimeout;
       return finishReply(ask(line, reply, sizeof(reply)), reply,
                          "failed to set brightness", YES);
     }

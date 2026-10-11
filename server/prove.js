@@ -1,28 +1,51 @@
 import { spawn } from "node:child_process";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { createHash, generateKeyPairSync } from "node:crypto";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import Stripe from "stripe";
-import { listen, licenseFor, saveLicense } from "./app.js";
+import { listen, licenseFor, saveLicense, signRamp, stripeApiVersion } from "./app.js";
+import {
+  checkoutSessionObject,
+  eventObject,
+  invoiceObject,
+  subscriptionObject,
+} from "./fixtures/stripe.js";
 
 const repo = dirname(dirname(fileURLToPath(import.meta.url)));
 const storeDir = mkdtempSync(join(tmpdir(), "nsstore-"));
 process.env.NIGHTSHIFT_LICENSE_STORE = join(storeDir, "licenses.json");
+
+// Finding 14: a throwaway key, never ~/.nightshift/license.pem. The client
+// under test is the test-key build (make nightshift-testkey), which takes
+// the public half from NIGHTSHIFT_TEST_PUBLIC_KEY; release builds ignore it.
+const { publicKey, privateKey } = generateKeyPairSync("ed25519");
+process.env.NIGHTSHIFT_LICENSE_KEY = join(storeDir, "throwaway.pem");
+writeFileSync(
+  process.env.NIGHTSHIFT_LICENSE_KEY,
+  privateKey.export({ type: "pkcs8", format: "pem" }),
+  { mode: 0o600 },
+);
+process.env.NIGHTSHIFT_TEST_PUBLIC_KEY = publicKey
+  .export({ type: "spki", format: "der" })
+  .subarray(-32)
+  .toString("hex");
+const client = process.env.NIGHTSHIFT_PROVE_BIN || join(repo, "nightshift-testkey");
 
 const secret = "whsec_nightshift_prove";
 process.env.STRIPE_WEBHOOK_SECRET = secret;
 delete process.env.STRIPE_SECRET_KEY;
 delete process.env.STRIPE_PRICE_ID;
 
-const stripe = new Stripe("sk_test_local");
+const stripe = new Stripe("sk_test_local", { apiVersion: stripeApiVersion });
 const installId = "11111111-1111-4111-8111-111111111111";
 const keptStore = process.env.NIGHTSHIFT_LICENSE_STORE;
 const freshDir = mkdtempSync(join(tmpdir(), "nslock-"));
 process.env.NIGHTSHIFT_LICENSE_STORE = join(freshDir, "missing", "licenses.json");
 const fresh = saveLicense(installId, {
   active: true,
-  token: "fresh-token",
+  token: signRamp(installId, "2099-01-01"),
   until: "2099-01-01",
 });
 if (!fresh || fresh.until !== "2099-01-01" || licenseFor(installId) == null) {
@@ -32,20 +55,18 @@ process.env.NIGHTSHIFT_LICENSE_STORE = keptStore;
 const firstEnd = Math.floor(Date.UTC(2027, 9, 1) / 1000);
 const secondEnd = Math.floor(Date.UTC(2028, 9, 1) / 1000);
 
+// The buying Mac's install secret: checkout stores its hash in the
+// subscription metadata, and every license fetch presents it.
+const macSecret = "a".repeat(64);
+const macHash = createHash("sha256").update(macSecret).digest("hex");
+
+// Stripe objects are built from the sandbox captures (fixtures/stripe.js).
 function event(id, end) {
-  return {
+  return eventObject(
     id,
-    object: "event",
-    type: "invoice.paid",
-    data: {
-      object: {
-        id: `in_${id}`,
-        object: "invoice",
-        metadata: { install_id: installId },
-        lines: { data: [{ period: { end } }] },
-      },
-    },
-  };
+    "invoice.paid",
+    invoiceObject(`in_${id}`, { metadata: { install_id: installId, secret_hash: macHash }, end }),
+  );
 }
 
 async function post(port, body) {
@@ -67,19 +88,31 @@ async function post(port, body) {
   }
 }
 
+// POST /license as the Mac makes it; there is no GET.
+function fetchLicense(port, id = installId, presented = macSecret) {
+  return fetch(`http://127.0.0.1:${port}/license`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Nightshift-Secret": presented },
+    body: JSON.stringify({ install_id: id }),
+  });
+}
+
 async function tokenFor(port) {
-  const response = await fetch(
-    `http://127.0.0.1:${port}/license?install_id=${installId}`,
-  );
+  const response = await fetchLicense(port);
   if (response.status !== 200) {
     throw new Error(`license ${response.status}`);
   }
   return response.json();
 }
 
-function install(token) {
+// Installs token in a fresh home whose install ID is id, as the Mac that
+// bought it would have.
+function install(token, id = installId) {
   const home = mkdtempSync(join(tmpdir(), "nightshift-license-"));
-  const child = spawn(join(repo, "nightshift"), ["license", token], {
+  const support = join(home, "Library", "Application Support", "nightshift");
+  mkdirSync(support, { recursive: true, mode: 0o700 });
+  writeFileSync(join(support, "install-id"), `${id}\n`, { mode: 0o600 });
+  const child = spawn(client, ["license", token], {
     cwd: repo,
     env: { ...process.env, HOME: home, CFFIXED_USER_HOME: home },
   });
@@ -113,6 +146,14 @@ if (first.until !== "2027-10-01" || firstText !== "Ramp is unlocked through 2027
   throw new Error(`first license ${first.until} ${firstText}`);
 }
 
+const elsewhere = await install(first.token, "99999999-9999-4999-8999-999999999999").then(
+  () => "accepted",
+  (error) => error.message.trim(),
+);
+if (elsewhere !== "that license was rejected") {
+  throw new Error(`token on another install: ${elsewhere}`);
+}
+
 await post(port, event("evt_year_2", secondEnd));
 const second = await tokenFor(port);
 const secondText = await install(second.token);
@@ -129,29 +170,29 @@ const basilEnd = Math.floor(Date.UTC(2029, 9, 1) / 1000);
 const returnId = "22222222-2222-4222-8222-222222222222";
 const invoiceId = "33333333-3333-4333-8333-333333333333";
 const subscriptions = {
-  sub_return: { metadata: { install_id: returnId }, customer: "cus_return" },
-  sub_invoice: { metadata: { install_id: invoiceId }, customer: "cus_invoice" },
+  sub_return: { metadata: { install_id: returnId, secret_hash: macHash }, customer: "cus_return" },
+  sub_invoice: { metadata: { install_id: invoiceId, secret_hash: macHash }, customer: "cus_invoice" },
 };
 const basil = {
   webhooks: stripe.webhooks,
   checkout: {
     sessions: {
-      retrieve: async (id) => ({
-        id,
-        status: "complete",
-        payment_status: id === "cs_unpaid" ? "unpaid" : "paid",
-        client_reference_id: returnId,
-        subscription: "sub_return",
-        customer: "cus_return",
-      }),
+      retrieve: async (id) =>
+        checkoutSessionObject(id, {
+          status: "complete",
+          payment_status: id === "cs_unpaid" ? "unpaid" : "paid",
+          client_reference_id: returnId,
+          subscription: "sub_return",
+          customer: "cus_return",
+        }),
     },
   },
   subscriptions: {
-    retrieve: async (id) => ({
-      id,
-      ...subscriptions[id],
-      items: { data: [{ current_period_end: basilEnd }] },
-    }),
+    retrieve: async (id) =>
+      subscriptionObject(id, {
+        ...subscriptions[id],
+        items: { data: [{ current_period_end: basilEnd }] },
+      }),
   },
 };
 
@@ -166,24 +207,20 @@ const unpaid = await fetch(
 if (unpaid.status !== 402) {
   throw new Error(`unpaid checkout ${unpaid.status} ${await unpaid.text()}`);
 }
-await post(basilPort, {
-  id: "evt_unpaid_session",
-  object: "event",
-  type: "checkout.session.completed",
-  data: {
-    object: {
-      id: "cs_unpaid",
-      object: "checkout.session",
+await post(
+  basilPort,
+  eventObject(
+    "evt_unpaid_session",
+    "checkout.session.completed",
+    checkoutSessionObject("cs_unpaid", {
       payment_status: "unpaid",
       status: "complete",
       client_reference_id: returnId,
       subscription: "sub_return",
-    },
-  },
-});
-const unpaidLicense = await fetch(
-  `http://127.0.0.1:${basilPort}/license?install_id=${returnId}`,
+    }),
+  ),
 );
+const unpaidLicense = await fetchLicense(basilPort, returnId);
 if (unpaidLicense.status !== 204) {
   throw new Error(`unpaid license ${unpaidLicense.status}`);
 }
@@ -197,32 +234,24 @@ const prefix = "nightshift://license?token=";
 if (returned.status !== 302 || !location.startsWith(prefix)) {
   throw new Error(`checkout return ${returned.status} ${location}`);
 }
-const returnText = await install(decodeURIComponent(location.slice(prefix.length)));
+const returnText = await install(decodeURIComponent(location.slice(prefix.length)), returnId);
 if (returnText !== "Ramp is unlocked through 2029-10-01") {
   throw new Error(`checkout return license ${returnText}`);
 }
 
-await post(basilPort, {
-  id: "evt_parent",
-  object: "event",
-  type: "invoice.paid",
-  data: {
-    object: {
-      id: "in_parent",
-      object: "invoice",
-      parent: {
-        type: "subscription_details",
-        subscription_details: {
-          subscription: "sub_invoice",
-          metadata: { install_id: invoiceId },
-        },
-      },
-    },
-  },
-});
-const parentResponse = await fetch(
-  `http://127.0.0.1:${basilPort}/license?install_id=${invoiceId}`,
+await post(
+  basilPort,
+  eventObject(
+    "evt_parent",
+    "invoice.paid",
+    invoiceObject("in_parent", {
+      subscription: "sub_invoice",
+      metadata: { install_id: invoiceId, secret_hash: macHash },
+      end: null,
+    }),
+  ),
 );
+const parentResponse = await fetchLicense(basilPort, invoiceId);
 const parentLicense = parentResponse.status === 200 ? await parentResponse.json() : {};
 if (parentLicense.until !== "2029-10-01") {
   throw new Error(`invoice without a line period ${parentResponse.status}`);
@@ -240,22 +269,21 @@ saveLicense(installId, {
   active: true,
   token: "expired-token",
   until: "2020-01-01",
+  secret_hash: macHash,
 });
 if (licenseFor(installId) != null) {
   throw new Error("expired license still counts");
 }
-const expiredLicense = await fetch(
-  `http://127.0.0.1:${basilPort}/license?install_id=${installId}`,
-);
+const expiredLicense = await fetchLicense(basilPort);
 if (expiredLicense.status !== 204) {
   throw new Error(`expired license ${expiredLicense.status}`);
 }
 const expiredCheckout = await fetch(`http://127.0.0.1:${basilPort}/checkout`, {
   method: "POST",
-  headers: { "Content-Type": "application/json" },
+  headers: { "Content-Type": "application/json", "X-Nightshift-Secret": macSecret },
   body: JSON.stringify({ install_id: installId }),
 });
-if (expiredCheckout.status === 409) {
+if (expiredCheckout.status === 409 || expiredCheckout.status === 400) {
   throw new Error(`expired checkout ${await expiredCheckout.text()}`);
 }
 process.env.NIGHTSHIFT_LICENSE_STORE = keptStore;
@@ -263,13 +291,11 @@ process.env.NIGHTSHIFT_LICENSE_STORE = keptStore;
 const corrupt = join(storeDir, "corrupt.json");
 writeFileSync(corrupt, "{");
 process.env.NIGHTSHIFT_LICENSE_STORE = corrupt;
-const corruptLicense = await fetch(
-  `http://127.0.0.1:${basilPort}/license?install_id=${installId}`,
-);
+const corruptLicense = await fetchLicense(basilPort);
 const corruptText = await corruptLicense.text();
 if (
   corruptLicense.status !== 503 ||
-  !corruptText.includes("license store is unreadable") ||
+  !corruptText.includes("service unavailable") ||
   readFileSync(corrupt, "utf8") !== "{"
 ) {
   throw new Error(`corrupt store ${corruptLicense.status} ${corruptText}`);

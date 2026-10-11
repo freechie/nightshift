@@ -1,0 +1,155 @@
+// Copyright 2026 John
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+// implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Pure logic the daemon uses, kept free of AppKit, IOKit and globals so the
+// unit tests can call it. Plain C: tests/logic.m builds on macOS and Linux.
+
+#ifndef NIGHTSHIFT_LOGIC_H
+#define NIGHTSHIFT_LOGIC_H
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+// MARK: Evening ramp
+
+// 1 in the first half of the glide, 2 in the second, 3 once it has arrived.
+int nsGlideStage(int fromMinute, int toMinute, int now);
+// Where a glide that starts now should end: Full at when it comes before the
+// schedule ends, else glideMinutes from now, never past the schedule's end.
+int nsGlideEnd(int now, int scheduleEnd, int fullAt, int glideMinutes);
+// clock falls inside the schedule, its end included.
+bool nsClockInSchedule(int start, int end, int clock);
+// clock comes after now and no later than the next turn-on.
+bool nsAheadOfTurnOn(int now, int start, int clock);
+// The Full at an evening uses: the saved clock when it is inside the
+// schedule, else rampMinutes after the start (or the schedule's end when it
+// is shorter). -1 for an empty schedule.
+int nsDefaultFullAt(int start, int end, int rampClock, int rampMinutes);
+
+// MARK: DDC monitor matching
+
+// One DCPAVServiceProxy that might belong to a display.
+typedef struct {
+  uint32_t vendor;   // EDID bytes 8-9, big-endian PNP ID, as CGDisplayVendorNumber
+  uint32_t product;  // EDID bytes 10-11
+  uint32_t serial;   // EDID bytes 12-15, 0 when the monitor leaves it unset
+  bool external;     // "Location" is "External", or the property is missing
+  char port[32];     // "dispext0" from the parent "dispext0:dcpav-service-epic:0"
+} DDCCandidate;
+
+// What CoreGraphics knows about the display being matched.
+typedef struct {
+  uint32_t vendor;
+  uint32_t model;
+  uint32_t serial;
+  char port[32];      // "dispext0" from CoreDisplay's IODisplayLocation, "" if unknown
+  int twins;          // online displays with this vendor and model, this one included
+  bool serialShared;  // another of those twins reports the same nonzero serial
+} DDCTarget;
+
+// Copies the part of name before stop ("dispext0" from "dispext0@88000000").
+bool nsDDCPortName(const char *name, char stop, char *out, size_t cap);
+// The index of the one candidate that is certainly this display, or -1 when
+// it is ambiguous and the shade should be used. Never trades a known brand
+// for a guess.
+int nsDDCPickCandidate(const DDCCandidate *candidates, int count, const DDCTarget *target);
+
+// MARK: DDC slots and readback
+
+// The slot a display's channel belongs in: its own slot when it has one, else
+// the first free one (display 0), else -1. Looking for its own slot first
+// keeps a freed lower slot from becoming a second slot for the display.
+int nsDDCSlotFor(const uint32_t *displays, int count, uint32_t display);
+int nsDDCValue(long percent, int scale);
+long nsDDCRawPercent(int raw, int scale);
+bool nsDDCNear(int got, int want, int scale);
+// The lowest raw value the lamp goes to, updated after a write of wanted
+// (lamp percent asked for: percent) moved the lamp from before to landed.
+// -1 means unknown. A floor is learned only from a readback that two reads
+// agreed on (stable) and only when the lamp really moved down, so a stale
+// reply that still shows the old level can't become a permanent floor. A
+// reading below the floor always clears it.
+int nsDDCLearnFloor(int floorRaw, int before, int wanted, int landed, int scale, long percent,
+                    bool stable);
+
+// MARK: Backlight and overlay
+
+// Brightness percents at or above this move the lamp; below it the lamp sits
+// at its floor and the overlay (shade) dims the picture.
+extern const long kNSCombinedSwitch;
+// The dimmest the overlay goes for any percent above 0. Only 0 is black.
+extern const long kNSShadeFloor;
+// The lowest percent restored at launch, after wake or replug. Black and
+// near-black are for this session only.
+extern const long kNSRestoreMinimum;
+
+long nsLampToCombined(long lamp, long floor);
+
+// Patch review N9: what a revalidation (after wake or a screen change) does
+// when it reads a confirmed lamp. current and target are raw values on
+// scale; the ages are seconds since the display's last brightness change
+// and since the Mac last woke, negative for never.
+//   kNSRevalidateKeep     on target, or changed in the last
+//                         kNSUserQuietSeconds (a write may still be settling
+//                         and the user's value stands)
+//   kNSRevalidateReapply  just woke (kNSWakeWindowSeconds) and at least
+//                         kNSResetGap points off: the monitor reset itself
+//                         while asleep or power-cycled
+//   kNSRevalidateAdopt    anything else: the monitor's own buttons moved it,
+//                         so its value becomes the shown one
+typedef enum {
+  kNSRevalidateKeep = 0,
+  kNSRevalidateReapply = 1,
+  kNSRevalidateAdopt = 2,
+} NSRevalidateAction;
+extern const double kNSUserQuietSeconds;
+extern const double kNSWakeWindowSeconds;
+extern const long kNSResetGap;
+NSRevalidateAction nsRevalidateAction(int current, int target, int scale,
+                                      double sinceChange, double sinceWake);
+// Splits a brightness percent into a lamp percent (hardware) and an overlay
+// percent (software, 100 = no overlay, 0 = black).
+void nsCombinedLevels(long percent, long floor, long *hardware, long *software);
+// One brightness-key step on a scale of stops.
+long nsSteppedPercent(long percent, int direction, long stops);
+// The percent a display may actually be set to. 0 (black) is refused for an
+// external display unless another online display is still lit, so the user
+// can never lose every screen; it becomes 1, the dimmest visible level.
+long nsSafeBrightness(long percent, bool builtin, int otherLitDisplays);
+
+// Another online display, as seen when deciding whether one may go black.
+typedef struct {
+  bool builtin;   // the built-in panel
+  bool hardware;  // brightness read from the display itself: confirmed DDC,
+                  // DisplayServices or CoreBrightness. Not the software shade.
+  bool asleep;
+  bool mirrored;  // in the same mirror set as the display going black
+  long percent;   // -1 when it can't be read
+} NSOtherDisplay;
+// Whether a display is trusted to still show a picture (patch review N6).
+// The built-in panel counts unless it reads 0. Anything else counts only
+// when its brightness comes from the display itself and is above 0: a
+// dummy HDMI plug, a virtual or DisplayLink display, or a monitor that is
+// off but still listed has only the software shade, which says nothing
+// about whether anyone can see it.
+bool nsCountsAsLit(NSOtherDisplay display);
+int nsLitDisplays(const NSOtherDisplay *others, int count);
+// What is written to the brightness file: never 0.
+long nsPersistedBrightness(long percent);
+// What a saved percent is restored as.
+long nsRestoredBrightness(long saved);
+
+#endif

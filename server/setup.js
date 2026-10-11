@@ -1,6 +1,6 @@
 import { writeFileSync } from "node:fs";
 import Stripe from "stripe";
-import { envPath, loadEnv } from "./app.js";
+import { envPath, loadEnv, stripeApiVersion } from "./app.js";
 
 function writeEnv(values) {
   const lines = Object.entries(values).map(([key, value]) => `${key}=${value}`);
@@ -14,7 +14,7 @@ if (!key) {
   process.exit(1);
 }
 
-const stripeOptions = {};
+const stripeOptions = { apiVersion: stripeApiVersion };
 if (process.env.STRIPE_API_HOST) {
   stripeOptions.host = process.env.STRIPE_API_HOST;
   stripeOptions.port = Number(process.env.STRIPE_API_PORT || 12111);
@@ -71,6 +71,8 @@ let webhookSecret = process.env.STRIPE_WEBHOOK_SECRET || "";
 if (base.startsWith("https://")) {
   const endpoint = await stripe.webhookEndpoints.create({
     url: `${base}/webhook`,
+    // Event payloads in the version the server is pinned to.
+    api_version: stripeApiVersion,
     enabled_events: [
       "invoice.paid",
       "checkout.session.completed",
@@ -95,6 +97,8 @@ console.log(`price ${price.id} ${cents} cents per year`);
 console.log(`portal ${portal.id}`);
 if (!base.startsWith("https://")) {
   console.log(
-    "Local webhook: stripe listen --forward-to localhost:8787/webhook",
+    "Local webhook: stripe listen --events checkout.session.completed,invoice.paid," +
+      "customer.subscription.deleted --forward-to localhost:8787/webhook" +
+      ` (its "Ready" line must name API version ${stripeApiVersion})`,
   );
 }

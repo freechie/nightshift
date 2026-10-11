@@ -14,25 +14,39 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Print a ramp license token. The private key stays in
+# Print a ramp license token for one install. The private key stays in
 # ~/.nightshift/license.pem, or in NIGHTSHIFT_LICENSE_KEY.
-# Pass YYYY-MM-DD to expire at the end of that UTC day.
+#   issue-license.sh <install-id> <YYYY-MM-DD>
+# Get the install ID by running "nightshift license id" on the Mac being
+# licensed. The token works only there, through the end of that UTC day.
+# There are no undated or unbound tokens (review finding 6).
+# Also record the grant with "node server/admin.js grant <install-id> <day>"
+# so the app's refresh, and support moving it with admin.js rebind, see it.
+# That prints an install secret once if the install has none; the customer
+# enters it with "nightshift license secret" (read from stdin, never argv).
 
 set -eu
 key=${NIGHTSHIFT_LICENSE_KEY:-$HOME/.nightshift/license.pem}
-payload=ramp
-if [ $# -eq 1 ]; then
-  case $1 in
-    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) payload=ramp:$1 ;;
-    *)
-      echo "use a date like 2027-10-01" >&2
-      exit 1
-      ;;
-  esac
-elif [ $# -ne 0 ]; then
-  echo "usage: issue-license.sh [YYYY-MM-DD]" >&2
+if [ $# -ne 2 ]; then
+  echo "usage: issue-license.sh <install-id> <YYYY-MM-DD>" >&2
   exit 1
 fi
+install=$(printf '%s' "$1" | tr 'A-F' 'a-f')
+case $install in
+  [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+  *)
+    echo "use an install ID like 5f0e1c2a-3b4d-4e6f-8a9b-0c1d2e3f4a5b" >&2
+    exit 1
+    ;;
+esac
+case $2 in
+  [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;;
+  *)
+    echo "use a date like 2027-10-01" >&2
+    exit 1
+    ;;
+esac
+payload=ramp:$install:$2
 file=$(mktemp)
 sigfile=$(mktemp)
 trap 'rm -f "$file" "$sigfile"' EXIT

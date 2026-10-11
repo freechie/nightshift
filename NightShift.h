@@ -44,7 +44,19 @@ NSString *rampLicenseUntil(void);
 BOOL rampLicenseRenewingSoon(void);
 BOOL rampLicenseNeedsRefresh(void);
 BOOL rampSaveNewerLicense(NSString *token);
+// The install ID (created once, never replaced; nil if its file exists but
+// can't be read) and the file it lives in.
 NSString *rampInstallID(void);
+NSString *rampInstallIDPath(void);
+NSString *rampInstallSecret(void);
+// Saves a secret from support (64 hex characters); an existing one only
+// when replace is YES. On failure, *error says why.
+BOOL rampSaveInstallSecret(NSString *value, BOOL replace, NSString **error);
+void forgetInstallIdentityForTests(void);
+// The end day a license payload grants on installID, or nil. Only
+// "ramp:<install-id>:<day>" for that install; unbound "ramp" and
+// "ramp:<day>" are refused. Does not check expiry.
+NSString *rampPayloadDay(NSString *payload, NSString *installID);
 NSString *rampServerOrigin(void);
 NSString *rampCheckoutURL(void);
 NSString *rampFetchLicenseToken(void);
@@ -52,5 +64,12 @@ int rampInstallReported(NSString *token, NSString **stdoutLine, NSString **stder
 int rampBeginPurchase(NSString **openURL, BOOL *portal, NSString **stdoutLine,
                       NSString **stderrLine);
 int rampTakeLicenseUpdate(NSString **stdoutLine, NSString **stderrLine);
+// What to tell this Mac when the server answered a license fetch with its
+// held-purchase reply (status 409): "This purchase is being reversed;
+// contact support" while the refund is pending (error "pending"), "This
+// purchase was refunded; contact support" once it succeeded (error
+// "refunded"), else nil. rampTakeLicenseUpdate and rampBeginPurchase
+// report it.
+NSString *rampHeldPurchaseMessage(NSInteger status, NSData *body);
 NSString *rampOffer(void);
 void useRampPublicKeyForTests(const uint8_t *key);
