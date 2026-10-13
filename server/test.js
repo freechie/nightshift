@@ -1437,5 +1437,41 @@ await check("an unreadable store is a plain 503 and is left alone", async () => 
   process.env.NIGHTSHIFT_LICENSE_STORE = kept;
 });
 
+// .env.example is committed and copied into .env, so it must never carry a
+// secret. Its defaults (cents, base URL, port) stay; any key whose name holds
+// SECRET, KEY or TOKEN must be empty, no value may start with sk_, rk_ or
+// whsec_, and no line may match the pre-commit hook's patterns
+// (scripts/secret-patterns.txt). Same KEY=value grammar as loadEnv; comments
+// and blank lines are skipped. A failure names the key (or the line number),
+// never the value.
+await check(".env.example carries no secrets", () => {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const patterns = readFileSync(join(here, "..", "scripts", "secret-patterns.txt"), "utf8")
+    .split("\n")
+    .filter((line) => line.trim() !== "" && !line.startsWith("#"))
+    .map((line) => new RegExp(line));
+  assert.ok(patterns.length > 0);
+  const found = [];
+  readFileSync(join(here, ".env.example"), "utf8")
+    .split(/\r?\n/)
+    .forEach((line, index) => {
+      const text = line.trim();
+      if (text === "" || text.startsWith("#")) return;
+      const match = text.match(/^([A-Z0-9_]+)=(.*)$/);
+      const name = match ? match[1] : `line ${index + 1}`;
+      const value = match ? match[2].trim() : text;
+      if (match && /SECRET|KEY|TOKEN/.test(name) && value !== "") {
+        found.push(`${name} must be empty`);
+      } else if (/^["']?(sk_|rk_|whsec_)/.test(value)) {
+        found.push(`${name} holds a Stripe secret prefix`);
+      } else if (patterns.some((pattern) => pattern.test(text))) {
+        found.push(`${name} looks like a Stripe secret`);
+      } else if (!match) {
+        found.push(`${name} isn't KEY=value`);
+      }
+    });
+  assert.ok(found.length === 0, `.env.example: ${found.join("; ")}`);
+});
+
 server.close();
 console.log(`server ok (${passed} checks)`);

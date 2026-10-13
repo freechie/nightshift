@@ -5352,7 +5352,17 @@ static const CGFloat kSettingsWidth = 720;
 static const CGFloat kSettingsHeight = 540;
 static const CGFloat kSettingsSidebarWidth = 200;
 static const CGFloat kFormWidth = 480;  // content pane 520 less 20 a side
-static const CGFloat kFormInset = 10;
+static const CGFloat kFormInset = 10;        // row content inset, left and right
+static const CGFloat kRowInsetV = 10;        // row content inset, top and bottom
+static const CGFloat kRowMinHeight = 44;     // a one-line row; two-line rows grow
+static const CGFloat kRowGap = 12;           // text to control in a row
+static const CGFloat kSectionGap = 20;       // above each section
+static const CGFloat kSectionHeaderGap = 8;  // section title to its box
+static const CGFloat kSectionFooterGap = 6;  // box to its footer
+static const CGFloat kSidebarSearchTop = 52; // window top to the search field
+static const CGFloat kSidebarListGap = 16;   // search field to the first row
+static const CGFloat kSidebarRowHeight = 28; // plus 4 spacing: a 32 pt pitch
+static const CGFloat kSidebarIconSize = 20;
 
 enum {
   kPaneGeneral = 0,
@@ -5479,6 +5489,22 @@ static NSString *const kSettingsWindowID = @"NightshiftSettings";
 @end
 
 @implementation FormRow
+@end
+
+// A wrapping caption that wraps at the width it is laid out at, so it never
+// clips when its row's control turns out wider or narrower than estimated.
+@interface FormCaption : NSTextField
+@end
+
+@implementation FormCaption
+- (void)layout {
+  [super layout];
+  CGFloat width = NSWidth(self.bounds);
+  if (width > 1 && fabs(self.preferredMaxLayoutWidth - width) > 0.5) {
+    self.preferredMaxLayoutWidth = width;
+    [self invalidateIntrinsicContentSize];
+  }
+}
 @end
 
 // One choice in the icon picker: the tile, its name under it, and an accent
@@ -5698,6 +5724,28 @@ static void installSettingsMenu(void) {
   NSApp.mainMenu = bar;
 }
 
+// Stack views and some controls (date pickers) stretch by default; a row's
+// control group hugs its controls so it sits flush right, and never clips
+// them: the caption beside it wraps instead.
+static void hugControls(NSView *view) {
+  if ([view isKindOfClass:[NSStackView class]]) {
+    NSStackView *stack = (NSStackView *)view;
+    // Across a vertical stack, required hugging would pull every view to the
+    // same width, so there it only has to beat the text column beside it.
+    BOOL across = stack.orientation == NSUserInterfaceLayoutOrientationVertical;
+    [stack setHuggingPriority:across ? NSLayoutPriorityDefaultHigh - 1 : NSLayoutPriorityRequired
+               forOrientation:NSLayoutConstraintOrientationHorizontal];
+    for (NSView *part in stack.arrangedSubviews) {
+      hugControls(part);
+    }
+  } else if (view != nil) {
+    [view setContentHuggingPriority:NSLayoutPriorityRequired
+                     forOrientation:NSLayoutConstraintOrientationHorizontal];
+    [view setContentCompressionResistancePriority:NSLayoutPriorityRequired
+                                   forOrientation:NSLayoutConstraintOrientationHorizontal];
+  }
+}
+
 @implementation SettingsPanel
 
 // MARK: Form helpers
@@ -5710,22 +5758,35 @@ static void installSettingsMenu(void) {
 }
 
 - (NSTextField *)captionLabel:(NSString *)text width:(CGFloat)width {
-  NSTextField *label = [NSTextField wrappingLabelWithString:text];
+  NSTextField *label = [FormCaption wrappingLabelWithString:text];
   label.font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize];
   label.textColor = NSColor.secondaryLabelColor;
   label.preferredMaxLayoutWidth = width;
   label.selectable = NO;
+  // Give way to the control; the caption rewraps at whatever width is left.
+  [label setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow
+                                  forOrientation:NSLayoutConstraintOrientationHorizontal];
   return label;
 }
 
 // A row: title and optional caption on the left, the control on the right.
 // Pass caption @"" for a caption that is filled in later.
 - (FormRow *)row:(NSString *)title caption:(NSString *)caption control:(NSView *)control {
+  return [self row:title caption:caption control:control below:NO];
+}
+
+// With below, the control gets its own line under the title and caption, for
+// controls too wide to sit beside a caption.
+- (FormRow *)row:(NSString *)title
+         caption:(NSString *)caption
+         control:(NSView *)control
+           below:(BOOL)below {
   [self addWords:title];
   [self addWords:caption];
   FormRow *row = [[FormRow alloc] initWithFrame:NSZeroRect];
   row.translatesAutoresizingMaskIntoConstraints = NO;
-  CGFloat controlWidth = control == nil ? 0 : control.fittingSize.width + 16;
+  hugControls(control);
+  CGFloat controlWidth = control == nil || below ? 0 : control.fittingSize.width + kRowGap;
   NSMutableArray<NSView *> *texts = [NSMutableArray array];
   if (title.length > 0) {
     row.titleField = [NSTextField labelWithString:title];
@@ -5739,7 +5800,7 @@ static void installSettingsMenu(void) {
   }
   if (caption != nil) {
     row.captionField =
-        [self captionLabel:caption width:MAX(160, kFormWidth - 2 * kFormInset - controlWidth)];
+        [self captionLabel:caption width:kFormWidth - 2 * kFormInset - controlWidth];
     [texts addObject:row.captionField];
   }
   NSStackView *text = [NSStackView stackViewWithViews:texts];
@@ -5749,6 +5810,14 @@ static void installSettingsMenu(void) {
   text.detachesHiddenViews = YES;
   [text setContentHuggingPriority:NSLayoutPriorityDefaultLow
                    forOrientation:NSLayoutConstraintOrientationHorizontal];
+  if (row.captionField != nil) {
+    // The caption spans the text column, which takes whatever the control
+    // leaves, and wraps at that width (see FormCaption).
+    [row.captionField.widthAnchor constraintEqualToAnchor:text.widthAnchor].active = YES;
+  }
+  if (below) {
+    [text.widthAnchor constraintEqualToConstant:kFormWidth - 2 * kFormInset].active = YES;
+  }
   NSMutableArray<NSView *> *parts = [NSMutableArray arrayWithObject:text];
   if (control != nil) {
     [control setContentHuggingPriority:NSLayoutPriorityRequired
@@ -5762,11 +5831,12 @@ static void installSettingsMenu(void) {
     [parts addObject:control];
   }
   NSStackView *line = [NSStackView stackViewWithViews:parts];
-  line.orientation = NSUserInterfaceLayoutOrientationHorizontal;
-  line.alignment = NSLayoutAttributeCenterY;
-  line.spacing = 12;
+  line.orientation = below ? NSUserInterfaceLayoutOrientationVertical
+                           : NSUserInterfaceLayoutOrientationHorizontal;
+  line.alignment = below ? NSLayoutAttributeLeading : NSLayoutAttributeCenterY;
+  line.spacing = below ? 8 : kRowGap;
   line.distribution = NSStackViewDistributionFill;
-  line.edgeInsets = NSEdgeInsetsMake(9, kFormInset, 9, kFormInset);
+  line.edgeInsets = NSEdgeInsetsMake(kRowInsetV, kFormInset, kRowInsetV, kFormInset);
   line.translatesAutoresizingMaskIntoConstraints = NO;
   [row addSubview:line];
   [NSLayoutConstraint activateConstraints:@[
@@ -5775,8 +5845,12 @@ static void installSettingsMenu(void) {
     [line.topAnchor constraintEqualToAnchor:row.topAnchor],
     [line.bottomAnchor constraintEqualToAnchor:row.bottomAnchor],
     [row.widthAnchor constraintEqualToConstant:kFormWidth],
-    [row.heightAnchor constraintGreaterThanOrEqualToConstant:40],
+    [row.heightAnchor constraintGreaterThanOrEqualToConstant:kRowMinHeight],
   ]];
+  if (below && control != nil) {
+    [control.widthAnchor constraintLessThanOrEqualToConstant:kFormWidth - 2 * kFormInset]
+        .active = YES;
+  }
   return row;
 }
 
@@ -5818,7 +5892,7 @@ static void installSettingsMenu(void) {
   return group;
 }
 
-// A section: small secondary header, the rounded group, an optional footer.
+// A section: a semibold header, the rounded group, an optional footer.
 - (NSView *)section:(NSString *)header
           accessory:(NSView *)accessory
                rows:(NSArray<NSView *> *)rows
@@ -5827,8 +5901,8 @@ static void installSettingsMenu(void) {
   if (header.length > 0) {
     [self addWords:header];
     NSTextField *title = [NSTextField labelWithString:header];
-    title.font = [NSFont systemFontOfSize:11 weight:NSFontWeightSemibold];
-    title.textColor = NSColor.secondaryLabelColor;
+    title.font = [NSFont systemFontOfSize:NSFont.systemFontSize weight:NSFontWeightSemibold];
+    title.textColor = NSColor.labelColor;
     title.lineBreakMode = NSLineBreakByTruncatingTail;
     NSMutableArray<NSView *> *headParts = [NSMutableArray arrayWithObject:title];
     if (accessory != nil) {
@@ -5841,7 +5915,8 @@ static void installSettingsMenu(void) {
     head.edgeInsets = NSEdgeInsetsMake(0, kFormInset, 0, 0);
     [parts addObject:head];
   }
-  [parts addObject:[self groupWithViews:rows]];
+  NSView *group = [self groupWithViews:rows];
+  [parts addObject:group];
   if (footer.length > 0) {
     [self addWords:footer];
     NSTextField *foot = [self captionLabel:footer width:kFormWidth - 2 * kFormInset];
@@ -5852,20 +5927,23 @@ static void installSettingsMenu(void) {
   NSStackView *stack = [NSStackView stackViewWithViews:parts];
   stack.orientation = NSUserInterfaceLayoutOrientationVertical;
   stack.alignment = NSLayoutAttributeLeading;
-  stack.spacing = 6;
+  stack.spacing = kSectionFooterGap;
+  if (header.length > 0) {
+    [stack setCustomSpacing:kSectionHeaderGap afterView:parts.firstObject];
+  }
   stack.translatesAutoresizingMaskIntoConstraints = NO;
   return stack;
 }
 
-// A scrolling page of sections, 18 pt apart. The scroll view's automatic
+// A scrolling page of sections, kSectionGap apart. The scroll view's automatic
 // content insets keep the first section clear of the toolbar.
 - (NSScrollView *)pageWithSections:(NSArray<NSView *> *)sections stack:(NSStackView **)stackOut {
   NSStackView *stack = [NSStackView stackViewWithViews:sections];
   stack.orientation = NSUserInterfaceLayoutOrientationVertical;
   stack.alignment = NSLayoutAttributeCenterX;
-  stack.spacing = 18;
+  stack.spacing = kSectionGap;
   stack.detachesHiddenViews = YES;
-  stack.edgeInsets = NSEdgeInsetsMake(6, 20, 20, 20);
+  stack.edgeInsets = NSEdgeInsetsMake(kSectionGap - 6, 20, 20, 20);
   stack.translatesAutoresizingMaskIntoConstraints = NO;
   SettingsFlippedView *document = [[SettingsFlippedView alloc] initWithFrame:NSZeroRect];
   document.translatesAutoresizingMaskIntoConstraints = NO;
@@ -5965,7 +6043,7 @@ static void installSettingsMenu(void) {
   }
   NSStackView *strip = [self hstack:tiles spacing:4];
   strip.alignment = NSLayoutAttributeTop;
-  strip.edgeInsets = NSEdgeInsetsMake(12, kFormInset - 4, 8, kFormInset);
+  strip.edgeInsets = NSEdgeInsetsMake(kRowInsetV, kFormInset - 4, kRowInsetV, kFormInset);
   [strip setAccessibilityRole:NSAccessibilityRadioGroupRole];
   strip.accessibilityLabel = @"Icon";
   NSStackView *box = [NSStackView stackViewWithViews:@[ strip ]];
@@ -6064,16 +6142,20 @@ static void installSettingsMenu(void) {
                               ]
                             footer:nil];
 
-  self.maxSlider = [self formSlider:150];
-  self.maxSlider.minValue = 1;
+  // The slider gets its own line under the title and caption, so the
+  // caption wraps across the full row instead of beside the slider.
   self.maxValue = [self valueLabel];
   NSTextField *less = [self secondaryLabel:@"Less Warm"];
   less.font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize];
   NSTextField *more = [self secondaryLabel:@"More Warm"];
   more.font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize];
+  CGFloat sliderWidth = kFormWidth - 2 * kFormInset - less.fittingSize.width -
+                        more.fittingSize.width - 40 - 3 * 8;
+  self.maxSlider = [self formSlider:floor(sliderWidth)];
+  self.maxSlider.minValue = 1;
   NSStackView *maxControl = [self hstack:@[ less, self.maxSlider, more, self.maxValue ]
                                  spacing:8];
-  self.maxRow = [self row:@"Max" caption:@"" control:maxControl];
+  self.maxRow = [self row:@"Max" caption:@"" control:maxControl below:YES];
   NSView *warmth = [self section:@"Warmth" accessory:nil rows:@[ self.maxRow ] footer:nil];
 
   self.fullAtPicker = [[NSDatePicker alloc] initWithFrame:NSZeroRect];
@@ -6262,14 +6344,18 @@ static NSString *displaySignature(uint32_t *ids, int count) {
   NSStackView *keysState = [self dot:&dot label:&status];
   self.keysDot = dot;
   self.keysStatus = status;
+  // The status and its button share the row, stacked at the trailing edge.
+  NSStackView *keysControl = [NSStackView stackViewWithViews:@[ keysState, self.keysButton ]];
+  keysControl.orientation = NSUserInterfaceLayoutOrientationVertical;
+  keysControl.alignment = NSLayoutAttributeTrailing;
+  keysControl.spacing = 6;
   FormRow *keysRow = [self row:@"Brightness Keys"
                        caption:@"The brightness keys change the display under the pointer. "
                                @"They need Accessibility access."
-                       control:keysState];
-  FormRow *keysOpen = [self row:@"" caption:nil control:self.keysButton];
+                       control:keysControl];
   NSView *keys = [self section:@"Keyboard"
                      accessory:nil
-                          rows:@[ keysRow, keysOpen ]
+                          rows:@[ keysRow ]
                         footer:@"The lower half of the range dims the picture after the "
                                @"backlight is as low as it will go. Turn on DDC/CI in the "
                                @"monitor's menu to change an external display's backlight."];
@@ -6699,8 +6785,8 @@ static NSImage *sidebarTile(NSInteger pane, CGFloat size) {
   [self.sidebarTable addTableColumn:column];
   self.sidebarTable.headerView = nil;
   self.sidebarTable.style = NSTableViewStyleSourceList;
-  self.sidebarTable.rowHeight = 30;
-  self.sidebarTable.intercellSpacing = NSMakeSize(0, 2);
+  self.sidebarTable.rowHeight = kSidebarRowHeight;
+  self.sidebarTable.intercellSpacing = NSMakeSize(0, 32 - kSidebarRowHeight);
   self.sidebarTable.backgroundColor = NSColor.clearColor;
   self.sidebarTable.allowsEmptySelection = YES;
   self.sidebarTable.dataSource = self;
@@ -6717,12 +6803,15 @@ static NSImage *sidebarTile(NSInteger pane, CGFloat size) {
   [sidebar addSubview:self.searchField];
   [sidebar addSubview:tableScroll];
   [NSLayoutConstraint activateConstraints:@[
-    [self.searchField.topAnchor constraintEqualToAnchor:sidebar.safeAreaLayoutGuide.topAnchor
-                                               constant:4],
+    // Measured from the window top, not the safe area, so the field sits
+    // clear of the traffic lights the way System Settings' does.
+    [self.searchField.topAnchor constraintEqualToAnchor:sidebar.topAnchor
+                                               constant:kSidebarSearchTop],
     [self.searchField.leadingAnchor constraintEqualToAnchor:sidebar.leadingAnchor constant:10],
     [self.searchField.trailingAnchor constraintEqualToAnchor:sidebar.trailingAnchor
                                                     constant:-10],
-    [tableScroll.topAnchor constraintEqualToAnchor:self.searchField.bottomAnchor constant:8],
+    [tableScroll.topAnchor constraintEqualToAnchor:self.searchField.bottomAnchor
+                                          constant:kSidebarListGap],
     [tableScroll.leadingAnchor constraintEqualToAnchor:sidebar.leadingAnchor],
     [tableScroll.trailingAnchor constraintEqualToAnchor:sidebar.trailingAnchor],
     [tableScroll.bottomAnchor constraintEqualToAnchor:sidebar.bottomAnchor],
@@ -6816,7 +6905,7 @@ static NSImage *sidebarTile(NSInteger pane, CGFloat size) {
     NSImageView *image = [[NSImageView alloc] initWithFrame:NSZeroRect];
     image.translatesAutoresizingMaskIntoConstraints = NO;
     NSTextField *text = [NSTextField labelWithString:@""];
-    text.font = [NSFont systemFontOfSize:NSFont.systemFontSize];
+    text.font = [NSFont systemFontOfSize:13 weight:NSFontWeightRegular];
     text.lineBreakMode = NSLineBreakByTruncatingTail;
     text.translatesAutoresizingMaskIntoConstraints = NO;
     [cell addSubview:image];
@@ -6826,14 +6915,14 @@ static NSImage *sidebarTile(NSInteger pane, CGFloat size) {
     [NSLayoutConstraint activateConstraints:@[
       [image.leadingAnchor constraintEqualToAnchor:cell.leadingAnchor constant:4],
       [image.centerYAnchor constraintEqualToAnchor:cell.centerYAnchor],
-      [image.widthAnchor constraintEqualToConstant:20],
-      [image.heightAnchor constraintEqualToConstant:20],
+      [image.widthAnchor constraintEqualToConstant:kSidebarIconSize],
+      [image.heightAnchor constraintEqualToConstant:kSidebarIconSize],
       [text.leadingAnchor constraintEqualToAnchor:image.trailingAnchor constant:8],
       [text.trailingAnchor constraintLessThanOrEqualToAnchor:cell.trailingAnchor constant:-4],
       [text.centerYAnchor constraintEqualToAnchor:cell.centerYAnchor],
     ]];
   }
-  cell.imageView.image = sidebarTile(pane, 20);
+  cell.imageView.image = sidebarTile(pane, kSidebarIconSize);
   cell.textField.stringValue = paneTitle(pane);
   return cell;
 }
@@ -7652,7 +7741,9 @@ static NSImage *sidebarTile(NSInteger pane, CGFloat size) {
       return;
     }
     dispatch_async(dispatch_get_main_queue(), ^{
-      NSURL *page = [NSURL URLWithString:url];
+      // Review finding 2: Stripe Checkout or the billing portal only, opened
+      // as the very NSURL that was checked.
+      NSURL *page = rampPurchasePage(url);
       BOOL opened = page != nil && [[NSWorkspace sharedWorkspace] openURL:page];
       if (!opened) {
         self.buying = NO;

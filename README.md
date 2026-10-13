@@ -74,9 +74,13 @@ Run `Nightshift.app`, not a bare `nightshiftd`, or notifications have nowhere to
 
 ## License server
 
+The app and CLI talk to a license server compiled in as an `https` origin: build releases with `make package LICENSE_SERVER=https://your.server`. `make package` stops with the reason if `LICENSE_SERVER` is missing or isn't a lowercase `https` origin (the app's own rule), `make install` warns when the build has none, and changing it rebuilds `nightshift` and `nightshiftd`. A `server` file in `~/Library/Application Support/nightshift` can replace it with another `https` origin. Plain `http` is accepted only for `127.0.0.1` and `localhost` in the test-key build. License requests never follow a redirect, so the install secret only goes to that origin. The only pages ever opened for buying are `https://checkout.stripe.com` and `https://billing.stripe.com`, and an address with a control character (a NUL included) is never opened. Turning on a Stripe custom domain for Checkout or the billing portal means adding that host to the allowlist in `nsPurchaseURLVerdict` (`NightshiftLogic.m`) first; otherwise the app refuses every purchase link.
+
 `server/` sells and serves ramp licenses through Stripe. Every Stripe client in it is pinned to API version `2026-03-25.dahlia` (`stripeApiVersion` in `server/app.js`), and `setup.js` creates the webhook endpoint in that version. Invoices in this version carry no payment fields; the server asks Stripe for them. `server/test.js` fakes Stripe with scrubbed responses captured from a sandbox run in this version (`server/fixtures/stripe-2026-03-25/`).
 
 Upgrading the version means re-running the sandbox check: a test-mode checkout paid with test card 4242, a purchase held and refunded, `stripe events resend` of its events, and a lapsed customer buying again. Recapture the fixtures from that run. The server logs `WEBHOOK-VERSION` when an event arrives in another version.
+
+Keep secrets out of commits: `server/.env` is ignored, and `server/.env.example` keeps every key, secret and token empty (`server/test.js` fails otherwise). `make hooks` points this clone's `core.hooksPath` at `scripts/hooks`, whose `pre-commit` refuses a commit when any staged file holds something shaped like a Stripe secret key, restricted key or webhook signing secret (`scripts/secret-patterns.txt`). It checks what is staged, not the files on disk, and names the file, line and key, never the value. If one was ever pushed, rotate it in Stripe; deleting it from the file doesn't retire it.
 
 ## License
 

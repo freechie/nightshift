@@ -57,7 +57,15 @@ void forgetInstallIdentityForTests(void);
 // "ramp:<install-id>:<day>" for that install; unbound "ramp" and
 // "ramp:<day>" are refused. Does not check expiry.
 NSString *rampPayloadDay(NSString *payload, NSString *installID);
+// The license server's origin without a trailing "/", or nil when this
+// build has no acceptable one (https, or loopback http in test-key builds).
 NSString *rampServerOrigin(void);
+// The page to open for url when it is a Stripe Checkout or billing portal
+// page, or nil. No control characters; the C check reads every byte; and
+// the NSURL returned prints back exactly as url, so what was checked is
+// what opens.
+NSURL *rampPurchasePage(NSString *url);
+BOOL rampPurchaseURLAllowed(NSString *url);
 NSString *rampCheckoutURL(void);
 NSString *rampFetchLicenseToken(void);
 int rampInstallReported(NSString *token, NSString **stdoutLine, NSString **stderrLine);

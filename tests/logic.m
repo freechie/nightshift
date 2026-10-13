@@ -345,6 +345,210 @@ static void checkSafety(void) {
   CHECK(sw >= kNSShadeFloor);
 }
 
+// The string's own length; NULL stays NULL.
+static size_t lengthOf(const char *s) {
+  return s != NULL ? strlen(s) : 0;
+}
+
+static bool originOK(const char *s, bool loopback) {
+  return nsLicenseOriginAllowed(s, lengthOf(s), loopback);
+}
+
+static bool pageOK(const char *s) {
+  return nsPurchaseURLAllowed(s, lengthOf(s));
+}
+
+static NSLinkVerdict originWhy(const char *s) {
+  return nsLicenseOriginVerdict(s, lengthOf(s), false);
+}
+
+static NSLinkVerdict pageWhy(const char *s) {
+  return nsPurchaseURLVerdict(s, lengthOf(s));
+}
+
+static void checkHosts(void) {
+  // License server origins: https only, with loopback http in test builds.
+  CHECK(originOK("https://license.example.com", false));
+  CHECK(originOK("https://license.example.com/", false));
+  CHECK(originOK("https://license.example.com:8443", false));
+  CHECK(!originOK("HTTPS://License.Example.com", false));  // v3: lowercase only
+  CHECK(!originOK("http://license.example.com", false));
+  CHECK(!originOK("http://license.example.com", true));
+  CHECK(!originOK("http://127.0.0.1:8787", false));
+  CHECK(!originOK("http://localhost:8787", false));
+  CHECK(originOK("http://127.0.0.1:8787", true));
+  CHECK(originOK("http://localhost:8787/", true));
+  CHECK(!originOK("http://LOCALHOST:8787", true));
+  CHECK(!originOK("http://127.0.0.1.evil.com:8787", true));
+  CHECK(!originOK("http://localhost.evil.com", true));
+  CHECK(!originOK("http://127.0.0.1@evil.com", true));
+  CHECK(!originOK("https://user:pass@license.example.com", false));
+  CHECK(!originOK("https://license.example.com/api", false));
+  CHECK(!originOK("https://license.example.com?x=1", false));
+  CHECK(!originOK("https://license.example.com#x", false));
+  CHECK(!originOK("https://license.example.com:0", false));
+  CHECK(!originOK("https://license.example.com:65536", false));
+  CHECK(!originOK("https://license.example.com:", false));
+  CHECK(!originOK("https://license.example.com:84a3", false));
+  CHECK(!originOK("https://", false));
+  CHECK(!originOK("https://.example.com", false));
+  CHECK(!originOK("https://example..com", false));
+  CHECK(!originOK("https://[::1]:8787", true));
+  CHECK(!originOK("ftp://license.example.com", false));
+  CHECK(!originOK("file:///etc/passwd", true));
+  CHECK(!originOK("license.example.com", false));
+  CHECK(!originOK("https://license.example.com\\@evil.com", false));
+  CHECK(!originOK("https://license.example.com /", false));
+  CHECK(!originOK("", true));
+  CHECK(!originOK(NULL, true));
+
+  // Pages the app opens: Stripe Checkout and the billing portal, nothing else.
+  CHECK(pageOK("https://checkout.stripe.com/c/pay/cs_test_a1#fid"));
+  CHECK(pageOK("https://billing.stripe.com/p/session/test_YWNjdA"));
+  CHECK(pageOK("https://billing.stripe.com/p/login/abc?prefilled_email=x"));
+  CHECK(pageOK("https://CHECKOUT.Stripe.COM/c/pay/x"));
+  CHECK(pageOK("HTTPS://checkout.stripe.com"));
+  CHECK(!pageOK("http://checkout.stripe.com/c/pay/x"));
+  CHECK(!pageOK("https://checkout.stripe.com.evil.com/c/pay/x"));
+  CHECK(!pageOK("https://evilcheckout.stripe.com/c/pay/x"));
+  CHECK(!pageOK("https://checkout-stripe.com/c/pay/x"));
+  CHECK(!pageOK("https://stripe.com/c/pay/x"));
+  CHECK(!pageOK("https://dashboard.stripe.com/"));
+  CHECK(!pageOK("https://checkout.stripe.com./c/pay/x"));
+  CHECK(!pageOK("https://checkout.stripe.com@evil.com/c/pay/x"));
+  CHECK(!pageOK("https://user:pw@checkout.stripe.com/c/pay/x"));
+  CHECK(!pageOK("https://evil.com#@checkout.stripe.com/"));
+  CHECK(!pageOK("https://evil.com\\@checkout.stripe.com/"));
+  CHECK(!pageOK("https://checkout.stripe.com:443/c/pay/x"));
+  CHECK(!pageOK("https://checkout.stripe.com:8443/c/pay/x"));
+  CHECK(!pageOK("https://checkout.stripe.com%2eevil.com/"));
+  CHECK(!pageOK("https://checkout.stripe.com/c/pay/x y"));
+  CHECK(!pageOK("https://checkout.stripe.com/\n"));
+  CHECK(!pageOK("https://checkout.stripe.com/c/\xc3\xa9"));
+  CHECK(!pageOK("file:///Applications/Calculator.app"));
+  CHECK(!pageOK("x-apple.systempreferences:com.apple.Displays-Settings"));
+  CHECK(!pageOK("-a Calculator"));
+  CHECK(!pageOK("//checkout.stripe.com/c/pay/x"));
+  CHECK(!pageOK("https:checkout.stripe.com/c/pay/x"));
+  CHECK(!pageOK(""));
+  CHECK(!pageOK(NULL));
+
+  // Review v2: lengths are explicit, so an embedded NUL is a byte that is
+  // checked (and refused), not the end of the string.
+  static const char nulPage[] = "https://checkout.stripe.com\0@evil.com/";
+  static const char nulOrigin[] = "https://license.example.com\0@evil.com";
+  CHECK(!nsPurchaseURLAllowed(nulPage, sizeof nulPage - 1));
+  CHECK_EQ(nsPurchaseURLVerdict(nulPage, sizeof nulPage - 1), kNSLinkControl);
+  CHECK(nsPurchaseURLAllowed(nulPage, strlen(nulPage)));  // only up to the NUL: fine
+  CHECK(!nsLicenseOriginAllowed(nulOrigin, sizeof nulOrigin - 1, false));
+  CHECK_EQ(nsLicenseOriginVerdict(nulOrigin, sizeof nulOrigin - 1, true), kNSLinkControl);
+  static const char nulEnd[] = "https://checkout.stripe.com/\0";
+  CHECK_EQ(nsPurchaseURLVerdict(nulEnd, sizeof nulEnd - 1), kNSLinkControl);
+  // A length past a short buffer's NUL still stops at the length, not later.
+  CHECK(nsPurchaseURLAllowed("https://checkout.stripe.com/xyz", 28));
+  CHECK_EQ(nsPurchaseURLVerdict("https://checkout.stripe.com", 0), kNSLinkEmpty);
+  const char *controls[] = {
+      "https://checkout.stripe.com/\x01",   "https://checkout.stripe.com/a\tb",
+      "https://checkout.stripe.com/\r\nX: y", "https://checkout.stripe.com\x1f/",
+      "https://checkout.stripe.com/\x7f",   "\x1bhttps://checkout.stripe.com/",
+      "https://checkout.stripe.com/\n",
+  };
+  for (size_t i = 0; i < sizeof controls / sizeof controls[0]; i++) {
+    CHECK_EQ(pageWhy(controls[i]), kNSLinkControl);
+  }
+  const char *originControls[] = {
+      "https://license.example.com\x01", "https://license.example.com\t",
+      "https://license.example.com\r\n", "https://license.example.com\x7f",
+  };
+  for (size_t i = 0; i < sizeof originControls / sizeof originControls[0]; i++) {
+    CHECK_EQ(originWhy(originControls[i]), kNSLinkControl);
+  }
+
+  // Review v2: each rule refuses on its own. Every string below breaks one
+  // rule and would get past it to a different verdict (or be accepted) if
+  // that rule were removed.
+  CHECK_EQ(originWhy("https://license.example.com"), kNSLinkOK);
+  CHECK_EQ(originWhy(""), kNSLinkEmpty);
+  CHECK_EQ(originWhy("https://license.example.com\xc3\xa9"), kNSLinkNotASCII);
+  CHECK_EQ(originWhy("https://license.example.com /"), kNSLinkNotASCII);
+  // "\" alone: without its rule, the "@" after it is the next refusal.
+  CHECK_EQ(originWhy("https://license.example.com\\@evil.com"), kNSLinkBackslash);
+  CHECK_EQ(originWhy("https://license.example.com\\"), kNSLinkBackslash);
+  CHECK_EQ(originWhy("license.example.com"), kNSLinkNoScheme);
+  CHECK_EQ(originWhy("://license.example.com"), kNSLinkNoScheme);
+  // "@" alone: without its rule, "user@license..." fails only as a host.
+  CHECK_EQ(originWhy("https://user@license.example.com"), kNSLinkUserinfo);
+  CHECK_EQ(originWhy("https://license.example.com@evil.com"), kNSLinkUserinfo);
+  CHECK_EQ(originWhy("https://user:pass@license.example.com"), kNSLinkUserinfo);
+  CHECK_EQ(originWhy("https://license.example.com:0"), kNSLinkBadPort);
+  CHECK_EQ(originWhy("https://license.example.com:65536"), kNSLinkBadPort);
+  CHECK_EQ(originWhy("https://license.example.com:"), kNSLinkBadPort);
+  CHECK_EQ(originWhy("https://license.example.com:443x"), kNSLinkBadPort);
+  CHECK_EQ(originWhy("https://"), kNSLinkBadHost);
+  CHECK_EQ(originWhy("https://.example.com"), kNSLinkBadHost);
+  CHECK_EQ(originWhy("https://example..com"), kNSLinkBadHost);
+  CHECK_EQ(originWhy("https://license_example.com"), kNSLinkBadHost);
+  CHECK_EQ(originWhy("https://[::1]:8787"), kNSLinkBadPort);  // the first ":" starts the port
+  CHECK_EQ(originWhy("https://[fe80]"), kNSLinkBadHost);
+  // A trailing dot alone: without its rule these would be accepted.
+  CHECK_EQ(originWhy("https://license.example.com."), kNSLinkTrailingDot);
+  CHECK_EQ(originWhy("https://license.example.com.:8443"), kNSLinkTrailingDot);
+  CHECK_EQ(originWhy("https://license.example.com./"), kNSLinkTrailingDot);
+  CHECK(!originOK("https://license.example.com.", true));
+  CHECK_EQ(originWhy("https://license.example.com/api"), kNSLinkPath);
+  CHECK_EQ(originWhy("https://license.example.com//"), kNSLinkPath);
+  CHECK_EQ(originWhy("https://license.example.com?x"), kNSLinkPath);
+  CHECK_EQ(originWhy("https://license.example.com#x"), kNSLinkPath);
+  CHECK_EQ(originWhy("http://license.example.com"), kNSLinkScheme);
+  CHECK_EQ(originWhy("http://127.0.0.1:8787"), kNSLinkScheme);
+  CHECK_EQ(nsLicenseOriginVerdict("http://127.0.0.1:8787", 21, true), kNSLinkOK);
+  CHECK_EQ(nsLicenseOriginVerdict("http://10.0.0.1:8787", 20, true), kNSLinkScheme);
+  CHECK_EQ(originWhy("ftp://license.example.com"), kNSLinkScheme);
+  CHECK_EQ(pageWhy("https://checkout.stripe.com/c/pay/x"), kNSLinkOK);
+  CHECK_EQ(pageWhy("https://checkout.stripe.com:443/"), kNSLinkPort);
+  CHECK_EQ(pageWhy("http://checkout.stripe.com/"), kNSLinkScheme);
+  CHECK_EQ(pageWhy("https://checkout.stripe.com.evil.com/"), kNSLinkHost);
+  CHECK_EQ(pageWhy("https://checkout.stripe.com./"), kNSLinkTrailingDot);
+  CHECK_EQ(pageWhy("https://checkout.stripe.com@evil.com/"), kNSLinkUserinfo);
+  CHECK_EQ(pageWhy("https://evil.com\\@checkout.stripe.com/"), kNSLinkBackslash);
+
+  // v3: an origin has one spelling (lowercase scheme and host) and its port
+  // no leading zero, exactly as make package checks it.
+  CHECK_EQ(originWhy("HTTPS://License.Example.com:08443/"), kNSLinkPortLeadingZero);
+  CHECK_EQ(originWhy("HTTPS://License.Example.com:8443/"), kNSLinkUppercase);
+  CHECK_EQ(originWhy("HTTPS://license.example.com"), kNSLinkUppercase);
+  CHECK_EQ(originWhy("Https://license.example.com"), kNSLinkUppercase);
+  CHECK_EQ(originWhy("https://License.example.com"), kNSLinkUppercase);
+  CHECK_EQ(originWhy("https://license.example.COM"), kNSLinkUppercase);
+  CHECK_EQ(nsLicenseOriginVerdict("http://LOCALHOST:8787", 21, true), kNSLinkUppercase);
+  CHECK_EQ(nsLicenseOriginVerdict("HTTP://127.0.0.1:8787", 21, true), kNSLinkUppercase);
+  CHECK_EQ(originWhy("https://license.example.com:08443"), kNSLinkPortLeadingZero);
+  CHECK_EQ(originWhy("https://license.example.com:0443/"), kNSLinkPortLeadingZero);
+  CHECK_EQ(originWhy("https://license.example.com:00001"), kNSLinkPortLeadingZero);
+  // Two digits is enough to refuse: :08 is not port 8.
+  CHECK_EQ(originWhy("https://license.example.com:08"), kNSLinkPortLeadingZero);
+  CHECK_EQ(originWhy("https://license.example.com:08/"), kNSLinkPortLeadingZero);
+  CHECK_EQ(pageWhy("https://checkout.stripe.com:08/"), kNSLinkPortLeadingZero);
+  CHECK_EQ(originWhy("https://license.example.com:8"), kNSLinkOK);
+  CHECK_EQ(originWhy("https://license.example.com:0"), kNSLinkBadPort);
+  CHECK_EQ(originWhy("https://license.example.com:8443"), kNSLinkOK);
+  CHECK_EQ(originWhy("https://license.example.com:1"), kNSLinkOK);
+  CHECK_EQ(originWhy("https://license-1.example.com/"), kNSLinkOK);
+  CHECK_EQ(pageWhy("https://checkout.stripe.com:0443/"), kNSLinkPortLeadingZero);
+  // The shapes Stripe returns (scrubbed): a long fragment, a portal secret query.
+  CHECK_EQ(pageWhy("https://checkout.stripe.com/c/pay/cs_test_a1Xscrub0Xscrub0#fidXXscrubbedXXabc%2FdeQ%3D"), kNSLinkOK);
+  CHECK_EQ(pageWhy("https://billing.stripe.com/p/session?secret=scrub_X0scrub_X0"), kNSLinkOK);
+  // Pages stay case-insensitive: only the host name is compared.
+  CHECK_EQ(pageWhy("https://Checkout.Stripe.com/c/pay/x"), kNSLinkOK);
+  // Every verdict has its own text for make package and make install.
+  for (int a = kNSLinkOK; a <= kNSLinkHost; a++) {
+    CHECK(nsLinkVerdictText((NSLinkVerdict)a) != NULL);
+    for (int b = a + 1; b <= kNSLinkHost; b++) {
+      CHECK(strcmp(nsLinkVerdictText((NSLinkVerdict)a), nsLinkVerdictText((NSLinkVerdict)b)) != 0);
+    }
+  }
+}
+
 int main(void) {
   checkRamp();
   checkMatching();
@@ -352,6 +556,7 @@ int main(void) {
   checkReadback();
   checkSplit();
   checkSafety();
+  checkHosts();
   if (gFailures != 0) {
     fprintf(stderr, "logic: %d of %d checks failed\n", gFailures, gChecks);
     return 1;

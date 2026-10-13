@@ -1,0 +1,33 @@
+#!/bin/sh
+# Refuses a commit when any staged file holds a Stripe secret (patterns in
+# scripts/secret-patterns.txt). It reads the index, not the working tree, so
+# blanking a key on disk without restaging it still blocks. It reports file,
+# line and key name, never the value. Enable with `make hooks`.
+root=$(git rev-parse --show-toplevel) || exit 1
+patterns="$root/scripts/secret-patterns.txt"
+if [ ! -f "$patterns" ]; then
+  echo "pre-commit: $patterns is missing" >&2
+  exit 1
+fi
+hits=$(grep -v -e '^#' -e '^$' "$patterns" |
+  git grep --cached -I -n -E -f - -- . |
+  awk '{
+    file = $0; sub(/:.*/, "", file)
+    rest = substr($0, length(file) + 2)
+    line = rest; sub(/:.*/, "", line)
+    text = substr(rest, length(line) + 2)
+    key = ""
+    if (match(text, /^[ \t]*(export[ \t]+)?["'"'"']?[A-Za-z_][A-Za-z0-9_]*["'"'"']?[ \t]*[=:]/)) {
+      key = substr(text, RSTART, RLENGTH)
+      sub(/^[ \t]*(export[ \t]+)?["'"'"']?/, "", key)
+      sub(/["'"'"']?[ \t]*[=:]$/, "", key)
+    }
+    print "  " file ":" line (key == "" ? "" : " (" key ")")
+  }')
+if [ -n "$hits" ]; then
+  echo "pre-commit: staged content holds what looks like a Stripe secret:" >&2
+  echo "$hits" >&2
+  echo "Remove it, restage (git add), and rotate the secret if it was ever pushed." >&2
+  exit 1
+fi
+exit 0

@@ -14,6 +14,7 @@
 // limitations under the License.
 
 #import "NightShift.h"
+#import "NightshiftLogic.h"
 #import <mach-o/dyld.h>
 #import <stdio.h>
 #import <stdlib.h>
@@ -355,6 +356,138 @@ static void checkLicense(void) {
   expectText(@"secret kept after a bad replace", rampInstallSecret(), other);
   forgetInstallIdentityForTests();
   expectText(@"install id after forgetting", rampInstallID(), installID);
+
+  // Review finding 2: an https license server, never plain http outside
+  // test-key builds, and only Stripe pages opened.
+  NSString *serverFile = [dir stringByAppendingPathComponent:@"server"];
+  [[NSFileManager defaultManager] removeItemAtPath:serverFile error:NULL];
+  expectBool(@"no license server compiled into a test build", rampServerOrigin() == nil, YES);
+  writeText(serverFile, @"https://license.example.com/\n");
+  expectText(@"https server file", rampServerOrigin(), @"https://license.example.com");
+  writeText(serverFile, @"https://license.example.com:8443");
+  expectText(@"https server file with port", rampServerOrigin(),
+             @"https://license.example.com:8443");
+  for (NSString *refused in @[
+         @"http://127.0.0.1:8787", @"http://localhost:8787", @"http://license.example.com",
+         @"https://license.example.com/api", @"https://user@license.example.com",
+         @"file:///tmp/server", @"license.example.com"
+       ]) {
+    writeText(serverFile, refused);
+    expectBool([@"server file refused: " stringByAppendingString:refused],
+               rampServerOrigin() == nil, YES);
+  }
+  // Review v2: a NUL or other control character in the server file is
+  // refused, not cut off or percent-encoded into another host.
+  NSArray<NSString *> *controlOrigins = @[
+    [NSString stringWithFormat:@"https://license.example.com%C@evil.com", (unichar)0],
+    [NSString stringWithFormat:@"https://license.example.com%C", (unichar)0],
+    @"https://license.example.com\x01", @"https://license\texample.com",
+    @"https://license.example.com\x7f", [NSString stringWithFormat:@"https://license%Cexample.com", (unichar)0x85],
+    @"https://license\u200bexample.com",
+  ];
+  for (NSString *refused in controlOrigins) {
+    [[refused dataUsingEncoding:NSUTF8StringEncoding] writeToFile:serverFile atomically:YES];
+    expectBool([@"server file with a control character refused: "
+                   stringByAppendingString:[refused stringByAddingPercentEncodingWithAllowedCharacters:
+                                                        NSCharacterSet.alphanumericCharacterSet]],
+               rampServerOrigin() == nil, YES);
+  }
+  writeText(serverFile, @"https://license.example.com.");
+  expectBool(@"server file with a trailing dot refused", rampServerOrigin() == nil, YES);
+  // v3: the app accepts exactly what make package's checker accepts: the
+  // same C rule (no loopback outside test-key builds) decides both.
+  for (NSString *origin in @[
+         @"https://license.example.com", @"https://license.example.com/",
+         @"https://license.example.com:8443", @"https://license-1.example.com:1/",
+         @"HTTPS://License.Example.com:08443/", @"HTTPS://License.Example.com:8443/",
+         @"https://License.example.com", @"Https://license.example.com",
+         @"https://license.example.com:08443", @"https://license.example.com:0",
+         @"https://license.example.com:65536", @"https://license.example.com.",
+         @"https://user@license.example.com", @"https://license.example.com\\@evil.com",
+         @"https://license.example.com/api", @"https://license.example.com//",
+         @"https://license.example.com?x", @"http://license.example.com",
+         @"http://127.0.0.1:8787", @"http://localhost:8787", @"https://[::1]:8787",
+         @"https://license_example.com", @"https://.example.com", @"license.example.com"
+       ]) {
+    writeText(serverFile, origin);
+    NSData *bytes = [origin dataUsingEncoding:NSUTF8StringEncoding];
+    BOOL checker = nsLicenseOriginVerdict(bytes.bytes, bytes.length, false) == kNSLinkOK;
+    expectBool([@"app and make package agree on " stringByAppendingString:origin],
+               rampServerOrigin() != nil, checker);
+  }
+  writeText(serverFile, @"HTTPS://License.Example.com:08443/");
+  expectBool(@"server file with capitals and a leading-zero port refused",
+             rampServerOrigin() == nil, YES);
+  writeText(serverFile, @"https://license.example.com\\@evil.com");
+  expectBool(@"server file with a backslash refused", rampServerOrigin() == nil, YES);
+  [[NSFileManager defaultManager] removeItemAtPath:serverFile error:NULL];
+  NSString *checkoutText = @"https://checkout.stripe.com/c/pay/cs_test_a1#x";
+  expectText(@"checked page opens as the same text",
+             rampPurchasePage(checkoutText).absoluteString, checkoutText);
+  expectText(@"checked page host", rampPurchasePage(checkoutText).host, @"checkout.stripe.com");
+  NSArray<NSString *> *controlPages = @[
+    [NSString stringWithFormat:@"https://checkout.stripe.com%C@evil.com/", (unichar)0],
+    [NSString stringWithFormat:@"https://checkout.stripe.com/%C", (unichar)0],
+    @"https://checkout.stripe.com/\x01", @"https://checkout.stripe.com/a\tb",
+    @"https://checkout.stripe.com/\r\n", @"https://checkout.stripe.com/\x7f",
+    [NSString stringWithFormat:@"https://checkout.stripe.com/%C", (unichar)0x85], @"https://checkout.stripe.com/\u200e",
+    @"\u202ehttps://checkout.stripe.com/",
+  ];
+  for (NSString *refused in controlPages) {
+    NSString *shown = [refused stringByAddingPercentEncodingWithAllowedCharacters:
+                                   NSCharacterSet.alphanumericCharacterSet];
+    expectBool([@"page with a control character refused: " stringByAppendingString:shown],
+               rampPurchaseURLAllowed(refused), NO);
+    expectBool([@"no page to open: " stringByAppendingString:shown],
+               rampPurchasePage(refused) == nil, YES);
+  }
+  // v3: the shapes Stripe really returns (test mode, API 2026-03-25.dahlia),
+  // scrubbed: a Checkout page with a 342-character fragment, and a billing
+  // portal session with its secret in the query. Both open as-is.
+  NSString *fragment = [[@"" stringByPaddingToLength:342
+                                          withString:@"fidXXscrubbedXXabc%2FdeQ%3D"
+                                     startingAtIndex:0] copy];
+  NSString *realCheckout = [NSString
+      stringWithFormat:@"https://checkout.stripe.com/c/pay/cs_test_a1%@#%@",
+                       [@"" stringByPaddingToLength:56 withString:@"Xscrub0" startingAtIndex:0],
+                       fragment];
+  NSString *realPortal = [@"https://billing.stripe.com/p/session?secret="
+      stringByAppendingString:[@"" stringByPaddingToLength:89
+                                                withString:@"scrub_X0"
+                                           startingAtIndex:0]];
+  expectText(@"real Checkout shape opens as-is", rampPurchasePage(realCheckout).absoluteString,
+             realCheckout);
+  expectText(@"real portal shape opens as-is", rampPurchasePage(realPortal).absoluteString,
+             realPortal);
+  expectBool(@"real Checkout shape on another host refused",
+             rampPurchasePage([realCheckout stringByReplacingOccurrencesOfString:@"checkout.stripe.com"
+                                                                       withString:@"checkout.stripe.com.evil.com"]) == nil,
+             YES);
+  // The NUL case is exactly what NSURL alone would open as evil.com.
+  expectText(@"NSURL alone reads the NUL page as evil.com",
+             [NSURL URLWithString:controlPages[0]].host, @"evil.com");
+  // Text the C check passes but NSURL rewrites is refused too: what opens
+  // must print back as exactly what was checked.
+  for (NSString *rewritten in @[
+         @"https://checkout.stripe.com/c/pay/a|b", @"https://checkout.stripe.com/c/pay/%zz",
+         @"https://checkout.stripe.com/c/pay/x#a#b"
+       ]) {
+    expectBool([@"page NSURL would rewrite refused: " stringByAppendingString:rewritten],
+               rampPurchasePage(rewritten) == nil, YES);
+  }
+  expectBool(@"checkout page opens",
+             rampPurchaseURLAllowed(@"https://checkout.stripe.com/c/pay/cs_test_a1#x"), YES);
+  expectBool(@"portal page opens",
+             rampPurchaseURLAllowed(@"https://billing.stripe.com/p/session/x"), YES);
+  for (NSString *refused in @[
+         @"https://checkout.stripe.com.evil.com/c/pay/x", @"http://checkout.stripe.com/c/pay/x",
+         @"https://checkout.stripe.com@evil.com/", @"https://checkout.stripe.com:444/",
+         @"file:///Applications/Calculator.app", @"-a Calculator", @""
+       ]) {
+    expectBool([@"page refused: " stringByAppendingString:refused],
+               rampPurchaseURLAllowed(refused), NO);
+  }
+  expectBool(@"no page", rampPurchaseURLAllowed(nil), NO);
 
   // v5 L3, v8: the server's held-purchase replies, shown with fixed text.
   NSData *(^json)(NSString *) = ^NSData *(NSString *text) {

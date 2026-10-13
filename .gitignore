@@ -3,6 +3,8 @@ nightshiftd
 nightshift-tests
 logic-tests
 nightshift-testkey
+license-server-check
+.license-server
 Nightshift.app/
 dist/
 license.pem

@@ -354,3 +354,216 @@ long nsRestoredBrightness(long saved) {
   }
   return saved > 100 ? 100 : saved;
 }
+
+// MARK: License server and purchase pages
+
+// A URL's parts, without decoding anything: scheme, host and port as
+// written, and whatever follows the authority.
+typedef struct {
+  const char *scheme;
+  size_t schemeLength;
+  const char *host;
+  size_t hostLength;
+  long port;  // -1: none written
+  const char *rest;
+  size_t restLength;
+} URLParts;
+
+static bool asciiEqualFold(const char *a, size_t length, const char *b) {
+  if (strlen(b) != length) {
+    return false;
+  }
+  for (size_t i = 0; i < length; i++) {
+    char x = a[i];
+    char y = b[i];
+    if (x >= 'A' && x <= 'Z') {
+      x = (char)(x - 'A' + 'a');
+    }
+    if (y >= 'A' && y <= 'Z') {
+      y = (char)(y - 'A' + 'a');
+    }
+    if (x != y) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static bool hasUppercase(const char *text, size_t length) {
+  for (size_t i = 0; i < length; i++) {
+    if (text[i] >= 'A' && text[i] <= 'Z') {
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool isAuthorityEnd(char c) {
+  return c == '/' || c == '?' || c == '#';
+}
+
+// Splits "scheme://host[:port]rest", reading exactly length bytes: a NUL
+// inside them is refused like any other control character, never taken as
+// the end. Each rule has its own verdict, checked in this order, so a test
+// can tell which rule refused a string.
+static NSLinkVerdict splitURL(const char *url, size_t length, URLParts *parts) {
+  if (url == NULL || length == 0) {
+    return kNSLinkEmpty;
+  }
+  for (size_t i = 0; i < length; i++) {
+    unsigned char c = (unsigned char)url[i];
+    if (c < 0x20 || c == 0x7f) {
+      return kNSLinkControl;
+    }
+  }
+  for (size_t i = 0; i < length; i++) {
+    unsigned char c = (unsigned char)url[i];
+    if (c == 0x20 || c > 0x7f) {
+      return kNSLinkNotASCII;
+    }
+  }
+  if (memchr(url, '\\', length) != NULL) {
+    return kNSLinkBackslash;
+  }
+  size_t colon = 0;
+  while (colon + 3 <= length && memcmp(url + colon, "://", 3) != 0) {
+    colon++;
+  }
+  if (colon == 0 || colon + 3 > length) {
+    return kNSLinkNoScheme;
+  }
+  parts->scheme = url;
+  parts->schemeLength = colon;
+  const char *authority = url + colon + 3;
+  size_t left = length - colon - 3;
+  size_t authorityLength = 0;
+  while (authorityLength < left && !isAuthorityEnd(authority[authorityLength])) {
+    authorityLength++;
+  }
+  parts->rest = authority + authorityLength;
+  parts->restLength = left - authorityLength;
+  if (memchr(authority, '@', authorityLength) != NULL) {
+    return kNSLinkUserinfo;
+  }
+  const char *portColon = memchr(authority, ':', authorityLength);
+  parts->host = authority;
+  parts->hostLength = portColon != NULL ? (size_t)(portColon - authority) : authorityLength;
+  parts->port = -1;
+  if (portColon != NULL) {
+    const char *digits = portColon + 1;
+    size_t count = (size_t)(authority + authorityLength - digits);
+    if (count == 0 || count > 5) {
+      return kNSLinkBadPort;
+    }
+    if (count > 1 && digits[0] == '0') {
+      return kNSLinkPortLeadingZero;
+    }
+    long port = 0;
+    for (size_t i = 0; i < count; i++) {
+      if (digits[i] < '0' || digits[i] > '9') {
+        return kNSLinkBadPort;
+      }
+      port = port * 10 + (digits[i] - '0');
+    }
+    if (port < 1 || port > 65535) {
+      return kNSLinkBadPort;
+    }
+    parts->port = port;
+  }
+  if (parts->hostLength == 0) {
+    return kNSLinkBadHost;
+  }
+  if (parts->host[parts->hostLength - 1] == '.') {
+    return kNSLinkTrailingDot;
+  }
+  if (parts->host[0] == '.') {
+    return kNSLinkBadHost;
+  }
+  for (size_t i = 0; i < parts->hostLength; i++) {
+    char c = parts->host[i];
+    bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+              c == '-' || c == '.';
+    if (!ok || (c == '.' && i + 1 < parts->hostLength && parts->host[i + 1] == '.')) {
+      return kNSLinkBadHost;
+    }
+  }
+  return kNSLinkOK;
+}
+
+NSLinkVerdict nsLicenseOriginVerdict(const char *origin, size_t length, bool allowLoopbackHTTP) {
+  URLParts parts;
+  NSLinkVerdict verdict = splitURL(origin, length, &parts);
+  if (verdict != kNSLinkOK) {
+    return verdict;
+  }
+  if (!(parts.restLength == 0 || (parts.restLength == 1 && parts.rest[0] == '/'))) {
+    return kNSLinkPath;
+  }
+  // One spelling per origin: the scheme and host are written in lowercase,
+  // as make package, the server file and the app all require.
+  if (hasUppercase(parts.scheme, parts.schemeLength) ||
+      hasUppercase(parts.host, parts.hostLength)) {
+    return kNSLinkUppercase;
+  }
+  if (asciiEqualFold(parts.scheme, parts.schemeLength, "https")) {
+    return kNSLinkOK;
+  }
+  if (allowLoopbackHTTP && asciiEqualFold(parts.scheme, parts.schemeLength, "http") &&
+      (asciiEqualFold(parts.host, parts.hostLength, "127.0.0.1") ||
+       asciiEqualFold(parts.host, parts.hostLength, "localhost"))) {
+    return kNSLinkOK;
+  }
+  return kNSLinkScheme;
+}
+
+const char *nsLinkVerdictText(NSLinkVerdict verdict) {
+  switch (verdict) {
+    case kNSLinkOK: return "it is acceptable";
+    case kNSLinkEmpty: return "it is empty";
+    case kNSLinkControl: return "it has a control character";
+    case kNSLinkNotASCII: return "it has a space or a non-ASCII character";
+    case kNSLinkBackslash: return "it has a backslash";
+    case kNSLinkNoScheme: return "it has no https://";
+    case kNSLinkUserinfo: return "it has a user name (\"@\")";
+    case kNSLinkBadPort: return "its port isn't 1-65535 in digits";
+    case kNSLinkPortLeadingZero: return "its port starts with 0";
+    case kNSLinkBadHost: return "its host isn't a plain host name";
+    case kNSLinkTrailingDot: return "its host ends in \".\"";
+    case kNSLinkPath: return "it has a path, query or fragment";
+    case kNSLinkUppercase: return "its scheme or host has capital letters (write it in lowercase)";
+    case kNSLinkPort: return "it has a port";
+    case kNSLinkScheme: return "it isn't https";
+    case kNSLinkHost: return "it isn't a Stripe Checkout or billing portal page";
+  }
+  return "it isn't acceptable";
+}
+
+bool nsLicenseOriginAllowed(const char *origin, size_t length, bool allowLoopbackHTTP) {
+  return nsLicenseOriginVerdict(origin, length, allowLoopbackHTTP) == kNSLinkOK;
+}
+
+NSLinkVerdict nsPurchaseURLVerdict(const char *url, size_t length) {
+  URLParts parts;
+  NSLinkVerdict verdict = splitURL(url, length, &parts);
+  if (verdict != kNSLinkOK) {
+    return verdict;
+  }
+  if (parts.port != -1) {
+    return kNSLinkPort;
+  }
+  if (!asciiEqualFold(parts.scheme, parts.schemeLength, "https")) {
+    return kNSLinkScheme;
+  }
+  // Stripe's own hosts only. Turning on a Stripe custom domain for Checkout or
+  // the billing portal (say pay.example.com) changes the URLs the server hands
+  // back, so add that host here first, or every purchase link is refused.
+  if (!asciiEqualFold(parts.host, parts.hostLength, "checkout.stripe.com") &&
+      !asciiEqualFold(parts.host, parts.hostLength, "billing.stripe.com")) {
+    return kNSLinkHost;
+  }
+  return kNSLinkOK;
+}
+
+bool nsPurchaseURLAllowed(const char *url, size_t length) {
+  return nsPurchaseURLVerdict(url, length) == kNSLinkOK;
+}

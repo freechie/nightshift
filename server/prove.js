@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { createHash, generateKeyPairSync } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -302,6 +303,67 @@ if (
 }
 
 basilServer.close();
+
+// Review v2: the client never follows a redirect from the license server,
+// so the X-Nightshift-Secret header can't be forwarded to another host.
+// `nightshift license secret` POSTs /license with the secret; the server
+// answers with a redirect to a second listener, which must never be reached.
+async function redirectRefused(status) {
+  let followed = 0;
+  let forwardedSecret = false;
+  const elsewhere = createServer((request, response) => {
+    followed += 1;
+    forwardedSecret ||= request.headers["x-nightshift-secret"] != null;
+    response.writeHead(204);
+    response.end();
+  });
+  elsewhere.listen(0, "127.0.0.1");
+  await new Promise((resolve) => elsewhere.on("listening", resolve));
+  let asked = 0;
+  let presented = false;
+  const redirecting = createServer((request, response) => {
+    asked += 1;
+    presented ||= request.headers["x-nightshift-secret"] === macSecret;
+    request.resume();
+    response.writeHead(status, {
+      Location: `http://127.0.0.1:${elsewhere.address().port}/license`,
+    });
+    response.end();
+  });
+  redirecting.listen(0, "127.0.0.1");
+  await new Promise((resolve) => redirecting.on("listening", resolve));
+
+  const home = mkdtempSync(join(tmpdir(), "nightshift-redirect-"));
+  const support = join(home, "Library", "Application Support", "nightshift");
+  mkdirSync(support, { recursive: true, mode: 0o700 });
+  writeFileSync(join(support, "install-id"), `${installId}\n`, { mode: 0o600 });
+  writeFileSync(join(support, "server"), `http://127.0.0.1:${redirecting.address().port}\n`);
+  const child = spawn(client, ["license", "secret"], {
+    cwd: repo,
+    env: { ...process.env, HOME: home, CFFIXED_USER_HOME: home },
+  });
+  child.stdout.resume();
+  child.stderr.resume();
+  child.stdin.end(`${macSecret}\n`);
+  const code = await new Promise((resolve) => child.on("close", resolve));
+  redirecting.close();
+  elsewhere.close();
+  if (asked !== 1 || !presented) {
+    throw new Error(`redirect ${status}: the license server was asked ${asked} times`);
+  }
+  if (followed !== 0) {
+    throw new Error(
+      `redirect ${status} was followed${forwardedSecret ? " with the install secret" : ""}`,
+    );
+  }
+  if (code === 0) {
+    throw new Error(`redirect ${status} counted as a license`);
+  }
+}
+for (const status of [301, 302, 303, 307, 308]) {
+  await redirectRefused(status);
+}
+
 console.log(
-  `unlocked through ${first.until}, renewed through ${second.until}, checkout return through ${parentLicense.until}`,
+  `unlocked through ${first.until}, renewed through ${second.until}, checkout return through ${parentLicense.until}, redirects refused`,
 );

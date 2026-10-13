@@ -511,9 +511,20 @@ int main(int argc, const char *argv[]) {
         fprintf(stderr, "%s\n", (err != nil ? err : @"could not open checkout").UTF8String);
         return 1;
       }
-      printf("%s\n", url.UTF8String);
+      NSURL *page = rampPurchasePage(url);
+      if (page == nil) {
+        fprintf(stderr, "could not open checkout\n");
+        return 1;
+      }
+      // The checked text, which page prints back exactly. It starts with
+      // "https://", so open never reads it as an option. Held in a local that
+      // ARC keeps to the end of the scope, so the C string stays valid
+      // through printf and open.
+      NS_VALID_UNTIL_END_OF_SCOPE NSString *pageString = page.absoluteString;
+      const char *pageText = pageString.UTF8String;
+      printf("%s\n", pageText);
       pid_t opened = 0;
-      char *openArgv[] = {"/usr/bin/open", (char *)url.UTF8String, NULL};
+      char *openArgv[] = {"/usr/bin/open", (char *)pageText, NULL};
       if (posix_spawn(&opened, "/usr/bin/open", NULL, NULL, openArgv, environ) != 0) {
         fprintf(stderr, "could not open checkout\n");
         return 1;

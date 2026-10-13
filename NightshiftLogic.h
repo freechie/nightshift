@@ -152,4 +152,45 @@ long nsPersistedBrightness(long percent);
 // What a saved percent is restored as.
 long nsRestoredBrightness(long saved);
 
+// MARK: License server and purchase pages
+
+// Why a URL was refused. The checks run in this order and the first that
+// fails is reported, so each rule can be tested on its own.
+typedef enum {
+  kNSLinkOK = 0,
+  kNSLinkEmpty,        // NULL or no bytes
+  kNSLinkControl,      // a NUL or other control character (0x00-0x1f, 0x7f)
+  kNSLinkNotASCII,     // a space or a byte above 0x7f
+  kNSLinkBackslash,    // "\" anywhere
+  kNSLinkNoScheme,     // no "scheme://"
+  kNSLinkUserinfo,     // "@" in the authority
+  kNSLinkBadPort,      // a port that isn't 1-65535 in digits
+  kNSLinkPortLeadingZero,  // a port written with a leading 0 ("08443")
+  kNSLinkBadHost,      // empty host, leading or doubled dot, other characters
+  kNSLinkTrailingDot,  // host ending in "."
+  kNSLinkPath,         // origin only: a path, query or fragment
+  kNSLinkUppercase,    // origin only: a capital letter in the scheme or host
+  kNSLinkPort,         // purchase page only: any port
+  kNSLinkScheme,       // not https (or loopback http where allowed)
+  kNSLinkHost,         // purchase page only: not a Stripe page host
+} NSLinkVerdict;
+
+// The length is explicit: every byte of the string is checked, so an
+// embedded NUL is refused instead of ending the string early.
+//
+// origin is a license server origin the app may talk to: "https://host" or
+// "https://host:port", optionally ending in one "/", in lowercase, with no
+// userinfo, path, query or fragment, and no leading 0 in the port. With allowLoopbackHTTP (test-key builds only),
+// "http://127.0.0.1[:port]" and "http://localhost[:port]" too.
+NSLinkVerdict nsLicenseOriginVerdict(const char *origin, size_t length, bool allowLoopbackHTTP);
+bool nsLicenseOriginAllowed(const char *origin, size_t length, bool allowLoopbackHTTP);
+// Why verdict refused a URL, as a phrase: "its port starts with 0". Used by
+// make package and make install, so they report the app's own rule.
+const char *nsLinkVerdictText(NSLinkVerdict verdict);
+// url may be opened as Stripe Checkout or the billing portal: https, host
+// exactly checkout.stripe.com or billing.stripe.com (any case), no
+// userinfo, no port, nothing that isn't printable ASCII.
+NSLinkVerdict nsPurchaseURLVerdict(const char *url, size_t length);
+bool nsPurchaseURLAllowed(const char *url, size_t length);
+
 #endif

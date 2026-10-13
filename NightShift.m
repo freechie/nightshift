@@ -14,6 +14,7 @@
 // limitations under the License.
 
 #import "NightShift.h"
+#import "NightshiftLogic.h"
 #import <Security/Security.h>
 #import <objc/runtime.h>
 #import <stdlib.h>
@@ -824,20 +825,106 @@ BOOL rampSaveInstallSecret(NSString *value, BOOL replace, NSString **error) {
   }
 }
 
-NSString *rampServerOrigin(void) {
-  NSString *saved = readSupportFile(@"server");
-  if ([saved hasPrefix:@"http://"] || [saved hasPrefix:@"https://"]) {
-    if ([saved hasSuffix:@"/"]) {
-      return [saved substringToIndex:saved.length - 1];
-    }
-    return saved;
+// Review finding 2: the license server is an https origin compiled in
+// (make LICENSE_SERVER=https://...), optionally replaced by a "server" file
+// in the support folder that passes the same check. Plain http is accepted
+// only for 127.0.0.1 and localhost, and only in test-key builds. A build
+// without a valid origin has no license server: buying and renewing report
+// that it can't be reached.
+#ifndef NIGHTSHIFT_LICENSE_SERVER
+#ifdef NIGHTSHIFT_TEST_KEYS
+#define NIGHTSHIFT_LICENSE_SERVER "http://127.0.0.1:8787"
+#else
+#define NIGHTSHIFT_LICENSE_SERVER ""
+#endif
+#endif
+#ifdef NIGHTSHIFT_TEST_KEYS
+static const bool kLoopbackLicenseServer = true;
+#else
+static const bool kLoopbackLicenseServer = false;
+#endif
+
+// Review v2: the C check and NSURL must judge the same text. NSURL
+// percent-encodes a NUL ("https://checkout.stripe.com\0@evil.com/" parses
+// with host evil.com) while a C string stops at it, so any control character
+// (Unicode Cc or Cf, NUL included) is refused before either looks; the C
+// check then reads every UTF-8 byte, length given; and the NSURL used must
+// print back exactly as the text that was checked.
+static NSData *plainURLBytes(NSString *text) {
+  if (![text isKindOfClass:[NSString class]] || text.length == 0 ||
+      [text rangeOfCharacterFromSet:NSCharacterSet.controlCharacterSet].location != NSNotFound) {
+    return nil;
   }
-  return @"http://127.0.0.1:8787";
+  return [text dataUsingEncoding:NSUTF8StringEncoding];
+}
+
+static NSURL *unchangedURL(NSString *text) {
+  NSURL *url = [NSURL URLWithString:text];
+  return url != nil && [url.absoluteString isEqualToString:text] ? url : nil;
+}
+
+static NSString *checkedOrigin(NSString *origin) {
+  NSData *bytes = plainURLBytes(origin);
+  if (bytes == nil ||
+      !nsLicenseOriginAllowed(bytes.bytes, bytes.length, kLoopbackLicenseServer) ||
+      unchangedURL(origin) == nil) {
+    return nil;
+  }
+  return [origin hasSuffix:@"/"] ? [origin substringToIndex:origin.length - 1] : origin;
+}
+
+NSString *rampServerOrigin(void) {
+  NSString *saved = checkedOrigin(readSupportFile(@"server"));
+  return saved != nil ? saved : checkedOrigin(@NIGHTSHIFT_LICENSE_SERVER);
+}
+
+NSURL *rampPurchasePage(NSString *url) {
+  NSData *bytes = plainURLBytes(url);
+  if (bytes == nil || !nsPurchaseURLAllowed(bytes.bytes, bytes.length)) {
+    return nil;
+  }
+  return unchangedURL(url);
+}
+
+BOOL rampPurchaseURLAllowed(NSString *url) {
+  return rampPurchasePage(url) != nil;
+}
+
+// Review v2: license-server requests never follow a redirect, so the
+// X-Nightshift-Secret header only ever goes to the checked origin. The 3xx
+// itself comes back as the answer, which every caller treats as a failure.
+@interface RampNoRedirects : NSObject <NSURLSessionTaskDelegate>
+@end
+
+@implementation RampNoRedirects
+- (void)URLSession:(NSURLSession *)session
+                          task:(NSURLSessionTask *)task
+    willPerformHTTPRedirection:(NSHTTPURLResponse *)response
+                    newRequest:(NSURLRequest *)request
+             completionHandler:(void (^)(NSURLRequest *))completionHandler {
+  (void)session;
+  (void)task;
+  (void)response;
+  (void)request;
+  completionHandler(nil);
+}
+@end
+
+static NSURLSession *licenseSession(void) {
+  static NSURLSession *session = nil;
+  static dispatch_once_t once;
+  dispatch_once(&once, ^{
+    session = [NSURLSession
+        sessionWithConfiguration:[NSURLSessionConfiguration defaultSessionConfiguration]
+                        delegate:[[RampNoRedirects alloc] init]
+                   delegateQueue:nil];
+  });
+  return session;
 }
 
 static NSData *httpJSON(NSString *method, NSString *urlString, NSData *body,
                         NSString *secret, NSInteger *status) {
-  NSURL *url = [NSURL URLWithString:urlString];
+  NSURL *url = urlString != nil ? [NSURL URLWithString:urlString] : nil;
   if (url == nil) {
     return nil;
   }
@@ -855,7 +942,7 @@ static NSData *httpJSON(NSString *method, NSString *urlString, NSData *body,
   __block NSData *data = nil;
   __block NSInteger code = 0;
   __block NSError *failed = nil;
-  [[[NSURLSession sharedSession]
+  [[licenseSession()
       dataTaskWithRequest:request
         completionHandler:^(NSData *received, NSURLResponse *response, NSError *error) {
           failed = error;
@@ -981,7 +1068,18 @@ static NSString *checkoutOrPortal(NSInteger *statusOut) {
     return nil;
   }
   NSString *url = ((NSDictionary *)parsed)[@"url"];
-  return [url isKindOfClass:[NSString class]] && url.length > 0 ? url : nil;
+  if (![url isKindOfClass:[NSString class]] || url.length == 0) {
+    return nil;
+  }
+  // Review finding 2: only Stripe Checkout or the billing portal is opened,
+  // whatever the server says. Anything else counts as a failed request.
+  if (!rampPurchaseURLAllowed(url)) {
+    if (statusOut != NULL) {
+      *statusOut = -1;
+    }
+    return nil;
+  }
+  return url;
 }
 
 NSString *rampCheckoutURL(void) {
