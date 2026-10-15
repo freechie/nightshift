@@ -57,6 +57,16 @@ void forgetInstallIdentityForTests(void);
 // "ramp:<install-id>:<day>" for that install; unbound "ramp" and
 // "ramp:<day>" are refused. Does not check expiry.
 NSString *rampPayloadDay(NSString *payload, NSString *installID);
+// The seconds a signed "nightshift-time:<install-id>:<unix seconds>" token
+// carries for installID, or -1 when it is malformed, for another install
+// or not signed with the license key.
+long long rampServerTimeFromToken(NSString *token, NSString *installID);
+// The newest verified server time saved by the refresh, or -1 (missing,
+// garbled or failing verification: expiry then uses the local clock).
+long long rampSavedServerTime(void);
+// Saves a server time token for this install when it verifies and is newer
+// than the saved one. License expiry uses the later of it and the clock.
+BOOL rampSaveServerTime(NSString *token);
 // The license server's origin without a trailing "/", or nil when this
 // build has no acceptable one (https, or loopback http in test-key builds).
 NSString *rampServerOrigin(void);

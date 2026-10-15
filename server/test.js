@@ -37,7 +37,18 @@ delete process.env.STRIPE_SECRET_KEY;
 delete process.env.STRIPE_PORTAL_LOGIN_URL;
 
 const app = await import("./app.js");
-const { listen, signRamp, tokenPayload, saveLicense, licenseFor, stripeApiVersion } = app;
+const {
+  listen,
+  signRamp,
+  signTime,
+  tokenPayload,
+  saveLicense,
+  licenseFor,
+  stripeApiVersion,
+  timeFloor,
+  timeCeiling,
+  useClockForTests,
+} = app;
 
 const A = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const B = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
@@ -300,6 +311,7 @@ async function license(installId, headerSecret = secretFor(installId)) {
   return {
     status: response.status,
     body: response.status === 200 || response.status === 409 ? await response.json() : null,
+    time: response.headers.get("x-nightshift-time"),
   };
 }
 
@@ -329,6 +341,21 @@ await check("a late older payment can't roll a license back", async () => {
   assert.equal(got.status, 200);
   assert.equal(got.body.until, "2028-10-01");
   assert.ok(verifies(got.body.token, `ramp:${A}:2028-10-01`));
+});
+await check("the refresh carries a signed server time bound to the install", async () => {
+  const before = Math.floor(Date.now() / 1000);
+  const got = await license(A);
+  const after = Math.floor(Date.now() / 1000);
+  const [, id, seconds] = tokenPayload(got.time).split(":");
+  assert.equal(id, A.toLowerCase());
+  assert.ok(Number(seconds) >= before && Number(seconds) <= after);
+  assert.ok(verifies(got.time, `nightshift-time:${A.toLowerCase()}:${seconds}`));
+  assert.ok(!verifies(got.time, `nightshift-time:${B.toLowerCase()}:${seconds}`));
+  assert.equal(got.body.time, undefined);
+  assert.equal(tokenPayload(signTime(A.toUpperCase(), 5)), `nightshift-time:${A.toLowerCase()}:5`);
+  assert.throws(() => signTime("ramp", 5));
+  assert.throws(() => signTime(A, -1));
+  assert.throws(() => signTime(A, 1.5));
 });
 await check("renewal moves forward", async () => {
   await webhook(paid(A, "sub_a", unix(2029, 10, 1)));
@@ -476,6 +503,36 @@ await check("an unbound legacy row is not served", async () => {
 await check("a revoked install gets 410", async () => {
   app.revokeLicense(D);
   assert.equal((await license(D)).status, 410);
+});
+await check("lapsed replies carry a signed server time", async () => {
+  const at = timeFloor + 86400;
+  useClockForTests(() => at);
+  try {
+    const revoked = await license(D);
+    assert.equal(revoked.status, 410);
+    assert.ok(verifies(revoked.time, `nightshift-time:${D.toLowerCase()}:${at}`));
+    const lapsed = await license(D, null);
+    assert.equal(lapsed.status, 204);
+    assert.ok(verifies(lapsed.time, `nightshift-time:${D.toLowerCase()}:${at}`));
+  } finally {
+    useClockForTests(null);
+  }
+});
+await check("no time is signed when the server clock is out of bounds", async () => {
+  try {
+    for (const at of [timeFloor - 1, timeCeiling + 1, 0, NaN]) {
+      useClockForTests(() => at);
+      const got = await license(D);
+      assert.equal(got.status, 410);
+      assert.equal(got.time, null);
+    }
+    for (const at of [timeFloor, timeCeiling]) {
+      useClockForTests(() => at);
+      assert.ok(verifies((await license(D)).time, `nightshift-time:${D.toLowerCase()}:${at}`));
+    }
+  } finally {
+    useClockForTests(null);
+  }
 });
 
 // Finding 10: the billing portal needs the install's secret.

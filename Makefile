@@ -46,7 +46,7 @@ nightshift: main.m $(SHARED) $(LOGIC) $(LICENSE_STAMP)
 	clang $(CFLAGS) $(SERVER_FLAGS) $(LDLIBS) -o $@ main.m NightShift.m NightshiftLogic.m
 
 nightshiftd: nightshiftd.m $(SHARED) $(LOGIC) $(LICENSE_STAMP)
-	clang $(CFLAGS) $(SERVER_FLAGS) $(LDLIBS) -framework AppKit -framework UserNotifications -framework ServiceManagement -framework CoreGraphics -framework IOKit -framework DisplayServices -framework SkyLight -o $@ nightshiftd.m NightShift.m NightshiftLogic.m
+	clang $(CFLAGS) $(SERVER_FLAGS) $(LDLIBS) -framework AppKit -framework Carbon -framework UserNotifications -framework ServiceManagement -framework CoreGraphics -framework IOKit -framework DisplayServices -framework SkyLight -o $@ nightshiftd.m NightShift.m NightshiftLogic.m
 
 nightshift-tests: tests/check.m $(SHARED) $(LOGIC)
 	clang $(CFLAGS) -I. $(LDLIBS) -o $@ tests/check.m NightShift.m NightshiftLogic.m

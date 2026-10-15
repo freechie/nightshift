@@ -93,13 +93,58 @@ export function signRamp(installId, day) {
   if (!/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(day || "")) {
     throw new Error("bad ramp date");
   }
-  const payload = Buffer.from(`ramp:${installId.toLowerCase()}:${day}`);
+  return signPayload(`ramp:${installId.toLowerCase()}:${day}`);
+}
+
+function signPayload(text) {
+  const payload = Buffer.from(text);
   const key = createPrivateKey(readFileSync(licenseKeyPath()));
   if (key.asymmetricKeyType !== "ed25519") {
     throw new Error("license key is not Ed25519");
   }
   const signature = sign(null, payload, key);
   return `${payload.toString("base64")}.${signature.toString("base64")}`;
+}
+
+// The server's clock, for the app's expiry check, so setting a Mac's clock
+// back can't keep an expired license alive. Bound to the install so it
+// can't be replayed on another Mac.
+//   payload: nightshift-time:<install_id>:<unix seconds>   (lower-case id)
+export function signTime(installId, seconds = Math.floor(Date.now() / 1000)) {
+  if (!idPattern.test(installId || "")) {
+    throw new Error("bad install id");
+  }
+  if (!Number.isSafeInteger(seconds) || seconds < 0) {
+    throw new Error("bad time");
+  }
+  return signPayload(`nightshift-time:${installId.toLowerCase()}:${seconds}`);
+}
+
+// A sanity bound on the server's own clock. A Mac keeps the newest signed
+// time it has seen, so one signed far ahead would expire its license for
+// good; a time before this code existed means the clock is unset. Outside
+// the bound no time is sent, and the app falls back to its own clock. Move
+// both dates forward together, in a release, before the ceiling.
+export const timeFloor = Date.UTC(2026, 9, 1) / 1000; // 2026-10-01
+export const timeCeiling = Date.UTC(2036, 9, 1) / 1000; // floor + 10 years
+const systemClock = () => Math.floor(Date.now() / 1000);
+let clock = systemClock;
+export function useClockForTests(next) {
+  clock = next || systemClock;
+}
+
+// The signed time for a /license reply, or null: out of bounds, or the
+// key can't be read. Never an error, so a lapsed reply still goes out.
+export function serverTimeToken(installId) {
+  const now = clock();
+  if (!Number.isSafeInteger(now) || now < timeFloor || now > timeCeiling) {
+    return null;
+  }
+  try {
+    return signTime(installId, now);
+  } catch {
+    return null;
+  }
 }
 
 // The payload a token carries, or null.
@@ -1115,11 +1160,12 @@ function failure(error) {
   return [500, "internal error"];
 }
 
-function send(res, status, body, type) {
+function send(res, status, body, type, headers = {}) {
   const payload = body == null ? "" : typeof body === "string" ? body : JSON.stringify(body);
   res.writeHead(status, {
     "Content-Type": type || (body && typeof body !== "string" ? "application/json" : "text/plain"),
     "Content-Length": Buffer.byteLength(payload),
+    ...headers,
   });
   res.end(payload);
 }
@@ -1234,6 +1280,10 @@ export function createApp(stripe = stripeClient()) {
           send(res, 400, "");
           return;
         }
+        // Every reply, lapsed ones included, carries the signed server
+        // time in a header: a 204 can't carry a body.
+        const time = serverTimeToken(installId);
+        const timed = time ? { "X-Nightshift-Time": time } : {};
         const presented = secretHash(req.headers["x-nightshift-secret"]);
         const stored = readStore().installs[installId];
         if (!presented || !stored || !sameHash(presented, stored.secret_hash)) {
@@ -1241,22 +1291,22 @@ export function createApp(stripe = stripeClient()) {
           // told; anyone else still gets a plain 204.
           const held = heldFor(installId, presented);
           if (held) {
-            send(res, 409, heldReply(held));
+            send(res, 409, heldReply(held), undefined, timed);
             return;
           }
-          send(res, 204, "");
+          send(res, 204, "", undefined, timed);
           return;
         }
         if (stored.revoked) {
-          send(res, 410, "");
+          send(res, 410, "", undefined, timed);
           return;
         }
         const row = licenseFor(installId);
         if (!row) {
-          send(res, 204, "");
+          send(res, 204, "", undefined, timed);
           return;
         }
-        send(res, 200, { token: row.token, until: row.until });
+        send(res, 200, { token: row.token, until: row.until }, undefined, timed);
         return;
       }
 

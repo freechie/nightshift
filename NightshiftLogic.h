@@ -193,4 +193,24 @@ const char *nsLinkVerdictText(NSLinkVerdict verdict);
 NSLinkVerdict nsPurchaseURLVerdict(const char *url, size_t length);
 bool nsPurchaseURLAllowed(const char *url, size_t length);
 
+// A media key (NX_SYSDEFINED, subtype 8) from its data1: the key code is
+// bits 16-31, the state bits 8-15 (0xA down, 0xB up). Returns 1 for
+// brightness up (code 2), -1 for brightness down (code 3), 0 for any other
+// key (volume up 0, down 1, mute 7, play...), which must reach macOS
+// unchanged. *down is set for a press or repeat.
+int nsMediaBrightnessKey(long data1, bool *down);
+
+// What to do when macOS disables the key taps (timeout or user input).
+// trusted is AXIsProcessTrusted() now; recent counts the disables in the
+// last minute, this one included. Returns the seconds to wait before
+// re-enabling (0.25, 0.5, 1, 2, 4), or -1 to remove the taps and let the
+// permission poll re-create them: always when Accessibility was revoked,
+// and after more than five disables a minute. Never re-enables at once.
+double nsTapRecoveryDelay(bool trusted, int recent);
+
+// Seconds before the next try at creating the key taps while
+// Accessibility is missing: every 2 s for the first 30 tries (about a
+// minute), then every 30 s for as long as Nightshift runs.
+double nsTapRetryDelay(int tries);
+
 #endif

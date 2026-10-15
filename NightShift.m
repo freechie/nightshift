@@ -406,7 +406,17 @@ static BOOL rampDayValid(NSString *day) {
   return [utcDayFormatter() dateFromString:day] != nil;
 }
 
-static NSString *rampToday(void) { return [utcDayFormatter() stringFromDate:[NSDate date]]; }
+// Today is the later of this Mac's clock and the newest server time the
+// hourly refresh saved, so setting the clock back can't keep an expired
+// license alive. A server time can only make today later, never earlier.
+static NSString *rampToday(void) {
+  NSDate *now = [NSDate date];
+  long long server = rampSavedServerTime();
+  if (server > (long long)now.timeIntervalSince1970) {
+    now = [NSDate dateWithTimeIntervalSince1970:(NSTimeInterval)server];
+  }
+  return [utcDayFormatter() stringFromDate:now];
+}
 
 static BOOL rampDayCurrent(NSString *day) {
   return rampDayValid(day) && [day compare:rampToday()] != NSOrderedAscending;
@@ -472,7 +482,8 @@ static void rememberVerifiedToken(NSString *token) {
   }
 }
 
-BOOL rampLicenseAllows(NSString *token) {
+// "<base64 payload>.<base64 signature>", split and decoded, or NO.
+static BOOL splitToken(NSString *token, NSData **payload, NSData **signature) {
   if (token.length == 0) {
     return NO;
   }
@@ -485,18 +496,17 @@ BOOL rampLicenseAllows(NSString *token) {
               .location != NSNotFound) {
     return NO;
   }
-  NSData *payload = [[NSData alloc]
+  *payload = [[NSData alloc]
       initWithBase64EncodedString:[token substringToIndex:dot.location]
                           options:0];
-  NSData *signature = [[NSData alloc]
+  *signature = [[NSData alloc]
       initWithBase64EncodedString:[token substringFromIndex:dot.location + 1]
                           options:0];
-  if (payload.length == 0 || signature.length != 64) {
-    return NO;
-  }
-  if (!rampPayloadCurrent(payload)) {
-    return NO;
-  }
+  return (*payload).length > 0 && (*signature).length == 64;
+}
+
+// Ed25519 over payload with the license key, cached by token.
+static BOOL signatureValid(NSString *token, NSData *payload, NSData *signature) {
   if (tokenVerifiedBefore(token)) {
     return YES;
   }
@@ -525,6 +535,18 @@ BOOL rampLicenseAllows(NSString *token) {
     rememberVerifiedToken(token);
   }
   return ok;
+}
+
+BOOL rampLicenseAllows(NSString *token) {
+  NSData *payload = nil;
+  NSData *signature = nil;
+  if (!splitToken(token, &payload, &signature)) {
+    return NO;
+  }
+  if (!rampPayloadCurrent(payload)) {
+    return NO;
+  }
+  return signatureValid(token, payload, signature);
 }
 
 BOOL rampLicensed(void) {
@@ -640,6 +662,62 @@ static NSString *readSupportFile(NSString *name) {
                                      encoding:NSUTF8StringEncoding
                                         error:NULL]
       stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+}
+
+// The clock-rollback fix: the hourly refresh carries a server time signed
+// with the license key, "nightshift-time:<install-id>:<unix seconds>", in
+// the same "<payload>.<signature>" form as a license. Bound to the install,
+// so one Mac's time can't be replayed on another.
+long long rampServerTimeFromToken(NSString *token, NSString *installID) {
+  NSData *payload = nil;
+  NSData *signature = nil;
+  if (installID.length != 36 || !splitToken(token, &payload, &signature)) {
+    return -1;
+  }
+  NSString *text = [[NSString alloc] initWithData:payload encoding:NSUTF8StringEncoding];
+  NSString *prefix =
+      [NSString stringWithFormat:@"nightshift-time:%@:", installID.lowercaseString];
+  if (![text hasPrefix:prefix]) {
+    return -1;
+  }
+  NSString *digits = [text substringFromIndex:prefix.length];
+  if (digits.length == 0 || digits.length > 12) {
+    return -1;
+  }
+  long long seconds = 0;
+  for (NSUInteger i = 0; i < digits.length; i++) {
+    unichar c = [digits characterAtIndex:i];
+    if (c < '0' || c > '9') {
+      return -1;
+    }
+    seconds = seconds * 10 + (c - '0');
+  }
+  return signatureValid(token, payload, signature) ? seconds : -1;
+}
+
+// The saved server time, or -1 when the file is missing, garbled or fails
+// verification; then expiry falls back to the local clock.
+long long rampSavedServerTime(void) {
+  return rampServerTimeFromToken(readSupportFile(@"server-time"), rampInstallID());
+}
+
+// Saves a verified server time beside the license, only when it is newer
+// than the one saved.
+BOOL rampSaveServerTime(NSString *token) {
+  NSString *trimmed = [token stringByTrimmingCharactersInSet:
+                                [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+  long long next = rampServerTimeFromToken(trimmed, rampInstallID());
+  if (next < 0 || next <= rampSavedServerTime() || !ensureSupportDir()) {
+    return NO;
+  }
+  NSString *path = [supportDir() stringByAppendingPathComponent:@"server-time"];
+  if (![[trimmed stringByAppendingString:@"\n"] writeToFile:path
+                                                  atomically:YES
+                                                    encoding:NSUTF8StringEncoding
+                                                       error:NULL]) {
+    return NO;
+  }
+  return chmod(path.fileSystemRepresentation, S_IRUSR | S_IWUSR) == 0;
 }
 
 // N3: the install ID and secret are created once and never replaced. A
@@ -923,7 +1001,7 @@ static NSURLSession *licenseSession(void) {
 }
 
 static NSData *httpJSON(NSString *method, NSString *urlString, NSData *body,
-                        NSString *secret, NSInteger *status) {
+                        NSString *secret, NSInteger *status, NSString **serverTime) {
   NSURL *url = urlString != nil ? [NSURL URLWithString:urlString] : nil;
   if (url == nil) {
     return nil;
@@ -941,6 +1019,7 @@ static NSData *httpJSON(NSString *method, NSString *urlString, NSData *body,
   dispatch_semaphore_t gate = dispatch_semaphore_create(0);
   __block NSData *data = nil;
   __block NSInteger code = 0;
+  __block NSString *time = nil;
   __block NSError *failed = nil;
   [[licenseSession()
       dataTaskWithRequest:request
@@ -950,6 +1029,7 @@ static NSData *httpJSON(NSString *method, NSString *urlString, NSData *body,
             data = received;
             if ([response isKindOfClass:[NSHTTPURLResponse class]]) {
               code = ((NSHTTPURLResponse *)response).statusCode;
+              time = [(NSHTTPURLResponse *)response valueForHTTPHeaderField:@"X-Nightshift-Time"];
             }
           }
           dispatch_semaphore_signal(gate);
@@ -963,6 +1043,9 @@ static NSData *httpJSON(NSString *method, NSString *urlString, NSData *body,
   }
   if (status != NULL) {
     *status = code;
+  }
+  if (serverTime != NULL) {
+    *serverTime = time;
   }
   return data;
 }
@@ -1019,8 +1102,15 @@ static NSInteger fetchLicense(NSString **tokenOut, NSString **heldOut) {
                                                  options:0
                                                    error:NULL];
   NSInteger status = 0;
+  NSString *serverTime = nil;
   NSData *received = httpJSON(@"POST", [rampServerOrigin() stringByAppendingString:@"/license"],
-                              json, rampInstallSecret(), &status);
+                              json, rampInstallSecret(), &status, &serverTime);
+  // Any reply, lapsed (204, 410) included, may carry the signed server
+  // time; it is verified and saved before the status is looked at. An old
+  // server sends none, and nothing changes.
+  if (serverTime != nil) {
+    rampSaveServerTime(serverTime);
+  }
   if (status < 0 || status == 0) {
     return -1;
   }
@@ -1056,7 +1146,7 @@ static NSString *checkoutOrPortal(NSInteger *statusOut) {
   NSData *json = [NSJSONSerialization dataWithJSONObject:body options:0 error:NULL];
   NSInteger status = 0;
   NSData *received = httpJSON(@"POST", [rampServerOrigin() stringByAppendingString:@"/checkout"],
-                              json, rampInstallSecret(), &status);
+                              json, rampInstallSecret(), &status, NULL);
   if (statusOut != NULL) {
     *statusOut = status;
   }

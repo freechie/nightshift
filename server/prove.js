@@ -6,7 +6,14 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import Stripe from "stripe";
-import { listen, licenseFor, saveLicense, signRamp, stripeApiVersion } from "./app.js";
+import {
+  listen,
+  licenseFor,
+  saveLicense,
+  signRamp,
+  stripeApiVersion,
+  useClockForTests,
+} from "./app.js";
 import {
   checkoutSessionObject,
   eventObject,
@@ -364,6 +371,61 @@ for (const status of [301, 302, 303, 307, 308]) {
   await redirectRefused(status);
 }
 
+// The clock-rollback fix, end to end: this Mac's clock (now) is before the
+// license's last day, the server's clock is past it, and the server has no
+// license for the install (204). The signed time on that 204 must leave
+// the saved license expired.
+async function rollbackStaysExpired() {
+  process.env.NIGHTSHIFT_LICENSE_STORE = keptStore;
+  const id = "44444444-4444-4444-8444-444444444444";
+  const lastDay = "2030-01-01";
+  const token = signRamp(id, lastDay);
+  saveLicense(id, { secret_hash: macHash });
+  useClockForTests(() => Math.floor(Date.UTC(2030, 5, 1) / 1000));
+  const rollbackServer = listen(0);
+  await new Promise((resolve) => rollbackServer.on("listening", resolve));
+  const home = mkdtempSync(join(tmpdir(), "nightshift-rollback-"));
+  const support = join(home, "Library", "Application Support", "nightshift");
+  mkdirSync(support, { recursive: true, mode: 0o700 });
+  writeFileSync(join(support, "install-id"), `${id}\n`, { mode: 0o600 });
+  writeFileSync(join(support, "license"), `${token}\n`, { mode: 0o600 });
+  writeFileSync(join(support, "server"), `http://127.0.0.1:${rollbackServer.address().port}\n`);
+  const run = (args, input = "") =>
+    new Promise((resolve) => {
+      const child = spawn(client, args, {
+        cwd: repo,
+        env: { ...process.env, HOME: home, CFFIXED_USER_HOME: home },
+      });
+      let out = "";
+      child.stdout.on("data", (chunk) => {
+        out += chunk;
+      });
+      child.stderr.on("data", (chunk) => {
+        out += chunk;
+      });
+      child.stdin.end(input);
+      child.on("close", (code) => resolve({ code, out: out.trim() }));
+    });
+  try {
+    const before = await run(["license", token]);
+    if (before.code !== 0 || before.out !== `Ramp is unlocked through ${lastDay}`) {
+      throw new Error(`rollback: license before the refresh ${before.code} ${before.out}`);
+    }
+    const refresh = await run(["license", "secret", "--replace"], `${macSecret}\n`);
+    if (refresh.code === 0) {
+      throw new Error(`rollback: the 204 counted as a license ${refresh.out}`);
+    }
+    const after = await run(["license", token]);
+    if (after.code === 0) {
+      throw new Error(`rollback: license still unlocked after a later server time ${after.out}`);
+    }
+  } finally {
+    useClockForTests(null);
+    rollbackServer.close();
+  }
+}
+await rollbackStaysExpired();
+
 console.log(
-  `unlocked through ${first.until}, renewed through ${second.until}, checkout return through ${parentLicense.until}, redirects refused`,
+  `unlocked through ${first.until}, renewed through ${second.until}, checkout return through ${parentLicense.until}, redirects refused, clock rollback stays expired`,
 );

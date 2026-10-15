@@ -564,6 +564,27 @@ NSLinkVerdict nsPurchaseURLVerdict(const char *url, size_t length) {
   return kNSLinkOK;
 }
 
+int nsMediaBrightnessKey(long data1, bool *down) {
+  long code = (data1 >> 16) & 0xFFFF;
+  *down = ((data1 >> 8) & 0xFF) == 0xA;
+  return code == 2 ? 1 : code == 3 ? -1 : 0;
+}
+
+double nsTapRecoveryDelay(bool trusted, int recent) {
+  if (!trusted || recent > 5) {
+    return -1;
+  }
+  double delay = 0.25;
+  for (int i = 1; i < recent; i++) {
+    delay *= 2;
+  }
+  return delay;
+}
+
+double nsTapRetryDelay(int tries) {
+  return tries < 30 ? 2 : 30;
+}
+
 bool nsPurchaseURLAllowed(const char *url, size_t length) {
   return nsPurchaseURLVerdict(url, length) == kNSLinkOK;
 }

@@ -593,6 +593,87 @@ static void checkLicense(void) {
   useRampPublicKeyForTests(NULL);
 }
 
+// The clock-rollback fix: a signed server time, bound to the install, is
+// saved only when newer, and license expiry uses the later of it and the
+// local clock. Signed with another throwaway key, private half discarded.
+static void checkServerTime(void) {
+  static const uint8_t key[32] = {0x03, 0x1a, 0x06, 0xc5, 0xa0, 0x85, 0x53, 0x19, 0x72, 0xcf, 0x90, 0x10, 0xcd, 0xec, 0xb9, 0x33, 0xd2, 0xd7, 0x57, 0xe0, 0x7e, 0x8c, 0x48, 0x4c, 0x53, 0xa9, 0x6b, 0x6d, 0xc4, 0x50, 0x4b, 0xfb};
+  static const uint8_t licSig[64] = {0x63, 0xa1, 0xd6, 0xfd, 0x4f, 0xfe, 0xe6, 0xe0, 0xd6, 0x24, 0x41, 0x41, 0x74, 0xe2, 0x06, 0x84, 0x92, 0xd6, 0x5a, 0x1a, 0x2b, 0x19, 0x5a, 0x28, 0x17, 0x67, 0xa5, 0x5a, 0x64, 0xf6, 0xe0, 0xfc, 0xb0, 0x2c, 0x22, 0x2d, 0x48, 0xdf, 0x53, 0x26, 0xe7, 0x5e, 0xe5, 0x6c, 0x8a, 0x81, 0x8e, 0x30, 0xcf, 0x3d, 0x37, 0x3c, 0x80, 0x0c, 0x0c, 0x80, 0xb6, 0x65, 0xcf, 0xea, 0xa8, 0x89, 0x8c, 0x09};
+  static const uint8_t t2099Sig[64] = {0x42, 0xb9, 0x37, 0x77, 0x6c, 0x18, 0xf9, 0xc7, 0x40, 0x50, 0xbe, 0xe2, 0x05, 0xa8, 0xd0, 0x4d, 0x1d, 0x90, 0x35, 0xcb, 0x7c, 0x91, 0x85, 0xdb, 0x32, 0xe3, 0xc3, 0x78, 0x47, 0x93, 0x84, 0x88, 0xa9, 0x9b, 0xa8, 0xdf, 0x80, 0xfe, 0xb6, 0x18, 0x2e, 0x73, 0xc1, 0x67, 0x46, 0xef, 0x2f, 0x2c, 0x44, 0x88, 0x2f, 0xd9, 0x6a, 0xca, 0x91, 0x0f, 0xb6, 0xb0, 0xd2, 0x48, 0x2a, 0xf3, 0xdb, 0x03};
+  static const uint8_t t2100Sig[64] = {0x1a, 0x06, 0x1f, 0xd6, 0x34, 0x11, 0x6a, 0x0f, 0xc4, 0x74, 0xf7, 0x52, 0x4b, 0xe7, 0xe1, 0x6a, 0xda, 0x1a, 0x46, 0xa2, 0x24, 0xda, 0xd3, 0xfe, 0x3f, 0x16, 0x97, 0x26, 0x9a, 0x20, 0x5d, 0x5a, 0x40, 0x19, 0x79, 0x54, 0xbf, 0x12, 0xa8, 0x4d, 0xb6, 0x11, 0x56, 0x8d, 0x67, 0xed, 0x19, 0xad, 0x8c, 0x00, 0xc5, 0xb0, 0x2c, 0x51, 0x17, 0x22, 0x14, 0x55, 0x60, 0xf5, 0xb7, 0xe9, 0x6a, 0x06};
+  static const uint8_t otherSig[64] = {0x7d, 0xbf, 0x56, 0x90, 0x57, 0xf6, 0x24, 0x34, 0x56, 0xcc, 0xd5, 0xed, 0x77, 0x4f, 0xc2, 0x88, 0x87, 0x33, 0x5f, 0xa1, 0x43, 0xf0, 0x86, 0x1b, 0x39, 0x18, 0xbe, 0xb8, 0xd8, 0xfe, 0xb9, 0x54, 0xee, 0x4e, 0x6a, 0xf6, 0x17, 0x32, 0xf7, 0xe7, 0xb0, 0xac, 0x01, 0x26, 0x91, 0x42, 0xfd, 0x7a, 0x43, 0xd4, 0xa8, 0x5d, 0x57, 0x99, 0xe0, 0x90, 0x9d, 0x42, 0x77, 0x86, 0x95, 0x60, 0x51, 0x0a};
+  NSString *installID = @"5f0e1c2a-3b4d-4e6f-8a9b-0c1d2e3f4a5b";
+  NSString *otherID = @"a0b1c2d3-e4f5-4a6b-8c7d-9e0f1a2b3c4d";
+  NSString *home = [NSHomeDirectory() stringByStandardizingPath];
+  if (home == nil || ![home hasPrefix:@"/tmp/nslic"]) {
+    fail(@"server time home", home ?: @"nil");
+    return;
+  }
+  NSString *dir = [home stringByAppendingPathComponent:@"Library/Application Support/nightshift"];
+  NSString *timeFile = [dir stringByAppendingPathComponent:@"server-time"];
+  [installID writeToFile:[dir stringByAppendingPathComponent:@"install-id"]
+              atomically:YES
+                encoding:NSUTF8StringEncoding
+                   error:NULL];
+  forgetInstallIdentityForTests();
+  [[NSFileManager defaultManager] removeItemAtPath:timeFile error:NULL];
+  useRampPublicKeyForTests(key);
+
+  NSString *license =
+      tokenFor([NSString stringWithFormat:@"ramp:%@:2099-06-01", installID], licSig);
+  NSString *(^timeText)(NSString *, NSString *) = ^NSString *(NSString *id, NSString *secs) {
+    return [NSString stringWithFormat:@"nightshift-time:%@:%@", id, secs];
+  };
+  NSString *t2099 = tokenFor(timeText(installID, @"4070908800"), t2099Sig);
+  NSString *t2100 = tokenFor(timeText(installID, @"4102444800"), t2100Sig);
+  NSString *other = tokenFor(timeText(otherID, @"4102444800"), otherSig);
+  NSString *forged = tokenFor(timeText(installID, @"4102444800"), t2099Sig);
+
+  expectBool(@"no server time: local clock", rampSavedServerTime() == -1, YES);
+  expectBool(@"license valid by the local clock", rampLicenseAllows(license), YES);
+
+  expectBool(@"server time for another install refused", rampSaveServerTime(other), NO);
+  expectBool(@"bad server time signature refused", rampSaveServerTime(forged), NO);
+  expectBool(@"refused times save nothing",
+             [[NSFileManager defaultManager] fileExistsAtPath:timeFile], NO);
+
+  expectBool(@"valid server time saved", rampSaveServerTime(t2099), YES);
+  expectBool(@"saved server time read back", rampSavedServerTime() == 4070908800LL, YES);
+  NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:timeFile
+                                                                          error:NULL];
+  expectBool(@"server time file is 0600", [attrs[NSFilePosixPermissions] intValue] == 0600, YES);
+  expectBool(@"license still valid before its day", rampLicenseAllows(license), YES);
+
+  expectBool(@"newer server time saved", rampSaveServerTime(t2100), YES);
+  expectBool(@"older server time ignored", rampSaveServerTime(t2099), NO);
+  expectBool(@"same server time ignored", rampSaveServerTime(t2100), NO);
+  expectBool(@"newest server time kept", rampSavedServerTime() == 4102444800LL, YES);
+  // Rollback: the local clock (now) is before the saved server time, past
+  // the license's last day, so the license stays expired.
+  expectBool(@"clock rolled back: license stays expired", rampLicenseAllows(license), NO);
+
+  [@"nightshift-time:garbled\n" writeToFile:timeFile
+                                   atomically:YES
+                                     encoding:NSUTF8StringEncoding
+                                        error:NULL];
+  expectBool(@"garbled server time falls back", rampSavedServerTime() == -1, YES);
+  expectBool(@"garbled server time: license by the local clock", rampLicenseAllows(license), YES);
+  [[forged stringByAppendingString:@"\n"] writeToFile:timeFile
+                                            atomically:YES
+                                              encoding:NSUTF8StringEncoding
+                                                 error:NULL];
+  expectBool(@"unverified saved time falls back", rampSavedServerTime() == -1, YES);
+  [[other stringByAppendingString:@"\n"] writeToFile:timeFile
+                                           atomically:YES
+                                             encoding:NSUTF8StringEncoding
+                                                error:NULL];
+  expectBool(@"another install's saved time falls back", rampSavedServerTime() == -1, YES);
+  expectBool(@"a valid time replaces a garbled file", rampSaveServerTime(t2099), YES);
+
+  [[NSFileManager defaultManager] removeItemAtPath:timeFile error:NULL];
+  useRampPublicKeyForTests(NULL);
+}
+
 static void isolateHome(void) {
   if (getenv("NIGHTSHIFT_LICENSE_TEST") != NULL) {
     return;
@@ -624,6 +705,7 @@ int main(void) {
     checkMath();
     checkSentences();
     checkLicense();
+    checkServerTime();
     if (gFailed != 0) {
       fprintf(stderr, "%d failed\n", gFailed);
       return 1;

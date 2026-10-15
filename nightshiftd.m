@@ -17,7 +17,9 @@
 #import "NightshiftLogic.h"
 #import <AppKit/AppKit.h>
 #import <ApplicationServices/ApplicationServices.h>
+#import <Carbon/Carbon.h>
 #import <dlfcn.h>
+#include <stdatomic.h>
 #import <IOKit/IOKitLib.h>
 #import <ServiceManagement/ServiceManagement.h>
 #import <UserNotifications/UserNotifications.h>
@@ -2180,19 +2182,10 @@ static BOOL readDisplayBrightness(uint32_t display, float *level, BOOL *writable
   return NO;
 }
 
-@interface DimWindow : NSWindow
-@end
-
-@implementation DimWindow
-- (BOOL)canBecomeKeyWindow {
-  return NO;
-}
-- (BOOL)canBecomeMainWindow {
-  return NO;
-}
-@end
-
-static NSMutableDictionary<NSNumber *, NSWindow *> *gShades = nil;
+// Displays dimmed in software, by percent. The dim is the display's gamma
+// table scaled down, not a window: a full-screen window got picked by
+// Cmd-Shift-4's window mode and showed up in screenshots.
+static NSMutableDictionary<NSNumber *, NSNumber *> *gShades = nil;
 static void liftBrightnessHUD(void);
 
 static NSScreen *screenForDisplay(uint32_t display) {
@@ -2213,53 +2206,28 @@ static void applyDim(uint32_t display, long percent) {
     gSoftwareBrightness = [NSMutableDictionary dictionary];
   }
   NSNumber *key = @(display);
-  NSWindow *shade = gShades[key];
   if (percent >= 100) {
-    [shade orderOut:nil];
+    if (gShades[key] != nil) {
+      restoreGamma(display);
+      [gShades removeObjectForKey:key];
+    }
     [gSoftwareBrightness removeObjectForKey:key];
     liftBrightnessHUD();
     return;
   }
-  NSScreen *screen = screenForDisplay(display);
-  if (screen == nil) {
+  if (percent < 0) {
+    percent = 0;
+  }
+  if (screenForDisplay(display) == nil || !setGammaLevel(display, (float)percent / 100.0f)) {
     return;
   }
-  if (shade == nil) {
-    shade = [[DimWindow alloc] initWithContentRect:screen.frame
-                                         styleMask:NSWindowStyleMaskBorderless
-                                           backing:NSBackingStoreBuffered
-                                             defer:NO];
-    shade.opaque = NO;
-    shade.backgroundColor = NSColor.blackColor;
-    shade.ignoresMouseEvents = YES;
-    shade.hasShadow = NO;
-    shade.level = kCGMaximumWindowLevel;
-    shade.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces |
-                               NSWindowCollectionBehaviorStationary |
-                               NSWindowCollectionBehaviorFullScreenAuxiliary |
-                               NSWindowCollectionBehaviorIgnoresCycle;
-    shade.releasedWhenClosed = NO;
-    gShades[key] = shade;
-  }
-  [shade setFrame:screen.frame display:NO];
-  shade.level = kCGMaximumWindowLevel;
-  CGFloat alpha = (CGFloat)(100 - percent) / 100.0;
-  if (shade.isVisible) {
-    [NSAnimationContext runAnimationGroup:^(NSAnimationContext *context) {
-      context.duration = 0.12;
-      shade.animator.alphaValue = alpha;
-    }];
-  } else {
-    shade.alphaValue = alpha;
-  }
-  [shade orderFront:nil];
+  gShades[key] = @(percent);
   gSoftwareBrightness[key] = @((float)percent / 100.0f);
   liftBrightnessHUD();
 }
 
 static BOOL shadeLogical(uint32_t display, float *level) {
-  NSWindow *shade = gShades[@(display)];
-  if (shade == nil || !shade.isVisible) {
+  if (gShades[@(display)] == nil) {
     return NO;
   }
   NSNumber *saved = gSoftwareBrightness[@(display)];
@@ -2758,7 +2726,6 @@ static void forgetOfflineDisplays(void) {
     if (online) {
       continue;
     }
-    [gShades[key] orderOut:nil];
     [gShades removeObjectForKey:key];
     [gSoftwareBrightness removeObjectForKey:key];
   }
@@ -2767,18 +2734,10 @@ static void forgetOfflineDisplays(void) {
   keepADisplayLit();
 }
 
+// A display reconfiguration can reset gamma tables, so the dims go back on.
 static void refitDimWindows(void) {
-  for (NSNumber *key in gShades) {
-    NSWindow *shade = gShades[key];
-    if (!shade.isVisible) {
-      continue;
-    }
-    NSScreen *screen = screenForDisplay(key.unsignedIntValue);
-    if (screen == nil) {
-      continue;
-    }
-    [shade setFrame:screen.frame display:NO];
-    [shade orderFront:nil];
+  for (NSNumber *key in gShades.allKeys) {
+    setGammaLevel(key.unsignedIntValue, gShades[key].floatValue / 100.0f);
   }
   liftBrightnessHUD();
 }
@@ -2963,16 +2922,10 @@ static void tintSlider(NSSlider *slider) {
 
   CGFloat fillX = track.origin.x + track.size.width * ((CGFloat)self.percent / 100.0);
   CGFloat knobSize = 16;
-  int dots = 12;
-  for (int i = 0; i < dots; i++) {
-    CGFloat x = track.origin.x + track.size.width * ((CGFloat)i / (CGFloat)(dots - 1));
-    if (x <= fillX || fabs(x - fillX) < knobSize / 2.0) {
-      continue;
-    }
-    NSRect dot = NSMakeRect(x - 1.4, sliderY - 1.4, 2.8, 2.8);
-    [[label colorWithAlphaComponent:0.55] setFill];
-    [[NSBezierPath bezierPathWithOvalInRect:dot] fill];
-  }
+  // The empty part of the bar, under the fill, as in the menu's sliders.
+  NSRect empty = NSMakeRect(track.origin.x, sliderY - 2.5, track.size.width, 5);
+  [[label colorWithAlphaComponent:0.25] setFill];
+  [[NSBezierPath bezierPathWithRoundedRect:empty xRadius:2.5 yRadius:2.5] fill];
   CGFloat fillWidth = fillX - track.origin.x;
   if (fillWidth < knobSize / 2.0) {
     fillWidth = knobSize / 2.0;
@@ -3113,12 +3066,7 @@ static void liftBrightnessHUD(void) {
   if (gBrightnessPanel == nil) {
     return;
   }
-  NSWindow *shade = gShades[@(gBrightnessAnchor)];
-  BOOL shadeUp = shade != nil && shade.isVisible;
-  gBrightnessPanel.level = shadeUp ? kCGMaximumWindowLevel : NSStatusWindowLevel + 2;
-  if (shadeUp && gBrightnessPanel.isVisible) {
-    [gBrightnessPanel orderFrontRegardless];
-  }
+  gBrightnessPanel.level = NSStatusWindowLevel + 2;
 }
 
 static void scheduleBrightnessHide(void) {
@@ -4330,6 +4278,15 @@ static BOOL menuMotionAllowed(void) {
 // A section title that opens and closes on click, with a chevron that turns
 // from right to down. Clicks come through a gesture recognizer, as on the old
 // Full at row, so the menu stays open.
+// A capsule label: the display status pill and the Pro badge.
+@interface PillView : NSView
+@property(nonatomic, strong) NSTextField *label;
+@property(nonatomic, strong) NSColor *color;
+@property(nonatomic) BOOL solid;
+- (instancetype)initWithText:(NSString *)text color:(NSColor *)color solid:(BOOL)solid;
+- (void)setText:(NSString *)text color:(NSColor *)color;
+@end
+
 @interface SectionHeader : NSView
 @property(nonatomic, strong) NSTextField *title;
 @property(nonatomic, strong) NSImageView *chevron;
@@ -4526,6 +4483,9 @@ static NSStackView *menuSection(NSArray<NSView *> *views, CGFloat spacing) {
 @property(nonatomic) long savedMax;
 @property(nonatomic, strong) RampClock *rampClock;
 @property(nonatomic, strong) NSStackView *maxRow;
+@property(nonatomic, strong) NSTextField *maxName;
+// On the Ramp title when the ramp isn't licensed; clicking it opens Pro.
+@property(nonatomic, strong) PillView *rampPro;
 @property(nonatomic, strong) SectionHeader *fullRow;
 @property(nonatomic, strong) NSTextField *fullTime;
 @property(nonatomic) BOOL fullCollapsed;
@@ -4687,7 +4647,7 @@ static void openBrightnessKeyAccess(void) {
   pay.preferredMaxLayoutWidth = kMenuContentWidth;
   pay.hidden = YES;
   self.payLabel = pay;
-  NSButton *buy = [NSButton buttonWithTitle:@"Unlock the ramp"
+  NSButton *buy = [NSButton buttonWithTitle:@"Renew the ramp"
                                      target:nil
                                      action:NULL];
   buy.bezelStyle = NSBezelStyleRounded;
@@ -4711,12 +4671,14 @@ static void openBrightnessKeyAccess(void) {
                                         value:self.nowValue
                                     nameWidth:62
                                          name:NULL];
+  NSTextField *maxName = nil;
   NSStackView *maxRow = [self sliderRowTitled:@"Max"
                                        slider:self.maxSlider
                                         value:self.maxValue
                                     nameWidth:62
-                                         name:NULL];
+                                         name:&maxName];
   self.maxRow = maxRow;
+  self.maxName = maxName;
 
   NSSegmentedControl *schedule = [NSSegmentedControl
       segmentedControlWithLabels:@[ @"Off", @"Custom", @"Sunset to Sunrise" ]
@@ -4760,12 +4722,30 @@ static void openBrightnessKeyAccess(void) {
   // Spacing: 10 between rows and under each title, 12 above and below each
   // divider, 14 side margins, as in the stock Sound menu.
   NSTextField *nightTitle = [self sectionLabel:@"Night Shift Intensity"];
-  NSStackView *nightSection = menuSection(
-      @[ nightTitle, nowRow, maxRow, pay, buy, schedule, fullRow, clockWell ], 10);
-  [nightSection setCustomSpacing:14 afterView:maxRow];
-  [nightSection setCustomSpacing:14 afterView:buy];
-  [nightSection setCustomSpacing:12 afterView:schedule];
-  [nightSection setCustomSpacing:6 afterView:fullRow];
+  NSStackView *nightSection = menuSection(@[ nightTitle, nowRow, schedule ], 10);
+  [nightSection setCustomSpacing:14 afterView:nowRow];
+
+  // Max and Full at are the Pro ramp, so they share one section with one
+  // PRO badge. Without Pro they show grayed out and the badge opens Pro.
+  PillView *rampPro = [[PillView alloc] initWithText:@"PRO"
+                                              color:NSColor.controlAccentColor
+                                              solid:YES];
+  rampPro.toolTip = @"Unlock the ramp with Pro";
+  rampPro.hidden = YES;
+  [rampPro addGestureRecognizer:[[NSClickGestureRecognizer alloc]
+                                    initWithTarget:self
+                                            action:@selector(rampProClicked:)]];
+  self.rampPro = rampPro;
+  NSStackView *rampTitle =
+      [NSStackView stackViewWithViews:@[ [self sectionLabel:@"Ramp"], rampPro ]];
+  rampTitle.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+  rampTitle.alignment = NSLayoutAttributeCenterY;
+  rampTitle.spacing = 8;
+  NSStackView *rampSection =
+      menuSection(@[ rampTitle, pay, maxRow, buy, fullRow, clockWell ], 10);
+  [rampSection setCustomSpacing:14 afterView:maxRow];
+  [rampSection setCustomSpacing:14 afterView:buy];
+  [rampSection setCustomSpacing:6 afterView:fullRow];
 
   self.collapsedSections = readCollapsedSections();
   SectionHeader *brightHeader =
@@ -4803,7 +4783,8 @@ static void openBrightnessKeyAccess(void) {
   NSView *brightDivider = menuHairline();
   self.brightDivider = brightDivider;
   NSStackView *stack = [NSStackView stackViewWithViews:@[
-    nightSection, brightDivider, brightSection, menuHairline(), appearanceSection
+    nightSection, menuHairline(), rampSection, brightDivider, brightSection, menuHairline(),
+    appearanceSection
   ]];
   stack.orientation = NSUserInterfaceLayoutOrientationVertical;
   stack.alignment = NSLayoutAttributeLeading;
@@ -4842,16 +4823,24 @@ static void openBrightnessKeyAccess(void) {
   BOOL paid = rampLicensed();
   BOOL soon = rampLicenseRenewingSoon();
   NSString *until = rampLicenseUntil();
-  self.maxRow.hidden = !paid;
+  self.rampPro.hidden = paid;
   self.maxSlider.enabled = paid;
-  self.fullRow.hidden = !paid;
-  self.clockWell.hidden = !paid || self.fullCollapsed;
+  self.maxSlider.alphaValue = paid ? 1 : 0.4;
+  self.maxName.textColor = paid ? NSColor.labelColor : NSColor.tertiaryLabelColor;
+  self.maxValue.textColor = paid ? NSColor.labelColor : NSColor.tertiaryLabelColor;
+  self.fullRow.title.textColor = paid ? NSColor.secondaryLabelColor : NSColor.tertiaryLabelColor;
+  self.fullTime.textColor = paid ? NSColor.secondaryLabelColor : NSColor.tertiaryLabelColor;
+  self.clockWell.hidden = self.fullCollapsed;
+  [self syncClock];
   [self styleFullHeader];
   self.payLabel.hidden = until == nil;
   self.payLabel.stringValue =
       until == nil ? @"" : [NSString stringWithFormat:@"Ramp through %@", until];
-  self.payButton.hidden = paid && !soon;
-  self.payButton.title = soon ? @"Renew the ramp" : @"Unlock the ramp";
+  self.payButton.hidden = !(paid && soon);
+}
+
+- (void)rampProClicked:(id)sender {
+  [NSApp sendAction:self.payButton.action to:self.payButton.target from:self.payButton];
 }
 
 - (void)showCheck:(NSButton *)button
@@ -5116,7 +5105,7 @@ static void openBrightnessKeyAccess(void) {
   }
   [self.rampClock showMinute:minute hour24:h24];
   self.fullTime.stringValue = clockString(minute);
-  BOOL on = customSchedule();
+  BOOL on = customSchedule() && rampLicensed();
   self.rampClock.enabled = on;
   self.rampClock.alphaValue = on ? 1 : 0.4;
 }
@@ -5401,15 +5390,6 @@ static NSString *const kSettingsWindowID = @"NightshiftSettings";
   [super viewDidChangeEffectiveAppearance];
   self.needsDisplay = YES;
 }
-@end
-
-// A capsule label: the display status pill and the Pro badge.
-@interface PillView : NSView
-@property(nonatomic, strong) NSTextField *label;
-@property(nonatomic, strong) NSColor *color;
-@property(nonatomic) BOOL solid;
-- (instancetype)initWithText:(NSString *)text color:(NSColor *)color solid:(BOOL)solid;
-- (void)setText:(NSString *)text color:(NSColor *)color;
 @end
 
 @implementation PillView
@@ -7974,7 +7954,11 @@ typedef struct __IOHIDEvent *IOHIDEventRef;
 typedef struct __IOHIDEventSystemClient *IOHIDEventSystemClientRef;
 typedef void (*IOHIDEventCallback)(void *target, void *refcon, void *sender,
                                    IOHIDEventRef event);
-extern IOHIDEventSystemClientRef IOHIDEventSystemClientCreate(CFAllocatorRef allocator);
+// Monitor clients only watch HID events; they can't filter or take them.
+static const int kIOHIDEventSystemClientTypeMonitor = 1;
+extern IOHIDEventSystemClientRef IOHIDEventSystemClientCreateWithType(CFAllocatorRef allocator,
+                                                                      int type,
+                                                                      CFDictionaryRef attributes);
 extern void IOHIDEventSystemClientRegisterEventCallback(
     IOHIDEventSystemClientRef client, IOHIDEventCallback callback, void *target,
     void *refcon);
@@ -8316,19 +8300,9 @@ static BOOL deliverBrightness(int direction) {
 
 static int brightnessDirection(NSEvent *key) {
   if (key.type == NSEventTypeSystemDefined && key.subtype == 8) {
-    NSInteger data = key.data1;
-    NSInteger code = (data & 0xFFFF0000) >> 16;
-    NSInteger flags = data & 0xFFFF;
-    BOOL down = ((flags & 0xFF00) >> 8) == 0xA;
-    if (!down) {
-      return 0;
-    }
-    if (code == 2) {
-      return 1;
-    }
-    if (code == 3) {
-      return -1;
-    }
+    bool down = false;
+    int direction = nsMediaBrightnessKey((long)key.data1, &down);
+    return down ? direction : 0;
   }
   if (key.type == NSEventTypeKeyDown) {
     if (key.keyCode == 144) {
@@ -8384,6 +8358,13 @@ static void dropKeyDisplay(uint32_t display) {
 // through the second time.
 static const int64_t kKeyReposted = 0x4e53686b;  // "NShk"
 
+// Tap thread: a brightness press the taps swallowed, so its release is
+// swallowed too. Cleared on main whenever the taps are (re-)created.
+static BOOL gSwallowedPress[2];
+// Set by the tap thread when a disabled notice is queued for main.
+static atomic_bool gTapDisabledPending;
+static void handleTapsDisabled(void);
+
 // Tap thread. Whether the display under the event is one the main thread
 // can step; display is set to it either way.
 static BOOL keyDisplayHandled(CGEventRef event, uint32_t *displayOut) {
@@ -8424,13 +8405,9 @@ static void deliverTappedKey(int direction, uint32_t display, CGEventRef copy) {
   }
 }
 
-// Tap thread. Same rules as brightnessDirection, without NSEvent for plain
-// key-downs.
+// Tap thread. Only system-defined (media) events reach the tap; plain
+// key-downs 144/145 come in as hotkeys instead.
 static int tapDirection(CGEventType type, CGEventRef event) {
-  if (type == kCGEventKeyDown) {
-    int64_t code = CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode);
-    return code == 144 ? 1 : code == 145 ? -1 : 0;
-  }
   if (type != (CGEventType)NSEventTypeSystemDefined) {
     return 0;
   }
@@ -8444,10 +8421,13 @@ static CGEventRef brightnessKey(CGEventTapProxy proxy, CGEventType type,
   (void)user;
   if (type == kCGEventTapDisabledByTimeout ||
       type == kCGEventTapDisabledByUserInput) {
-    for (int i = 0; i < gBrightnessTapCount; i++) {
-      if (gBrightnessTaps[i] != NULL) {
-        CGEventTapEnable(gBrightnessTaps[i], true);
-      }
+    // Never re-enabled here: when Accessibility is revoked, macOS disables
+    // the taps and an immediate re-enable loops with it. The main thread
+    // decides, once for all taps, with backoff.
+    if (!atomic_exchange(&gTapDisabledPending, true)) {
+      dispatch_async(dispatch_get_main_queue(), ^{
+        handleTapsDisabled();
+      });
     }
     return event;
   }
@@ -8455,12 +8435,27 @@ static CGEventRef brightnessKey(CGEventTapProxy proxy, CGEventType type,
     if (CGEventGetIntegerValueField(event, kCGEventSourceUserData) == kKeyReposted) {
       return event;
     }
+    // A brightness key whose press was swallowed has its release swallowed
+    // too, so nothing downstream sees a release without a press. Every
+    // other key, volume and mute included, goes back untouched.
+    if (type == (CGEventType)NSEventTypeSystemDefined) {
+      NSEvent *key = [NSEvent eventWithCGEvent:event];
+      bool down = false;
+      int brightness = key.subtype == 8 ? nsMediaBrightnessKey((long)key.data1, &down) : 0;
+      if (brightness != 0 && !down) {
+        BOOL *pressed = &gSwallowedPress[brightness > 0];
+        BOOL swallow = *pressed;
+        *pressed = NO;
+        return swallow ? NULL : event;
+      }
+    }
     int direction = tapDirection(type, event);
     uint32_t display = 0;
     if (direction == 0 || !keyDisplayHandled(event, &display)) {
       return event;
     }
-    // The three taps see the same press; only the first one steps.
+    gSwallowedPress[direction > 0] = YES;
+    // Guards against a press delivered twice; only the first one steps.
     static CFAbsoluteTime last = 0;
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
     if (now - last >= 0.02) {
@@ -8535,7 +8530,8 @@ static void hidBrightness(void *target, void *refcon, void *sender,
 }
 
 static void watchHIDBrightness(void) {
-  IOHIDEventSystemClientRef client = IOHIDEventSystemClientCreate(kCFAllocatorDefault);
+  IOHIDEventSystemClientRef client = IOHIDEventSystemClientCreateWithType(
+      kCFAllocatorDefault, kIOHIDEventSystemClientTypeMonitor, NULL);
   if (client == NULL) {
     return;
   }
@@ -8544,17 +8540,93 @@ static void watchHIDBrightness(void) {
                                             kCFRunLoopCommonModes);
 }
 
+static void startBrightnessKeys(void);
+
+// Main thread. Disables, invalidates and releases the key taps; their run
+// loop sources go with the invalidated ports.
+static void removeBrightnessTaps(void) {
+  for (int i = 0; i < gBrightnessTapCount; i++) {
+    if (gBrightnessTaps[i] != NULL) {
+      CGEventTapEnable(gBrightnessTaps[i], false);
+      CFMachPortInvalidate(gBrightnessTaps[i]);
+      CFRelease(gBrightnessTaps[i]);
+      gBrightnessTaps[i] = NULL;
+    }
+  }
+  gBrightnessTapCount = 0;
+}
+
+// Main thread. At most one pending retry of startBrightnessKeys.
+static BOOL gTapRetryScheduled = NO;
+static void scheduleTapRetry(double delay) {
+  if (gTapRetryScheduled) {
+    return;
+  }
+  gTapRetryScheduled = YES;
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
+                 dispatch_get_main_queue(), ^{
+                   gTapRetryScheduled = NO;
+                   startBrightnessKeys();
+                 });
+}
+
+// Main thread. Drops the taps so installBrightnessTap can re-create them,
+// and lets the permission poll do that once Accessibility is back.
+static void dropTapsAndRetry(void) {
+  removeBrightnessTaps();
+  atomic_store(&gTapDisabledPending, false);
+  if (gMenu != nil) {
+    [gMenu refresh];
+  }
+  gTapTries = 0;
+  scheduleTapRetry(nsTapRetryDelay(0));
+}
+
+// Main thread, once per burst of disabled notices.
+static void handleTapsDisabled(void) {
+  static CFAbsoluteTime windowStart = 0;
+  static int recent = 0;
+  CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+  if (now - windowStart > 60) {
+    windowStart = now;
+    recent = 0;
+  }
+  recent++;
+  double delay = nsTapRecoveryDelay(AXIsProcessTrusted(), recent);
+  if (delay < 0) {
+    dropTapsAndRetry();
+    return;
+  }
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
+                 dispatch_get_main_queue(), ^{
+                   if (!AXIsProcessTrusted()) {
+                     // Revoked during the wait: disabled taps left in place
+                     // would block installBrightnessTap for good.
+                     dropTapsAndRetry();
+                     return;
+                   }
+                   for (int i = 0; i < gBrightnessTapCount; i++) {
+                     CGEventTapEnable(gBrightnessTaps[i], true);
+                   }
+                   atomic_store(&gTapDisabledPending, false);
+                 });
+}
+
 static BOOL installBrightnessTap(void) {
   if (gBrightnessTapCount > 0) {
     return YES;
   }
-  CGEventMask mask = CGEventMaskBit(NSEventTypeSystemDefined) |
-                     CGEventMaskBit(kCGEventKeyDown);
-  CGEventTapLocation places[3] = {kCGSessionEventTap, kCGHIDEventTap,
-                                  kCGAnnotatedSessionEventTap};
+  gSwallowedPress[0] = gSwallowedPress[1] = NO;
+  // System-defined events only. A key-down bit here would make every tap
+  // an active filter on everything typed, passwords included.
+  CGEventMask mask = CGEventMaskBit(NSEventTypeSystemDefined);
+  // One Session tap. An active Annotated Session tap breaks the volume and
+  // mute keys even when it hands their events back untouched, and the HID
+  // tap adds nothing the Session tap misses (measured Oct 14, 2026).
+  CGEventTapLocation places[1] = {kCGSessionEventTap};
   refreshKeyDisplays();
   CFRunLoopRef loop = tapRunLoop();
-  for (int i = 0; i < 3; i++) {
+  for (int i = 0; i < 1; i++) {
     CFMachPortRef tap = CGEventTapCreate(places[i], kCGHeadInsertEventTap,
                                          kCGEventTapOptionDefault, mask, brightnessKey,
                                          NULL);
@@ -8571,10 +8643,38 @@ static BOOL installBrightnessTap(void) {
   return gBrightnessTapCount > 0;
 }
 
+// Main thread. Key codes 144/145 (brightness on keyboards that send them as
+// plain keys) as hotkeys, so macOS reports only these two to Nightshift.
+static OSStatus brightnessHotKey(EventHandlerCallRef next, EventRef event, void *user) {
+  (void)next;
+  (void)user;
+  EventHotKeyID hotKey;
+  if (GetEventParameter(event, kEventParamDirectObject, typeEventHotKeyID, NULL,
+                        sizeof(hotKey), NULL, &hotKey) != noErr) {
+    return eventNotHandledErr;
+  }
+  deliverBrightness(hotKey.id == 1 ? 1 : -1);
+  return noErr;
+}
+
+static void registerBrightnessHotKeys(void) {
+  EventTypeSpec pressed = {kEventClassKeyboard, kEventHotKeyPressed};
+  InstallApplicationEventHandler(brightnessHotKey, 1, &pressed, NULL, NULL);
+  const UInt32 codes[2] = {144, 145};
+  for (UInt32 i = 0; i < 2; i++) {
+    EventHotKeyRef ref = NULL;
+    EventHotKeyID hotKey = {'NShk', i + 1};
+    if (RegisterEventHotKey(codes[i], 0, hotKey, GetApplicationEventTarget(), 0, &ref) != noErr) {
+      NSLog(@"nightshift: brightness hotkey %u not registered", (unsigned)codes[i]);
+    }
+  }
+}
+
 static void startBrightnessKeys(void) {
   if (!gHIDWatching) {
     gHIDWatching = YES;
     watchHIDBrightness();
+    registerBrightnessHotKeys();
     rememberBuiltin();
     probeDDC();
   }
@@ -8591,13 +8691,12 @@ static void startBrightnessKeys(void) {
     AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)options);
     notifyPlain(@"Allow Nightshift in Accessibility to use the brightness keys");
   }
-  if (gTapTries++ >= 30) {
-    return;
+  // Never gives up: 2 s for about a minute, then every 30 s.
+  double retry = nsTapRetryDelay(gTapTries);
+  if (gTapTries < 30) {
+    gTapTries++;
   }
-  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
-                 dispatch_get_main_queue(), ^{
-                   startBrightnessKeys();
-                 });
+  scheduleTapRetry(retry);
 }
 
 // Main thread. Re-reads every DDC channel, the confirmed ones included, as
@@ -8675,7 +8774,7 @@ static void teardownDaemon(void) {
   }
   if (gShades != nil) {
     for (NSNumber *key in gShades.allKeys) {
-      [gShades[key] orderOut:nil];
+      restoreGamma(key.unsignedIntValue);
       [gShades removeObjectForKey:key];
     }
   }

@@ -549,7 +549,57 @@ static void checkHosts(void) {
   }
 }
 
+// Media keys: only brightness is Nightshift's; volume, mute and the rest
+// must be told apart so the key tap hands them back to macOS.
+static void checkMediaKeys(void) {
+  struct {
+    int code;
+    int want;
+  } keys[] = {{0, 0}, {1, 0}, {7, 0}, {16, 0}, {2, 1}, {3, -1}};
+  for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+    long press = ((long)keys[i].code << 16) | (0xA << 8);
+    long repeat = press | 1;
+    long release = ((long)keys[i].code << 16) | (0xB << 8);
+    bool down = false;
+    CHECK_EQ(nsMediaBrightnessKey(press, &down), keys[i].want);
+    CHECK(down);
+    CHECK_EQ(nsMediaBrightnessKey(repeat, &down), keys[i].want);
+    CHECK(down);
+    CHECK_EQ(nsMediaBrightnessKey(release, &down), keys[i].want);
+    CHECK(!down);
+  }
+  // The low byte (repeat count) doesn't change the answer.
+  bool down = false;
+  CHECK_EQ(nsMediaBrightnessKey((2L << 16) | (0xA << 8) | 0xFF, &down), 1);
+  CHECK(down);
+}
+
+// Disabled key taps: never an immediate re-enable, never once
+// Accessibility is gone, and a give-up after repeated disables.
+static void checkTapRecovery(void) {
+  CHECK(nsTapRecoveryDelay(false, 1) < 0);
+  CHECK(nsTapRecoveryDelay(false, 0) < 0);
+  CHECK(nsTapRecoveryDelay(true, 1) == 0.25);
+  CHECK(nsTapRecoveryDelay(true, 2) == 0.5);
+  CHECK(nsTapRecoveryDelay(true, 5) == 4);
+  CHECK(nsTapRecoveryDelay(true, 6) < 0);
+  CHECK(nsTapRecoveryDelay(true, 1000) < 0);
+  for (int n = 0; n <= 5; n++) {
+    CHECK(nsTapRecoveryDelay(true, n) > 0);
+  }
+  // Missing Accessibility: fast polling for a minute, then slow, never stop.
+  CHECK(nsTapRetryDelay(0) == 2);
+  CHECK(nsTapRetryDelay(29) == 2);
+  CHECK(nsTapRetryDelay(30) == 30);
+  CHECK(nsTapRetryDelay(1000000) == 30);
+  for (int n = 0; n < 100; n++) {
+    CHECK(nsTapRetryDelay(n) > 0);
+  }
+}
+
 int main(void) {
+  checkTapRecovery();
+  checkMediaKeys();
   checkRamp();
   checkMatching();
   checkSlots();
