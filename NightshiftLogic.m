@@ -530,6 +530,39 @@ NSDDCProbeVerdict nsDDCProbeDecide(const NSDDCProbeFacts *facts, int *current, i
   return kNSDDCProbeSoftware;
 }
 
+int nsDDCNextReadOffset(int tried, int offset0, bool budgetLeft) {
+  if (!budgetLeft) {
+    return -1;
+  }
+  if (tried <= 0) {
+    return 0;
+  }
+  if (offset0 != kNSDDCOffsetEmpty) {
+    return -1;
+  }
+  if (tried == 1) {
+    return 0x51;
+  }
+  if (tried == 2) {
+    return 0x50;
+  }
+  return -1;
+}
+
+static bool ddcBudgetOpen(const NSDDCProbeIO *io) {
+  return io->budget == NULL || io->budget(io->ctx);
+}
+
+static NSDDCProbeVerdict ddcBudgetStop(NSDDCProbeIO *io, int *currentOut, int *maxOut) {
+  NSDDCProbeFacts facts;
+  memset(&facts, 0, sizeof(facts));
+  facts.evidence = kNSDDCEvidenceTimedOut;
+  facts.fallbackCurrent = io->fallbackCurrent;
+  facts.fallbackMax = io->fallbackMax;
+  io->evidence = kNSDDCEvidenceTimedOut;
+  return nsDDCProbeDecide(&facts, currentOut, maxOut);
+}
+
 NSDDCProbeVerdict nsDDCProbeControl(NSDDCProbeIO *io, int *currentOut, int *maxOut) {
   if (currentOut != NULL) {
     *currentOut = 0;
@@ -548,12 +581,20 @@ NSDDCProbeVerdict nsDDCProbeControl(NSDDCProbeIO *io, int *currentOut, int *maxO
   int scale = 0;
   bool readOk = false;
   // HDMI often drops the first VCP read. A later try is still a read.
+  // A call that does not return inside the budget ends the probe. It must
+  // not fall through into a brightness write.
   for (int attempt = 0; attempt < 4; attempt++) {
+    if (!ddcBudgetOpen(io)) {
+      return ddcBudgetStop(io, currentOut, maxOut);
+    }
     before = 0;
     scale = 0;
     if (io->read(io->ctx, &before, &scale) && scale > 0 && before >= 0 && before <= scale) {
       readOk = true;
       break;
+    }
+    if (!ddcBudgetOpen(io)) {
+      return ddcBudgetStop(io, currentOut, maxOut);
     }
   }
   NSDDCProbeFacts facts;
@@ -561,7 +602,13 @@ NSDDCProbeVerdict nsDDCProbeControl(NSDDCProbeIO *io, int *currentOut, int *maxO
   facts.fallbackCurrent = io->fallbackCurrent;
   facts.fallbackMax = io->fallbackMax;
   if (!readOk) {
+    if (!ddcBudgetOpen(io)) {
+      return ddcBudgetStop(io, currentOut, maxOut);
+    }
     bool framed = io->framed != NULL && io->framed(io->ctx);
+    if (!ddcBudgetOpen(io)) {
+      return ddcBudgetStop(io, currentOut, maxOut);
+    }
     if (!framed) {
       // The write function is there. Its return code, with no frame, is not
       // evidence the packet reached the panel.
@@ -574,6 +621,9 @@ NSDDCProbeVerdict nsDDCProbeControl(NSDDCProbeIO *io, int *currentOut, int *maxO
     int keep = nsDDCProbeKeep(io->fallbackCurrent, io->fallbackMax, &keepScale);
     facts.evidence = kNSDDCEvidenceFramed;
     facts.writeOk = io->write(io->ctx, keep);
+    if (!ddcBudgetOpen(io)) {
+      return ddcBudgetStop(io, currentOut, maxOut);
+    }
     facts.fallbackCurrent = keep;
     facts.fallbackMax = keepScale;
     io->evidence = facts.writeOk ? kNSDDCEvidenceFramed : kNSDDCEvidenceNone;
@@ -581,7 +631,13 @@ NSDDCProbeVerdict nsDDCProbeControl(NSDDCProbeIO *io, int *currentOut, int *maxO
     return nsDDCProbeDecide(&facts, currentOut, maxOut);
   }
   int target = nsDDCProbeTarget(before, scale);
+  if (!ddcBudgetOpen(io)) {
+    return ddcBudgetStop(io, currentOut, maxOut);
+  }
   if (target < 0 || !io->write(io->ctx, target)) {
+    if (!ddcBudgetOpen(io)) {
+      return ddcBudgetStop(io, currentOut, maxOut);
+    }
     io->evidence = kNSDDCEvidenceNone;
     return nsDDCProbeDecide(&facts, currentOut, maxOut);
   }
@@ -591,9 +647,15 @@ NSDDCProbeVerdict nsDDCProbeControl(NSDDCProbeIO *io, int *currentOut, int *maxO
   bool landed = false;
   bool sawReply = false;
   for (int attempt = 0; attempt < 4; attempt++) {
+    if (!ddcBudgetOpen(io)) {
+      return ddcBudgetStop(io, currentOut, maxOut);
+    }
     int after = 0;
     int scaleAfter = 0;
     if (!io->read(io->ctx, &after, &scaleAfter)) {
+      if (!ddcBudgetOpen(io)) {
+        return ddcBudgetStop(io, currentOut, maxOut);
+      }
       continue;
     }
     sawReply = true;
@@ -603,8 +665,15 @@ NSDDCProbeVerdict nsDDCProbeControl(NSDDCProbeIO *io, int *currentOut, int *maxO
     }
   }
   // The nudge already went out. Put the original back whether or not a
-  // confirmation read proved the panel moved.
+  // confirmation read proved the panel moved. A timed-out bus does not get
+  // another write.
+  if (!ddcBudgetOpen(io)) {
+    return ddcBudgetStop(io, currentOut, maxOut);
+  }
   (void)io->write(io->ctx, before);
+  if (!ddcBudgetOpen(io)) {
+    return ddcBudgetStop(io, currentOut, maxOut);
+  }
   if (landed) {
     facts.evidence = kNSDDCEvidenceRead;
     facts.writeOk = true;
@@ -628,7 +697,7 @@ bool nsDDCDebugLine(uint32_t display, int service, int verdict, int evidence, ch
   if (verdict != kNSDDCProbeControllable && verdict != kNSDDCProbeSoftware) {
     return false;
   }
-  if (evidence < kNSDDCEvidenceNone || evidence > kNSDDCEvidenceInFlight) {
+  if (evidence < kNSDDCEvidenceNone || evidence > kNSDDCEvidenceTimedOut) {
     return false;
   }
   int wrote = snprintf(out, cap, "ddc %u %d %d %d", display, service, verdict, evidence);

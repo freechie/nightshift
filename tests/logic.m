@@ -890,6 +890,7 @@ typedef struct {
   int held;
   int failFirst;  // the first N reads fail, later ones work
   bool framed;
+  bool overran;
   int framedCalls;
   int reads;
   int writes;
@@ -925,6 +926,30 @@ static bool probeFramed(void *ctx) {
   ProbePanel *panel = ctx;
   panel->framedCalls++;
   return panel->framed;
+}
+
+static bool probeBudget(void *ctx) {
+  ProbePanel *panel = ctx;
+  return !panel->overran;
+}
+
+static bool probeFramedOverrun(void *ctx) {
+  ProbePanel *panel = ctx;
+  panel->framedCalls++;
+  panel->overran = true;
+  return false;
+}
+
+static bool probeReadConfirmOverrun(void *ctx, int *current, int *max) {
+  ProbePanel *panel = ctx;
+  panel->reads++;
+  if (panel->writes > 0) {
+    panel->overran = true;
+    return false;
+  }
+  *current = panel->panel;
+  *max = panel->max;
+  return true;
 }
 
 static bool probeWrite(void *ctx, int value) {
@@ -1435,6 +1460,77 @@ static void checkProbe(void) {
   CHECK(strcmp(report, "ddc 3 0 1 3\nddc 2 1 1 7\n") == 0);
   CHECK_EQ(nsDDCDebugReport(NULL, NULL, 0, NULL, 0, report, sizeof(report)), 0);
   CHECK(report[0] == '\0');
+
+  // Offset 0 first. 0x51 and 0x50 only after an empty offset-0 reply, and
+  // only while the display deadline still has time left.
+  CHECK_EQ(nsDDCNextReadOffset(0, kNSDDCOffsetEmpty, true), 0);
+  CHECK_EQ(nsDDCNextReadOffset(0, kNSDDCOffsetEmpty, false), -1);
+  CHECK_EQ(nsDDCNextReadOffset(1, kNSDDCOffsetEmpty, true), 0x51);
+  CHECK_EQ(nsDDCNextReadOffset(2, kNSDDCOffsetEmpty, true), 0x50);
+  CHECK_EQ(nsDDCNextReadOffset(3, kNSDDCOffsetEmpty, true), -1);
+  CHECK_EQ(nsDDCNextReadOffset(1, kNSDDCOffsetEmpty, false), -1);
+  CHECK_EQ(nsDDCNextReadOffset(1, kNSDDCOffsetTimedOut, true), -1);
+  CHECK_EQ(nsDDCNextReadOffset(1, kNSDDCOffsetFrame, true), -1);
+
+  CHECK(nsDDCDebugLine(3, 0, kNSDDCProbeSoftware, kNSDDCEvidenceTimedOut, line, sizeof(line)));
+  CHECK(strcmp(line, "ddc 3 0 1 8") == 0);
+  NSDDCProbeFacts timed;
+  memset(&timed, 0, sizeof(timed));
+  timed.evidence = kNSDDCEvidenceTimedOut;
+  timed.writeOk = true;
+  timed.fallbackCurrent = 40;
+  timed.fallbackMax = 100;
+  CHECK_EQ(nsDDCProbeDecide(&timed, &current, &max), kNSDDCProbeSoftware);
+  CHECK_EQ(current, 0);
+  CHECK_EQ(max, 0);
+
+  // A read that does not return must not fall through into the full-scale
+  // keep write, even when a framed reply would otherwise allow it.
+  ProbePanel stalled = probePanel(42, 100);
+  io.ctx = &stalled;
+  io.read = probeRead;
+  io.write = probeWrite;
+  io.framed = probeFramed;
+  io.budget = probeBudget;
+  stalled.failRead = true;
+  stalled.framed = true;
+  stalled.overran = true;
+  io.fallbackCurrent = 0;
+  io.fallbackMax = 0;
+  current = 99;
+  max = 99;
+  CHECK_EQ(nsDDCProbeControl(&io, &current, &max), kNSDDCProbeSoftware);
+  CHECK_EQ(stalled.writes, 0);
+  CHECK_EQ(stalled.framedCalls, 0);
+  CHECK_EQ(io.evidence, kNSDDCEvidenceTimedOut);
+  CHECK_EQ(current, 0);
+  CHECK_EQ(max, 0);
+
+  // The read returned nothing, then the capabilities read overran. Still no
+  // brightness write, and the code is the timeout, not write-only.
+  ProbePanel lateHang = probePanel(42, 100);
+  lateHang.failRead = true;
+  io.ctx = &lateHang;
+  io.framed = probeFramedOverrun;
+  io.budget = probeBudget;
+  CHECK_EQ(nsDDCProbeControl(&io, &current, &max), kNSDDCProbeSoftware);
+  CHECK_EQ(lateHang.framedCalls, 1);
+  CHECK_EQ(lateHang.writes, 0);
+  CHECK_EQ(io.evidence, kNSDDCEvidenceTimedOut);
+
+  // Nudge went out, confirmation read overran: do not write the original back.
+  ProbePanel confirmHang = probePanel(42, 100);
+  io.ctx = &confirmHang;
+  io.read = probeReadConfirmOverrun;
+  io.framed = NULL;
+  io.budget = probeBudget;
+  CHECK_EQ(nsDDCProbeControl(&io, &current, &max), kNSDDCProbeSoftware);
+  CHECK_EQ(confirmHang.writes, 1);
+  CHECK_EQ(confirmHang.written[0], 44);
+  CHECK_EQ(io.evidence, kNSDDCEvidenceTimedOut);
+  io.budget = NULL;
+  io.read = probeRead;
+  io.framed = probeFramed;
 }
 
 int main(void) {
