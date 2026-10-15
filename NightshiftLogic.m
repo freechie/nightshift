@@ -372,36 +372,111 @@ bool nsDDCProbeLanded(int before, int written, int after) {
   return after == written;
 }
 
-static bool ddcChecksummed(const uint8_t *bytes, int last, uint8_t expect) {
-  uint8_t sum = 0x50;
-  for (int i = 0; i <= last; i++) {
+static uint8_t ddcXor(uint8_t seed, const uint8_t *bytes, int from, int toInclusive) {
+  uint8_t sum = seed;
+  for (int i = from; i <= toInclusive; i++) {
     sum ^= bytes[i];
   }
-  return sum == expect;
+  return sum;
 }
 
-bool nsDDCFrameValid(const uint8_t *bytes, int count) {
+static bool ddcOpcodeOk(uint8_t opcode) {
+  return opcode == 0x02 || opcode == 0xE3;
+}
+
+// first..csIndex-1 are the checksummed bytes. Seed is 0x50. lenIndex is the
+// length byte; the opcode is the next byte. Brightness fields sit at the
+// usual offsets from that length byte and must end before the checksum.
+static bool ddcTake(const uint8_t *bytes, int count, int first, int lenIndex, int csIndex,
+                    NSDDCReply *out) {
+  if (first < 0 || lenIndex < first || csIndex <= lenIndex + 1 || csIndex >= count) {
+    return false;
+  }
+  if (!ddcOpcodeOk(bytes[lenIndex + 1])) {
+    return false;
+  }
+  if (ddcXor(0x50, bytes, first, csIndex - 1) != bytes[csIndex]) {
+    return false;
+  }
+  out->valid = true;
+  out->brightness = false;
+  out->current = 0;
+  out->max = 0;
+  if (bytes[lenIndex + 1] == 0x02) {
+    int curLow = lenIndex + 8;
+    if (curLow < csIndex && bytes[lenIndex + 2] == 0x00 && bytes[lenIndex + 3] == 0x10) {
+      int maxValue = (bytes[lenIndex + 5] << 8) | bytes[lenIndex + 6];
+      int currentValue = (bytes[lenIndex + 7] << 8) | bytes[curLow];
+      if (maxValue > 0 && currentValue >= 0 && currentValue <= maxValue) {
+        out->brightness = true;
+        out->current = currentValue;
+        out->max = maxValue;
+      }
+    }
+  }
+  return true;
+}
+
+static bool ddcFrameAt(const uint8_t *bytes, int count, int first, int lenIndex, NSDDCReply *out) {
+  if (lenIndex < 0 || lenIndex >= count || (bytes[lenIndex] & 0x80) == 0) {
+    return false;
+  }
+  int length = bytes[lenIndex] & 0x7F;
+  if (length < 3 || length > 32) {
+    return false;
+  }
+  // Some replies count the checksum in the length (capabilities, 0x86).
+  // Apple's 11-byte VCP read does not (0x88, checksum at index 10).
+  if (ddcTake(bytes, count, first, lenIndex, lenIndex + length, out)) {
+    return true;
+  }
+  return ddcTake(bytes, count, first, lenIndex, lenIndex + 1 + length, out);
+}
+
+static bool ddcConsider(const uint8_t *bytes, int count, int start, NSDDCReply *out) {
+  if (start < 0 || start >= count) {
+    return false;
+  }
+  // Host address 0x50 or data address 0x51, echoed in front of the frame.
+  // It is not part of the checksum.
+  if (bytes[start] == 0x50 || bytes[start] == 0x51) {
+    start++;
+    if (start >= count) {
+      return false;
+    }
+  }
+  if (bytes[start] == 0x6E || bytes[start] == 0x6F || bytes[start] == 0x6e) {
+    if (ddcFrameAt(bytes, count, start, start + 1, out)) {
+      return true;
+    }
+    // 11-byte layout even when the length byte has no 0x80 flag.
+    return ddcTake(bytes, count, start, start + 1, start + 10, out);
+  }
+  if ((bytes[start] & 0x80) != 0) {
+    return ddcFrameAt(bytes, count, start, start, out);
+  }
+  return false;
+}
+
+bool nsDDCDecodeReply(const uint8_t *bytes, int count, NSDDCReply *out) {
+  if (out == NULL) {
+    return false;
+  }
+  out->valid = false;
+  out->brightness = false;
+  out->current = 0;
+  out->max = 0;
   if (bytes == NULL || count < 4) {
     return false;
   }
-  if (bytes[0] != 0x6E && bytes[0] != 0x6e) {
-    return false;
-  }
-  if (bytes[2] != 0x02 && bytes[2] != 0xE3) {
-    return false;
-  }
-  int length = bytes[1] & 0x7F;
-  // Length is the count of bytes after the length byte, checksum included.
-  if (length >= 2 && 2 + length <= count &&
-      ddcChecksummed(bytes, length, bytes[1 + length])) {
-    return true;
-  }
-  // IOAVServiceReadI2C of a VCP reply is 11 bytes, checksum at index 10,
-  // even when the length nibble is not 9.
-  if (count >= 11 && ddcChecksummed(bytes, 9, bytes[10])) {
-    return true;
-  }
-  return false;
+  // Only the front of the buffer. A checksum that appears later is not a
+  // reply, and must not turn a write-only link into a brightness reading.
+  return ddcConsider(bytes, count, 0, out);
+}
+
+bool nsDDCFrameValid(const uint8_t *bytes, int count) {
+  NSDDCReply reply;
+  return nsDDCDecodeReply(bytes, count, &reply);
 }
 
 int nsDDCProbeKeep(int fallbackCurrent, int fallbackMax, int *scaleOut) {
@@ -553,7 +628,7 @@ bool nsDDCDebugLine(uint32_t display, int service, int verdict, int evidence, ch
   if (verdict != kNSDDCProbeControllable && verdict != kNSDDCProbeSoftware) {
     return false;
   }
-  if (evidence < kNSDDCEvidenceNone || evidence > kNSDDCEvidenceUnchanged) {
+  if (evidence < kNSDDCEvidenceNone || evidence > kNSDDCEvidenceInFlight) {
     return false;
   }
   int wrote = snprintf(out, cap, "ddc %u %d %d %d", display, service, verdict, evidence);
@@ -562,6 +637,50 @@ bool nsDDCDebugLine(uint32_t display, int service, int verdict, int evidence, ch
     return false;
   }
   return true;
+}
+
+int nsDDCDebugReport(const uint32_t *displays, const int *builtin, int displayCount,
+                     const NSDDCDebugRow *rows, int rowCount, char *out, size_t cap) {
+  if (out == NULL || cap == 0) {
+    return -1;
+  }
+  out[0] = '\0';
+  if (displays == NULL || displayCount < 0) {
+    displayCount = 0;
+  }
+  if (rows == NULL || rowCount < 0) {
+    rowCount = 0;
+  }
+  size_t used = 0;
+  int lines = 0;
+  for (int i = 0; i < displayCount; i++) {
+    if (builtin != NULL && builtin[i] != 0) {
+      continue;
+    }
+    int service = -1;
+    int verdict = kNSDDCProbeSoftware;
+    int evidence = kNSDDCEvidenceNotProbed;
+    for (int r = 0; r < rowCount; r++) {
+      if (rows[r].display == displays[i]) {
+        service = rows[r].service;
+        verdict = rows[r].verdict;
+        evidence = rows[r].evidence;
+        break;
+      }
+    }
+    char line[64];
+    if (!nsDDCDebugLine(displays[i], service, verdict, evidence, line, sizeof(line))) {
+      continue;
+    }
+    int wrote = snprintf(out + used, cap - used, "%s\n", line);
+    if (wrote < 0 || (size_t)wrote >= cap - used) {
+      out[used] = '\0';
+      return -1;
+    }
+    used += (size_t)wrote;
+    lines++;
+  }
+  return lines;
 }
 
 const char *nsDDCControlLabel(NSDDCProbeVerdict verdict) {
