@@ -615,6 +615,17 @@ static void checkMediaKeys(void) {
   bool down = false;
   CHECK_EQ(nsMediaBrightnessKey((2L << 16) | (0xA << 8) | 0xFF, &down), 1);
   CHECK(down);
+
+  // Session tap mask: system-defined only. The old OR with bit 10 is refused.
+  uint64_t mask = nsMediaTapMaskBits();
+  CHECK_EQ(mask, 16384);
+  CHECK_EQ(mask & ((uint64_t)1 << 10), 0);
+  CHECK(mask != 0 && (mask & (mask - 1)) == 0);
+  CHECK(nsMediaTapMaskAllowed(mask));
+  CHECK(!nsMediaTapMaskAllowed(mask | ((uint64_t)1 << 10)));
+  CHECK(!nsMediaTapMaskAllowed((uint64_t)1 << 10));
+  CHECK(!nsMediaTapMaskAllowed(0));
+  CHECK(!nsMediaTapMaskAllowed(mask | 1));
 }
 
 // Disabled key taps: never an immediate re-enable, never once
