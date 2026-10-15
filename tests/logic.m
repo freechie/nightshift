@@ -345,6 +345,56 @@ static void checkSafety(void) {
   CHECK(sw >= kNSShadeFloor);
 }
 
+// Cmd+F1 / Cmd+F2: the Current slider, five percent at a time, clamped
+// to 0...100. F1 lowers, F2 raises.
+static void checkCommandWarmth(void) {
+  CHECK_EQ(nsCommandWarmthDirection(1), -1);
+  CHECK_EQ(nsCommandWarmthDirection(2), 1);
+  CHECK_EQ(nsCommandWarmthDirection(0), 0);
+  CHECK_EQ(nsCommandWarmthDirection(3), 0);
+  CHECK_EQ(nsCommandWarmthStep(), 5);
+  CHECK(nsCommandWarmthRepeatGap(0.5) == 0.5);
+  CHECK(nsCommandWarmthRepeatGap(0.02) == 0.02);
+  CHECK(nsCommandWarmthRepeatGap(0.019) == 0.02);
+  CHECK(nsCommandWarmthRepeatGap(0) == 0.02);
+  CHECK(nsCommandWarmthRepeatGap(-1) == 0.02);
+
+  CHECK_EQ(nsCommandWarmthNext(50, 1), 55);
+  CHECK_EQ(nsCommandWarmthNext(50, -1), 45);
+  CHECK_EQ(nsCommandWarmthNext(0, -1), 0);
+  CHECK_EQ(nsCommandWarmthNext(100, 1), 100);
+  CHECK_EQ(nsCommandWarmthNext(3, -1), 0);
+  CHECK_EQ(nsCommandWarmthNext(98, 1), 100);
+  CHECK_EQ(nsCommandWarmthNext(97, 1), 100);
+  CHECK_EQ(nsCommandWarmthNext(2, -1), 0);
+  CHECK_EQ(nsCommandWarmthNext(50, 0), 50);
+  CHECK_EQ(nsCommandWarmthNext(-4, 0), 0);
+  CHECK_EQ(nsCommandWarmthNext(140, 0), 100);
+  CHECK_EQ(nsCommandWarmthNext(140, 1), 100);
+  CHECK_EQ(nsCommandWarmthNext(-8, -1), 0);
+
+  long percent = 0;
+  for (int i = 0; i < 30; i++) {
+    long next = nsCommandWarmthNext(percent, 1);
+    CHECK(next >= 0 && next <= 100);
+    CHECK(next >= percent);
+    CHECK(next - percent == 5 || next == 100);
+    percent = next;
+  }
+  CHECK_EQ(percent, 100);
+  CHECK_EQ(nsCommandWarmthNext(percent, 1), 100);
+  percent = 100;
+  for (int i = 0; i < 30; i++) {
+    long next = nsCommandWarmthNext(percent, -1);
+    CHECK(next >= 0 && next <= 100);
+    CHECK(next <= percent);
+    CHECK(percent - next == 5 || next == 0);
+    percent = next;
+  }
+  CHECK_EQ(percent, 0);
+  CHECK_EQ(nsCommandWarmthNext(percent, -1), 0);
+}
+
 // The string's own length; NULL stays NULL.
 static size_t lengthOf(const char *s) {
   return s != NULL ? strlen(s) : 0;
@@ -933,6 +983,7 @@ int main(void) {
   checkReadback();
   checkSplit();
   checkSafety();
+  checkCommandWarmth();
   checkProbe();
   checkHosts();
   checkWorkspaceOpens();
