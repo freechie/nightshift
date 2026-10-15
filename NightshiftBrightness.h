@@ -46,6 +46,12 @@ BOOL externalNeedsDDC(void);
 BOOL readDisplayBrightness(uint32_t display, float *level, BOOL *writable);
 NSScreen *screenForDisplay(uint32_t display);
 long softwareDimPercent(uint32_t display, long percent);
+// Learned DDC floor as a percent, or -1 when display has no confirmed
+// channel. A held command key uses it to tell a shade step from a lamp step.
+long ddcBrightnessFloor(uint32_t display);
+// Other online displays that still show a picture. The safe clamp refuses
+// black on an external display when this is 0.
+int otherLitDisplayCount(uint32_t display);
 BOOL setDisplayBrightnessThen(uint32_t display, long percent, BrightnessDone done);
 BOOL setDisplayBrightness(uint32_t display, long percent);
 void holdBrightnessTick(uint32_t display, long percent);

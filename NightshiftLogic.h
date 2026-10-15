@@ -177,6 +177,27 @@ long nsSteppedPercent(long percent, int direction, long stops);
 // can never lose every screen; it becomes 1, the dimmest visible level.
 long nsSafeBrightness(long percent, bool builtin, int otherLitDisplays);
 
+// Command brightness keys: Cmd+F1 lowers (id 1), Cmd+F2 raises (id 2).
+// 0 is any other id. The chord is a Carbon hotkey, which does not repeat,
+// so a hold repeats on a timer. stops is 16 on a DDC backlight and 32 for
+// software dimming, the same steps as the brightness keys.
+int nsCommandBrightnessDirection(unsigned hotKeyID);
+long nsCommandBrightnessStops(bool ddcReady);
+// One step, then nsSafeBrightness. direction 0 only clamps.
+long nsCommandBrightnessNext(long percent, int direction, long stops, bool builtin,
+                             int otherLitDisplays);
+// Seconds between hold repeats. Carbon has no repeat; the system interval
+// is used, but never faster than the brightness keys (0.02s).
+double nsCommandBrightnessRepeatGap(double seconds);
+// Whether this tick may call setDisplayBrightnessThen. Release always may:
+// that is the one save. A repeat may not when it would move a DDC lamp, or
+// when the display is still only a probe (not built-in, not a confirmed
+// channel, not software-dimming). Those wait for release, so a hold does
+// not queue a DDC write per tick. Shade-only DDC steps may: the lamp value
+// does not change.
+bool nsCommandBrightnessAppliesNow(bool release, bool builtin, bool ddcReady, bool ddcFailed,
+                                   long previous, long next, long floor);
+
 // Another online display, as seen when deciding whether one may go black.
 typedef struct {
   bool builtin;   // the built-in panel

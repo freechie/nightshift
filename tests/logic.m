@@ -345,6 +345,90 @@ static void checkSafety(void) {
   CHECK(sw >= kNSShadeFloor);
 }
 
+// Cmd+F1 / Cmd+F2: the brightness-key step, the safe clamp, and which
+// repeats may write. A DDC lamp moves on release, not on every tick.
+static void checkCommandBrightness(void) {
+  CHECK_EQ(nsCommandBrightnessDirection(1), -1);
+  CHECK_EQ(nsCommandBrightnessDirection(2), 1);
+  CHECK_EQ(nsCommandBrightnessDirection(0), 0);
+  CHECK_EQ(nsCommandBrightnessDirection(3), 0);
+  CHECK_EQ(nsCommandBrightnessStops(true), 16);
+  CHECK_EQ(nsCommandBrightnessStops(false), 32);
+  CHECK(nsCommandBrightnessRepeatGap(0.5) == 0.5);
+  CHECK(nsCommandBrightnessRepeatGap(0.02) == 0.02);
+  CHECK(nsCommandBrightnessRepeatGap(0.019) == 0.02);
+  CHECK(nsCommandBrightnessRepeatGap(0) == 0.02);
+  CHECK(nsCommandBrightnessRepeatGap(-1) == 0.02);
+
+  CHECK_EQ(nsCommandBrightnessNext(50, 1, 16, false, 1), nsSteppedPercent(50, 1, 16));
+  CHECK_EQ(nsCommandBrightnessNext(50, 1, 16, false, 1), 56);
+  CHECK_EQ(nsCommandBrightnessNext(50, -1, 16, false, 0), 44);
+  CHECK_EQ(nsCommandBrightnessNext(6, -1, 16, false, 0), 1);
+  CHECK_EQ(nsCommandBrightnessNext(6, -1, 16, false, 1), 0);
+  CHECK_EQ(nsCommandBrightnessNext(6, -1, 16, true, 0), 0);
+  CHECK_EQ(nsCommandBrightnessNext(1, -1, 16, false, 0), 1);
+  CHECK_EQ(nsCommandBrightnessNext(0, -1, 16, false, 0), 1);
+  CHECK_EQ(nsCommandBrightnessNext(100, 1, 32, false, 0), 100);
+  CHECK_EQ(nsCommandBrightnessNext(0, -1, 32, true, 0), 0);
+  CHECK_EQ(nsCommandBrightnessNext(99, 1, 32, false, 0), 100);
+  CHECK_EQ(nsCommandBrightnessNext(0, 1, 16, false, 0), 6);
+  CHECK_EQ(nsCommandBrightnessNext(50, 0, 16, false, 0), 50);
+  CHECK_EQ(nsCommandBrightnessNext(0, 0, 16, false, 0), 1);
+  CHECK_EQ(nsCommandBrightnessNext(140, 0, 16, false, 0), 100);
+  CHECK_EQ(nsCommandBrightnessNext(50, 1, 32, false, 0), nsSteppedPercent(50, 1, 32));
+
+  long percent = 0;
+  for (int i = 0; i < 40; i++) {
+    long next = nsCommandBrightnessNext(percent, 1, 16, false, 0);
+    CHECK(next >= 1 && next <= 100);
+    CHECK(next >= percent);
+    percent = next;
+  }
+  CHECK_EQ(percent, 100);
+  for (int i = 0; i < 40; i++) {
+    percent = nsCommandBrightnessNext(percent, -1, 32, true, 0);
+    CHECK(percent >= 0 && percent <= 100);
+  }
+  CHECK_EQ(percent, 0);
+
+  // Release always writes. A built-in panel and a software-dimmed display
+  // write every repeat. A confirmed DDC lamp does not, until release.
+  // A probe that is none of those waits for release too.
+  CHECK(nsCommandBrightnessAppliesNow(true, false, true, false, 60, 70, 20));
+  CHECK(nsCommandBrightnessAppliesNow(false, true, false, false, 60, 70, 20));
+  CHECK(nsCommandBrightnessAppliesNow(false, false, false, true, 60, 70, 20));
+  CHECK(!nsCommandBrightnessAppliesNow(false, false, false, false, 60, 70, 20));
+  CHECK(nsCommandBrightnessAppliesNow(false, false, true, false, 40, 44, 20));
+  CHECK(!nsCommandBrightnessAppliesNow(false, false, true, false, 60, 70, 20));
+  CHECK(!nsCommandBrightnessAppliesNow(false, false, true, false, 48, 56, 20));
+  CHECK(nsCommandBrightnessAppliesNow(false, false, true, false, 100, 100, 0));
+  CHECK(nsCommandBrightnessAppliesNow(false, false, true, false, -1, 56, 20));
+  // Walking down a confirmed channel: lamp steps are not written, shade
+  // steps are, and release still is.
+  long held = 100;
+  int lampSkips = 0;
+  int shadeApplies = 0;
+  for (int i = 0; i < 30 && held > 0; i++) {
+    long next = nsCommandBrightnessNext(held, -1, 16, false, 0);
+    bool apply = nsCommandBrightnessAppliesNow(false, false, true, false, held, next, 0);
+    if (held > kNSCombinedSwitch && next >= kNSCombinedSwitch && next != held) {
+      CHECK(!apply);
+      lampSkips++;
+    }
+    if (held < kNSCombinedSwitch && next < kNSCombinedSwitch && next != held && apply) {
+      shadeApplies++;
+    }
+    CHECK(nsCommandBrightnessAppliesNow(true, false, true, false, held, next, 0));
+    if (next == held) {
+      break;
+    }
+    held = next;
+  }
+  CHECK(lampSkips > 0);
+  CHECK(shadeApplies > 0);
+  CHECK_EQ(held, 1);
+}
+
 // The string's own length; NULL stays NULL.
 static size_t lengthOf(const char *s) {
   return s != NULL ? strlen(s) : 0;
@@ -933,6 +1017,7 @@ int main(void) {
   checkReadback();
   checkSplit();
   checkSafety();
+  checkCommandBrightness();
   checkProbe();
   checkHosts();
   checkWorkspaceOpens();

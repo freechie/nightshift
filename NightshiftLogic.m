@@ -458,6 +458,58 @@ long nsSafeBrightness(long percent, bool builtin, int otherLitDisplays) {
   return otherLitDisplays > 0 ? 0 : 1;
 }
 
+int nsCommandBrightnessDirection(unsigned hotKeyID) {
+  if (hotKeyID == 1) {
+    return -1;
+  }
+  if (hotKeyID == 2) {
+    return 1;
+  }
+  return 0;
+}
+
+long nsCommandBrightnessStops(bool ddcReady) {
+  return ddcReady ? 16 : 32;
+}
+
+long nsCommandBrightnessNext(long percent, int direction, long stops, bool builtin,
+                             int otherLitDisplays) {
+  long next = percent;
+  if (direction != 0 && stops > 0) {
+    next = nsSteppedPercent(percent, direction, stops);
+  }
+  return nsSafeBrightness(next, builtin, otherLitDisplays);
+}
+
+double nsCommandBrightnessRepeatGap(double seconds) {
+  // NaN fails this comparison, so it takes the floor too.
+  if (!(seconds >= 0.02)) {
+    return 0.02;
+  }
+  return seconds;
+}
+
+bool nsCommandBrightnessAppliesNow(bool release, bool builtin, bool ddcReady, bool ddcFailed,
+                                   long previous, long next, long floor) {
+  if (release) {
+    return true;
+  }
+  // Still being probed: the HUD waits for release, and so does this hold.
+  // An unconfirmed channel's write is DDC, and a repeat would queue one per tick.
+  if (!builtin && !ddcReady && !ddcFailed) {
+    return false;
+  }
+  if (!ddcReady || previous < 0 || next < 0) {
+    return true;
+  }
+  long beforeLamp = 0;
+  long afterLamp = 0;
+  long ignored = 0;
+  nsCombinedLevels(previous, floor, &beforeLamp, &ignored);
+  nsCombinedLevels(next, floor, &afterLamp, &ignored);
+  return beforeLamp == afterLamp;
+}
+
 bool nsCountsAsLit(NSOtherDisplay display) {
   if (display.asleep || display.mirrored) {
     return false;

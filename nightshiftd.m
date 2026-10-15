@@ -6705,6 +6705,11 @@ static OSStatus brightnessHotKey(EventHandlerCallRef next, EventRef event, void 
                         sizeof(hotKey), NULL, &hotKey) != noErr) {
     return eventNotHandledErr;
   }
+  // Cmd+F1 / Cmd+F2 use another signature. Without this they would also
+  // step through the plain brightness keys.
+  if (hotKey.signature != 'NShk') {
+    return eventNotHandledErr;
+  }
   deliverBrightness(hotKey.id == 1 ? 1 : -1);
   return noErr;
 }
@@ -6722,11 +6727,261 @@ static void registerBrightnessHotKeys(void) {
   }
 }
 
+// Cmd+F1 lowers, Cmd+F2 raises, on the display under the pointer.
+//
+// "Use F1, F2, etc. keys as standard function keys" on: the keyboard reports
+// F1 and F2, so Command arrives as kVK_F1 (122) / kVK_F2 (120) with cmdKey.
+// RegisterEventHotKey sees that. macOS may already own Cmd+F1 (mirroring)
+// or Cmd+F2; a failed registration is logged as its error code and skipped.
+//
+// The setting off: F1 and F2 are the brightness keys. Command does not turn
+// them into F1/F2. A built-in keyboard sends a media key
+// (NX_KEYTYPE_BRIGHTNESS_DOWN 3 / UP 2, system-defined subtype 8) with
+// Command set in the event flags. That is not a virtual key code.
+// RegisterEventHotKey cannot bind it, and this does not add an event tap.
+// Those presses stay on the existing brightness-key path. Keyboards that
+// send brightness as the plain key codes 145 (down) and 144 (up) do deliver
+// Command+those codes, so those two are registered as well.
+//
+// Carbon reports the chord once on press and once on release, with no
+// repeat. The hold repeats on the main queue. A repeat that would move a
+// DDC lamp, or that would write an unconfirmed channel, is not written.
+// The release writes once and is the only save, as with the slider.
+static EventHotKeyRef gCommandHotKeys[4];
+static EventHandlerRef gCommandHotKeyHandler = NULL;
+static int gCommandHoldGeneration = 0;
+static int gCommandHoldDirection = 0;
+static uint32_t gCommandHoldDisplay = 0;
+static long gCommandHoldPercent = -1;
+static BOOL gCommandHoldDirty = NO;
+
+static void commandBrightnessPresented(uint32_t display, long percent) {
+  long shown = percent;
+  long landed = readPercent(display);
+  if (landed >= 0) {
+    shown = landed;
+  }
+  rememberBuiltin();
+  refreshKeyDisplays();
+  showBrightnessHUD(display, shown);
+  if (gMenu != nil && gMenu.menuOpen && !gMenu.tracking) {
+    [gMenu refresh];
+  }
+}
+
+static void commandBrightnessClearHold(void) {
+  gCommandHoldDirection = 0;
+  gCommandHoldDisplay = 0;
+  gCommandHoldPercent = -1;
+  gCommandHoldDirty = NO;
+}
+
+// Main thread. release saves the value the hold already reached and does
+// not take another step. A repeat steps once.
+static void commandBrightnessTick(BOOL release) {
+  if (release) {
+    if (gCommandHoldDirty && gCommandHoldDisplay != 0 && gCommandHoldPercent >= 0) {
+      uint32_t display = gCommandHoldDisplay;
+      long percent = gCommandHoldPercent;
+      endBrightnessDrag(display, percent);
+      commandBrightnessPresented(display, percent);
+    }
+    commandBrightnessClearHold();
+    return;
+  }
+  if (gCommandHoldDirection == 0) {
+    return;
+  }
+  uint32_t display = displayUnderPointer();
+  if (gCommandHoldDisplay != 0 && display != gCommandHoldDisplay) {
+    if (gCommandHoldDirty && gCommandHoldPercent >= 0) {
+      endBrightnessDrag(gCommandHoldDisplay, gCommandHoldPercent);
+      commandBrightnessPresented(gCommandHoldDisplay, gCommandHoldPercent);
+    }
+    gCommandHoldDirty = NO;
+    gCommandHoldPercent = -1;
+    gCommandHoldDisplay = 0;
+  }
+  if (display == 0) {
+    return;
+  }
+  uint32_t builtin = builtinDisplay();
+  long currentBuiltin = readPercent(builtin);
+  if (display == builtin && gBuiltinPercent >= 0 && currentBuiltin >= 0 &&
+      currentBuiltin != gBuiltinPercent) {
+    gBuiltinPercent = currentBuiltin;
+    gCommandHoldDisplay = display;
+    gCommandHoldPercent = currentBuiltin;
+    showBrightnessHUD(display, currentBuiltin);
+    if (gMenu != nil && gMenu.menuOpen && !gMenu.tracking) {
+      [gMenu refresh];
+    }
+    return;
+  }
+  if (display != builtin && gBuiltinPercent >= 0 && currentBuiltin >= 0 &&
+      currentBuiltin != gBuiltinPercent) {
+    setDisplayBrightness(builtin, gBuiltinPercent);
+  }
+  if (gCommandHoldPercent < 0 || gCommandHoldDisplay != display) {
+    long percent = readPercent(display);
+    if (percent < 0) {
+      return;
+    }
+    gCommandHoldPercent = percent;
+    gCommandHoldDisplay = display;
+  }
+  BOOL ddc = ddcReady(display);
+  long previous = gCommandHoldPercent;
+  long stops = nsCommandBrightnessStops(ddc);
+  long stepped = nsSteppedPercent(previous, gCommandHoldDirection, stops);
+  if (!ddc) {
+    stepped = softwareDimPercent(display, stepped);
+  }
+  BOOL builtinPanel = CGDisplayIsBuiltin(display) != 0;
+  int others = builtinPanel ? 0 : otherLitDisplayCount(display);
+  long next = nsSafeBrightness(stepped, builtinPanel, others);
+  if (next != previous) {
+    gCommandHoldDirty = YES;
+  }
+  gCommandHoldPercent = next;
+  gCommandHoldDisplay = display;
+  BOOL failed = ddcFailed(display);
+  if (!nsCommandBrightnessAppliesNow(NO, builtinPanel, ddc, failed, previous, next,
+                                     ddcBrightnessFloor(display)) ||
+      next == previous) {
+    if (next != previous) {
+      showBrightnessHUD(display, next);
+    }
+    return;
+  }
+  // Same path as the brightness keys and the slider: setDisplayBrightnessThen,
+  // held in memory. The release is the save.
+  holdBrightnessTick(display, next);
+  long landed = readPercent(display);
+  if (landed >= 0) {
+    gCommandHoldPercent = landed;
+  }
+  commandBrightnessPresented(display, gCommandHoldPercent);
+}
+
+static void scheduleCommandBrightnessRepeat(int generation, BOOL first) {
+  NSTimeInterval seconds = first ? NSEvent.keyRepeatDelay : NSEvent.keyRepeatInterval;
+  double gap = nsCommandBrightnessRepeatGap(seconds);
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(gap * NSEC_PER_SEC)),
+                 dispatch_get_main_queue(), ^{
+                   if (generation != gCommandHoldGeneration || gCommandHoldDirection == 0) {
+                     return;
+                   }
+                   commandBrightnessTick(NO);
+                   scheduleCommandBrightnessRepeat(generation, NO);
+                 });
+}
+
+static void commandBrightnessHotKeyOnMain(UInt32 kind, EventHotKeyID hotKey) {
+  int direction = nsCommandBrightnessDirection(hotKey.id);
+  if (direction == 0) {
+    return;
+  }
+  if (kind == kEventHotKeyReleased) {
+    if (direction != gCommandHoldDirection) {
+      return;
+    }
+    gCommandHoldGeneration++;
+    commandBrightnessTick(YES);
+    return;
+  }
+  if (kind != kEventHotKeyPressed) {
+    return;
+  }
+  if (gCommandHoldDirection == direction) {
+    return;
+  }
+  if (gCommandHoldDirection != 0) {
+    gCommandHoldGeneration++;
+    commandBrightnessTick(YES);
+  }
+  gCommandHoldDirection = direction;
+  gCommandHoldGeneration++;
+  int generation = gCommandHoldGeneration;
+  commandBrightnessTick(NO);
+  scheduleCommandBrightnessRepeat(generation, YES);
+}
+
+static OSStatus commandBrightnessHotKey(EventHandlerCallRef next, EventRef event, void *user) {
+  (void)next;
+  (void)user;
+  EventHotKeyID hotKey;
+  if (GetEventParameter(event, kEventParamDirectObject, typeEventHotKeyID, NULL, sizeof(hotKey),
+                        NULL, &hotKey) != noErr) {
+    return eventNotHandledErr;
+  }
+  if (hotKey.signature != 'NScm') {
+    return eventNotHandledErr;
+  }
+  UInt32 kind = GetEventKind(event);
+  if (![NSThread isMainThread]) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+      commandBrightnessHotKeyOnMain(kind, hotKey);
+    });
+    return noErr;
+  }
+  commandBrightnessHotKeyOnMain(kind, hotKey);
+  return noErr;
+}
+
+static void registerCommandBrightnessHotKeys(void) {
+  if (gCommandHotKeyHandler != NULL) {
+    return;
+  }
+  EventTypeSpec types[2] = {
+      {kEventClassKeyboard, kEventHotKeyPressed},
+      {kEventClassKeyboard, kEventHotKeyReleased},
+  };
+  EventHandlerRef handler = NULL;
+  OSStatus err = InstallApplicationEventHandler(commandBrightnessHotKey, 2, types, NULL, &handler);
+  if (err != noErr) {
+    NSLog(@"%d", (int)err);
+    return;
+  }
+  gCommandHotKeyHandler = handler;
+  // F1 down, F2 up, then the plain brightness key codes with Command.
+  const UInt32 codes[4] = {kVK_F1, kVK_F2, 145, 144};
+  const UInt32 ids[4] = {1, 2, 1, 2};
+  for (UInt32 i = 0; i < 4; i++) {
+    EventHotKeyID hotKey = {'NScm', ids[i]};
+    EventHotKeyRef ref = NULL;
+    err = RegisterEventHotKey(codes[i], cmdKey, hotKey, GetApplicationEventTarget(), 0, &ref);
+    if (err != noErr) {
+      NSLog(@"%d", (int)err);
+      continue;
+    }
+    gCommandHotKeys[i] = ref;
+  }
+}
+
+static void unregisterCommandBrightnessHotKeys(void) {
+  gCommandHoldGeneration++;
+  if (gCommandHoldDirection != 0) {
+    commandBrightnessTick(YES);
+  }
+  for (int i = 0; i < 4; i++) {
+    if (gCommandHotKeys[i] != NULL) {
+      UnregisterEventHotKey(gCommandHotKeys[i]);
+      gCommandHotKeys[i] = NULL;
+    }
+  }
+  if (gCommandHotKeyHandler != NULL) {
+    RemoveEventHandler(gCommandHotKeyHandler);
+    gCommandHotKeyHandler = NULL;
+  }
+}
+
 static void startBrightnessKeys(void) {
   if (!gHIDWatching) {
     gHIDWatching = YES;
     watchHIDBrightness();
     registerBrightnessHotKeys();
+    registerCommandBrightnessHotKeys();
     rememberBuiltin();
     probeDDC();
   }
@@ -6817,6 +7072,7 @@ static void teardownDaemon(void) {
     return;
   }
   done = YES;
+  unregisterCommandBrightnessHotKeys();
   settleBrightnessOnQuit();
   gBlackCursorCount = 0;
   cancelCursorHide();
