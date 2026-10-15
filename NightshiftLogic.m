@@ -570,6 +570,14 @@ int nsMediaBrightnessKey(long data1, bool *down) {
   return code == 2 ? 1 : code == 3 ? -1 : 0;
 }
 
+uint64_t nsMediaTapMaskBits(void) {
+  return (uint64_t)1 << 14;
+}
+
+bool nsMediaTapMaskAllowed(uint64_t bits) {
+  return bits == nsMediaTapMaskBits();
+}
+
 double nsTapRecoveryDelay(bool trusted, int recent) {
   if (!trusted || recent > 5) {
     return -1;
