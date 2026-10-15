@@ -816,7 +816,8 @@ static bool ddcIOToken(int state, int code, char *out, size_t cap) {
 }
 
 bool nsDDCReplyLine(uint32_t display, int writeState, int writeCode, int readState, int readCode,
-                    const uint8_t *bytes, int count, char *out, size_t cap) {
+                    const uint8_t *bytes, int count, const char *servicePath,
+                    const uint8_t *outbound, int outboundCount, char *out, size_t cap) {
   if (out == NULL || cap == 0) {
     return false;
   }
@@ -841,6 +842,36 @@ bool nsDDCReplyLine(uint32_t display, int writeState, int writeCode, int readSta
   }
   for (int i = 0; i < 12; i++) {
     int next = snprintf(out + wrote, cap - (size_t)wrote, " %02x", raw[i]);
+    if (next < 0 || (size_t)next >= cap - (size_t)wrote) {
+      out[0] = '\0';
+      return false;
+    }
+    wrote += next;
+  }
+  const char *path = (servicePath != NULL && servicePath[0] != '\0') ? servicePath : "-";
+  int next = snprintf(out + wrote, cap - (size_t)wrote, " path=%s", path);
+  if (next < 0 || (size_t)next >= cap - (size_t)wrote) {
+    out[0] = '\0';
+    return false;
+  }
+  wrote += next;
+  if (outbound == NULL || outboundCount <= 0) {
+    next = snprintf(out + wrote, cap - (size_t)wrote, " out=-");
+    if (next < 0 || (size_t)next >= cap - (size_t)wrote) {
+      out[0] = '\0';
+      return false;
+    }
+    return true;
+  }
+  next = snprintf(out + wrote, cap - (size_t)wrote, " out=");
+  if (next < 0 || (size_t)next >= cap - (size_t)wrote) {
+    out[0] = '\0';
+    return false;
+  }
+  wrote += next;
+  int n = outboundCount > 8 ? 8 : outboundCount;
+  for (int i = 0; i < n; i++) {
+    next = snprintf(out + wrote, cap - (size_t)wrote, "%s%02x", i == 0 ? "" : " ", outbound[i]);
     if (next < 0 || (size_t)next >= cap - (size_t)wrote) {
       out[0] = '\0';
       return false;
@@ -913,9 +944,10 @@ int nsDDCDebugReport(const uint32_t *displays, const int *builtin, int displayCo
     used += (size_t)wrote;
     lines++;
     if (row != NULL && row->haveReply) {
-      char reply[160];
+      char reply[768];
       if (!nsDDCReplyLine(displays[i], row->writeState, row->writeCode, row->readState,
-                          row->readCode, row->reply, 12, reply, sizeof(reply))) {
+                          row->readCode, row->reply, 12, row->servicePath, row->outbound,
+                          row->outboundCount, reply, sizeof(reply))) {
         continue;
       }
       wrote = snprintf(out + used, cap - used, "%s\n", reply);
