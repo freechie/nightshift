@@ -29,11 +29,22 @@ ZIP := $(DIST)/Nightshift.zip
 
 all: nightshift nightshiftd $(BUNDLED)
 
-test: nightshift nightshift-tests logic-tests server-test license-server-check
+test: secret-scan workspace-open-check nightshift nightshift-tests logic-tests server-test license-server-check
 	./nightshift-tests
 	./logic-tests
 	sh tests/cli.sh
 	sh tests/license-server.sh
+
+# Stripe-shaped values in the tracked tree, and the webhook source of truth.
+# Prints file, line, and key name, never the value. server/.env is ignored.
+secret-scan:
+	sh scripts/scan-secrets.sh tree
+	sh scripts/scan-secrets.sh self-test
+	sh scripts/check-server-webhook.sh
+
+# One NSWorkspace openURL:, and it calls both license verdicts.
+workspace-open-check:
+	sh scripts/check-workspace-open.sh
 
 # The license server's tests: test.js needs only Node; prove.js also runs
 # the license command of nightshift-testkey. Both sign with a throwaway key.
@@ -101,4 +112,4 @@ hooks:
 icon-lab:
 	open prototype/icon/index.html
 
-.PHONY: all test server-test install package clean hooks icon-lab
+.PHONY: all test server-test install package clean hooks icon-lab secret-scan workspace-open-check
