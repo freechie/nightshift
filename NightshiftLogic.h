@@ -189,6 +189,22 @@ long nsCommandWarmthNext(long percent, int direction);
 // spin the run loop if the system repeat interval is tiny.
 double nsCommandWarmthRepeatGap(double seconds);
 
+// A media brightness key (fnState off: Command does not become F1/F2) and
+// the Carbon hotkey can both observe one physical press. The hotkey does
+// not repeat. The media key does, and it has its own down and up. Begin
+// steps once and starts the hold. Repeat, or another down while that
+// direction is already held, does not step: the hold timer does. A repeat
+// with nothing held does not start a hold. End saves once. A release that
+// is not the held direction does not save again.
+typedef enum {
+  kNSWarmthMediaIgnore = 0,
+  kNSWarmthMediaBegin,
+  kNSWarmthMediaRepeat,
+  kNSWarmthMediaEnd,
+} NSWarmthMediaAction;
+NSWarmthMediaAction nsCommandWarmthMediaAction(int direction, bool down, bool repeat,
+                                               int heldDirection);
+
 // Another online display, as seen when deciding whether one may go black.
 typedef struct {
   bool builtin;   // the built-in panel
@@ -257,12 +273,40 @@ bool nsPurchaseURLAllowed(const char *url, size_t length);
 // the project pages are exact strings.
 bool nsWorkspaceOpenAllowed(const char *url, size_t length, bool allowLoopbackHTTP);
 
+// Device-independent modifier bits, the same positions as CGEventFlags.
+// Caps lock, numeric pad, and the device-dependent low bits are not a chord:
+// Command alone still steps intensity when those are set.
+enum {
+  kNSModifierShift = 1 << 17,
+  kNSModifierControl = 1 << 18,
+  kNSModifierOption = 1 << 19,
+  kNSModifierCommand = 1 << 20,
+  kNSModifierHelp = 1 << 22,
+  kNSModifierFunction = 1 << 23,
+};
+
+// What the session tap does with a subtype-8 media key. Command alone on a
+// brightness key is the Cmd+F1 / Cmd+F2 intensity chord (fnState off, where
+// RegisterEventHotKey never sees F1/F2). No Command stays on brightness,
+// whatever else is held. Command plus Shift, Control, Option, Help, or
+// Function is left untouched. Any other key (volume, mute) is None.
+typedef enum {
+  kNSMediaRouteNone = 0,
+  kNSMediaRouteBrightness = 1,
+  kNSMediaRouteIntensity = 2,
+  kNSMediaRouteUntouched = 3,
+} NSMediaRoute;
+NSMediaRoute nsMediaBrightnessRoute(long data1, uint64_t modifierFlags, bool *down);
+
 // A media key (NX_SYSDEFINED, subtype 8) from its data1: the key code is
 // bits 16-31, the state bits 8-15 (0xA down, 0xB up). Returns 1 for
 // brightness up (code 2), -1 for brightness down (code 3), 0 for any other
 // key (volume up 0, down 1, mute 7, play...), which must reach macOS
 // unchanged. *down is set for a press or repeat.
 int nsMediaBrightnessKey(long data1, bool *down);
+// Low byte of data1. 0 is the first press or the release. Any other value
+// is a repeat while the key is held. Direction ignores it.
+bool nsMediaKeyRepeat(long data1);
 
 // Mask for the one Session tap: event type 14 (system-defined) and nothing
 // else. Bit 10 is key-down and is not set. Volume and mute use this same
