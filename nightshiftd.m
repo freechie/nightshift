@@ -1738,17 +1738,53 @@ static long ddcFloorPercent(uint32_t display);
 static int ddcLampValue(DDCSlot *slot, long percent, long floor, int scale);
 static void combinedLevels(long percent, long floor, long *hardware, long *software);
 static BOOL ddcNear(int got, int want, int scale);
+static BOOL displayWasRestored(uint32_t display);
+// Raw VCP reads and writes. Not readDisplayBrightness: that returns the
+// saved slider value (slot->combined) and would make this probe look green
+// without the panel moving.
+static bool ddcProbeRead(void *ctx, int *current, int *max);
+static bool ddcProbeWrite(void *ctx, int value);
 
 static BOOL setDisplayBrightness(uint32_t display, long percent);
+
+// The percent the user asked for. The slot's combined value when a drag set
+// one, otherwise the session or saved number. Not the lamp reading: listing
+// displays from that reading is what made a stuck panel look like it moved.
+// -1 when Nightshift has no number for it yet.
+static long rememberedBrightness(uint32_t display) {
+  DDCSlot *slot = ddcSlot(display);
+  if (slot != NULL && slot->combined >= 0 && slot->combined <= 100) {
+    return slot->combined;
+  }
+  NSNumber *saved = nil;
+  if (gSoftwareBrightness != nil) {
+    saved = gSoftwareBrightness[@(display)];
+  }
+  if (saved == nil && gBrightnessSaved != nil) {
+    saved = gBrightnessSaved[displayBrightnessKey(display)];
+  }
+  if (saved == nil) {
+    return -1;
+  }
+  long percent = (long)llround(saved.doubleValue * 100.0);
+  if (percent < 0) {
+    return 0;
+  }
+  if (percent > 100) {
+    return 100;
+  }
+  return percent;
+}
 
 static double secondsSince(CFAbsoluteTime at) {
   return at == 0 ? -1 : CFAbsoluteTimeGetCurrent() - at;
 }
 
-// Main thread. A probe re-read a channel that was already confirmed (after
-// wake, replug or a screen change). The service is always the fresh one, so
-// a dead IOAVService from before the change is dropped. A failed read keeps
-// the confirmed scale: the first write that fails demotes it (ddcLanded).
+// Main thread. A probe proved this channel still follows writes (after wake,
+// replug or a screen change) and re-read it. The service is always the fresh
+// one, so a dead IOAVService from before the change is dropped. A probe that
+// did not prove control is not delivered here; the caller marks that display
+// software-only.
 //
 // N9: the slot is refreshed in place. It is not republished, which would
 // bump seq (dropping a just-released drag's settle and save) and clear
@@ -1867,21 +1903,23 @@ static void probeDDC(void) {
     DDCResult *results = pending > 0 ? calloc((size_t)pending, sizeof(DDCResult)) : NULL;
     for (int i = 0; i < pending; i++) {
       IOAVServiceRef service = serviceMatching(&wanted[i]);
-      int current = 0;
-      int max = 0;
-      BOOL ok = NO;
+      results[i].display = targets[i];
+      results[i].service = service;
+      results[i].current = 0;
+      results[i].max = -1;
+      // A readable VCP is not control. Nudge the panel and require the next
+      // raw read to come back as that value. Wake, replug and a screen
+      // change all come through here, so a monitor is not trusted forever
+      // from the first launch.
       if (service != NULL) {
-        for (int attempt = 0; attempt < 4 && !ok; attempt++) {
-          if (attempt > 0) {
-            usleep(kDDCBetweenReads);
-          }
-          ok = ddcReadOnce(service, &current, &max);
+        int current = 0;
+        int max = 0;
+        NSDDCProbeIO io = {ddcProbeRead, ddcProbeWrite, (void *)service};
+        if (nsDDCProbeControl(&io, &current, &max) == kNSDDCProbeControllable && max > 0) {
+          results[i].current = current;
+          results[i].max = max;
         }
       }
-      results[i].display = targets[i];
-      results[i].current = ok ? current : 0;
-      results[i].max = ok ? max : (service != NULL ? 0 : -1);
-      results[i].service = service;
     }
     dispatch_async(dispatch_get_main_queue(), ^{
       for (int i = 0; i < pending; i++) {
@@ -1903,13 +1941,36 @@ static void probeDDC(void) {
         if (results[i].service == NULL && ddcHasService(results[i].display)) {
           continue;
         }
-        if (snapshotReady(&seen, results[i].display)) {
+        if (results[i].max > 0 && snapshotReady(&seen, results[i].display)) {
           revalidateDDC(results[i].display, results[i].service, results[i].current,
                         results[i].max);
           continue;
         }
-        publishDDC(results[i].display, results[i].service, results[i].current,
-                   results[i].max);
+        if (results[i].max > 0) {
+          // Was software-only and now answers. Push the saved percent through
+          // the backlight path. The first probe leaves that to
+          // restoreSavedBrightness, which has not marked the display yet.
+          BOOL restored = displayWasRestored(results[i].display);
+          long shown = restored ? rememberedBrightness(results[i].display) : -1;
+          publishDDC(results[i].display, results[i].service, results[i].current,
+                     results[i].max);
+          if (restored && shown >= 0) {
+            setDisplayBrightness(results[i].display, shown);
+          }
+          continue;
+        }
+        // Unchanged readback, or the read/write failed: software dimming
+        // only. Drop the service so later slider moves do not write DDC.
+        long shown = rememberedBrightness(results[i].display);
+        BOOL wasReady = snapshotReady(&seen, results[i].display);
+        if (results[i].service != NULL) {
+          CFRelease(results[i].service);
+          results[i].service = NULL;
+        }
+        publishDDC(results[i].display, NULL, 0, -1);
+        if (wasReady && shown >= 0) {
+          setDisplayBrightness(results[i].display, shown);
+        }
       }
       free(results);
       gDDCBusy = NO;
@@ -1967,6 +2028,23 @@ static BOOL ddcWriteOnce(IOAVServiceRef service, int value) {
   }
   gDDCWroteAt = ddcNow();
   return wrote;
+}
+
+static bool ddcProbeRead(void *ctx, int *current, int *max) {
+  IOAVServiceRef service = (IOAVServiceRef)ctx;
+  for (int attempt = 0; attempt < 4; attempt++) {
+    if (attempt > 0) {
+      usleep(kDDCBetweenReads);
+    }
+    if (ddcReadOnce(service, current, max)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool ddcProbeWrite(void *ctx, int value) {
+  return ddcWriteOnce((IOAVServiceRef)ctx, value) ? true : false;
 }
 
 static BOOL ddcCommit(DDCSlot *slot, int current, int max) {
@@ -2241,12 +2319,15 @@ static BOOL shadeLogical(uint32_t display, float *level) {
   return YES;
 }
 
-static const long kSoftwareDimFloor = 10;
-
+// Software-only displays follow the slider across the whole 0-100 range.
+// A controllable backlight keeps the combined split instead.
 static long softwareDimPercent(uint32_t display, long percent) {
-  if (percent < kSoftwareDimFloor && ddcFailed(display) &&
-      !DisplayServicesCanChangeBrightness(display)) {
-    return kSoftwareDimFloor;
+  (void)display;
+  if (percent < 0) {
+    return 0;
+  }
+  if (percent > 100) {
+    return 100;
   }
   return percent;
 }
@@ -2266,15 +2347,12 @@ static BOOL finishBrightnessAs(uint32_t display, long percent, int saving) {
 }
 
 // Main thread. An unconfirmed channel refused the write: the shade does all
-// of the dimming, never below kSoftwareDimFloor.
+// of the dimming, across the whole slider range.
 static BOOL shadeInstead(uint32_t display, long percent, int saving) {
   if (screenForDisplay(display) == nil) {
     return NO;
   }
   restoreGamma(display);
-  if (percent < kSoftwareDimFloor) {
-    percent = kSoftwareDimFloor;
-  }
   applyDim(display, percent);
   return finishBrightnessAs(display, percent, saving);
 }
@@ -2559,7 +2637,8 @@ static BOOL setDisplayBrightnessThen(uint32_t display, long percent, BrightnessD
   // after it.
   if (done != nil) {
     dropDisplayPercent(&gDeferredBrightness, display);
-  } else if (gDDCBusy && ddcUnconfirmed(display) && putDisplayPercent(&gDeferredBrightness, display, percent)) {
+  } else if (gDDCBusy && (ddcUnconfirmed(display) || ddcPending(display)) &&
+             putDisplayPercent(&gDeferredBrightness, display, percent)) {
     if (gSoftwareBrightness == nil) {
       gSoftwareBrightness = [NSMutableDictionary dictionary];
     }
@@ -2569,7 +2648,7 @@ static BOOL setDisplayBrightnessThen(uint32_t display, long percent, BrightnessD
   long floor = ddcFloorPercent(display);
   long hardware = percent;
   long software = 100;
-  combinedLevels(percent, floor, &hardware, &software);
+  nsExternalBrightness(kNSDDCProbeControllable, percent, floor, &hardware, &software);
   DDCSlot *slot = ddcSlot(display);
   // A confirmed channel is optimistic: shade, number and save happen now and
   // the worker brings the lamp along.
@@ -2616,8 +2695,9 @@ static BOOL setDisplayBrightnessThen(uint32_t display, long percent, BrightnessD
   }
   if (ddcFailed(display) && screenForDisplay(display) != nil) {
     restoreGamma(display);
-    percent = softwareDimPercent(display, percent);
-    applyDim(display, percent);
+    nsExternalBrightness(kNSDDCProbeSoftware, percent, floor, &hardware, &software);
+    percent = software;
+    applyDim(display, software);
     ok = finishBrightness(display, percent);
   } else if (screenForDisplay(display) != nil) {
     return NO;
@@ -3145,7 +3225,9 @@ static void showBrightnessHUD(uint32_t display, long percent) {
         return;
       }
       gBrightnessScrubPending = value;
-      if (!CGDisplayIsBuiltin(display) && !ddcReady(display)) {
+      // Software-only dimming is a local gamma change, so the drag follows
+      // the knob. A display still being probed waits until release.
+      if (!CGDisplayIsBuiltin(display) && !ddcReady(display) && !ddcFailed(display)) {
         return;
       }
       holdBrightnessTick(display, value);
@@ -4706,7 +4788,7 @@ static void openBrightnessKeyAccess(void) {
   self.brightRows = brightRows;
   self.displayRows = [NSMutableArray array];
   NSTextField *ddcNote = [NSTextField
-      wrappingLabelWithString:@"Turn on DDC/CI in the monitor menu to change the backlight."];
+      wrappingLabelWithString:@"Software dimming. This display's backlight is not controllable over DDC."];
   ddcNote.font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize];
   ddcNote.textColor = NSColor.secondaryLabelColor;
   ddcNote.preferredMaxLayoutWidth = kMenuContentWidth;
@@ -6283,7 +6365,8 @@ static void displayKind(uint32_t display, NSString **text, NSColor **color) {
     *text = @"Built-in backlight";
     *color = NSColor.secondaryLabelColor;
   } else if (ddcReady(display)) {
-    *text = @"DDC/CI connected";
+    // Only after the write/readback probe passed. A bare VCP read is not this.
+    *text = [NSString stringWithUTF8String:nsDDCControlLabel(kNSDDCProbeControllable)];
     *color = NSColor.systemGreenColor;
   } else if (ddcPending(display) || ddcUnconfirmed(display)) {
     *text = @"Checking DDC/CI…";
@@ -6292,7 +6375,7 @@ static void displayKind(uint32_t display, NSString **text, NSColor **color) {
     *text = @"Backlight";
     *color = NSColor.secondaryLabelColor;
   } else {
-    *text = @"Dimming overlay";
+    *text = [NSString stringWithUTF8String:nsDDCControlLabel(kNSDDCProbeSoftware)];
     *color = NSColor.systemOrangeColor;
   }
 }
@@ -6314,6 +6397,7 @@ static NSString *displaySignature(uint32_t *ids, int count) {
   [self addWords:@"Brightness"];
   [self addWords:@"Display"];
   [self addWords:@"DDC/CI"];
+  [self addWords:@"Software dimming"];
 
   self.keysButton = [NSButton buttonWithTitle:@"Open Accessibility Settings…"
                                        target:nil
@@ -6336,9 +6420,9 @@ static NSString *displaySignature(uint32_t *ids, int count) {
   NSView *keys = [self section:@"Keyboard"
                      accessory:nil
                           rows:@[ keysRow ]
-                        footer:@"The lower half of the range dims the picture after the "
-                               @"backlight is as low as it will go. Turn on DDC/CI in the "
-                               @"monitor's menu to change an external display's backlight."];
+                        footer:@"When the backlight answers over DDC, the lower half of the range "
+                               @"dims the picture after the backlight is as low as it will go. "
+                               @"Otherwise the whole range is software dimming."];
   NSStackView *stack = nil;
   NSScrollView *page = [self pageWithSections:@[ keys ] stack:&stack];
   self.displaysStack = stack;
@@ -7577,7 +7661,7 @@ static NSImage *sidebarTile(NSInteger pane, CGFloat size) {
   [self.settings showBrightness:value forDisplay:display];
   if (!settled) {
     self.settings.trackingDisplay = display;
-    if (CGDisplayIsBuiltin(display) || ddcReady(display)) {
+    if (CGDisplayIsBuiltin(display) || ddcReady(display) || ddcFailed(display)) {
       holdBrightnessTick(display, value);
     }
     return;
@@ -7797,7 +7881,7 @@ static NSImage *sidebarTile(NSInteger pane, CGFloat size) {
   // ends it too rather than holding a value nothing would save.
   if (!sliderSettled() && self.menuOpen) {
     self.panel.trackingDisplay = display;
-    if (CGDisplayIsBuiltin(display) || ddcReady(display)) {
+    if (CGDisplayIsBuiltin(display) || ddcReady(display) || ddcFailed(display)) {
       holdBrightnessTick(display, value);
     }
     return;
@@ -7891,8 +7975,16 @@ static NSRect menuBarIconFrame(void) {
 }
 
 static void refreshMenu(void) {
+  if (gMenu == nil) {
+    return;
+  }
   [gMenu syncStatusItem];
-  if (gMenu == nil || !gMenu.menuOpen) {
+  // The probe finishes on the main queue. Refresh an open Settings window
+  // so the connected / software-dimming label updates with the result.
+  if (gMenu.settings.window.isVisible && gMenu.settings.trackingDisplay == 0) {
+    [gMenu.settings syncDisplays];
+  }
+  if (!gMenu.menuOpen) {
     return;
   }
   [gMenu refresh];

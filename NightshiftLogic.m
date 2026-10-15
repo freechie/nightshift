@@ -285,6 +285,113 @@ void nsCombinedLevels(long percent, long floor, long *hardware, long *software) 
   *software = kNSShadeFloor + (percent * (100 - kNSShadeFloor)) / kNSCombinedSwitch;
 }
 
+// MARK: Proving a monitor follows DDC
+
+int nsDDCProbeTarget(int current, int max) {
+  if (max < 1 || current < 0 || current > max) {
+    return -1;
+  }
+  int steps[2] = {2, 1};
+  for (int i = 0; i < 2; i++) {
+    int step = steps[i];
+    if (current + step <= max) {
+      return current + step;
+    }
+    if (current - step >= 0) {
+      return current - step;
+    }
+  }
+  return -1;
+}
+
+bool nsDDCProbeLanded(int before, int written, int after) {
+  if (written == before || after == before) {
+    return false;
+  }
+  return after == written;
+}
+
+NSDDCProbeVerdict nsDDCProbeControl(const NSDDCProbeIO *io, int *currentOut, int *maxOut) {
+  if (currentOut != NULL) {
+    *currentOut = 0;
+  }
+  if (maxOut != NULL) {
+    *maxOut = 0;
+  }
+  if (io == NULL || io->read == NULL || io->write == NULL) {
+    return kNSDDCProbeSoftware;
+  }
+  int before = 0;
+  int scale = 0;
+  if (!io->read(io->ctx, &before, &scale) || scale <= 0 || before < 0 || before > scale) {
+    return kNSDDCProbeSoftware;
+  }
+  if (currentOut != NULL) {
+    *currentOut = before;
+  }
+  if (maxOut != NULL) {
+    *maxOut = scale;
+  }
+  int target = nsDDCProbeTarget(before, scale);
+  if (target < 0 || !io->write(io->ctx, target)) {
+    return kNSDDCProbeSoftware;
+  }
+  // A slow panel can report the pre-write value once. Keep reading until one
+  // sample is the value just written, or four tries are used up. A cached
+  // read stays on the first value for every try and does not pass.
+  bool landed = false;
+  for (int attempt = 0; attempt < 4; attempt++) {
+    int after = 0;
+    int scaleAfter = 0;
+    if (!io->read(io->ctx, &after, &scaleAfter)) {
+      continue;
+    }
+    if (scaleAfter == scale && nsDDCProbeLanded(before, target, after)) {
+      landed = true;
+      break;
+    }
+  }
+  // The nudge already went out. Put the original back whether or not a
+  // confirmation read proved the panel moved.
+  (void)io->write(io->ctx, before);
+  return landed ? kNSDDCProbeControllable : kNSDDCProbeSoftware;
+}
+
+const char *nsDDCControlLabel(NSDDCProbeVerdict verdict) {
+  if (verdict == kNSDDCProbeControllable) {
+    return "DDC/CI connected";
+  }
+  return "Software dimming";
+}
+
+void nsExternalBrightness(NSDDCProbeVerdict verdict, long percent, long floor, long *hardware,
+                          long *software) {
+  if (percent < 0) {
+    percent = 0;
+  }
+  if (percent > 100) {
+    percent = 100;
+  }
+  if (verdict != kNSDDCProbeControllable) {
+    if (hardware != NULL) {
+      *hardware = -1;
+    }
+    if (software != NULL) {
+      *software = percent;
+    }
+    return;
+  }
+  long lamp = 0;
+  long shade = 100;
+  nsCombinedLevels(percent, floor, &lamp, &shade);
+  if (hardware != NULL) {
+    *hardware = lamp;
+  }
+  if (software != NULL) {
+    *software = shade;
+  }
+}
+
 long nsSteppedPercent(long percent, int direction, long stops) {
   long steps = (percent * stops + stops / 2) / 100 + direction;
   if (steps < 0) {
