@@ -1594,6 +1594,39 @@ static void checkProbe(void) {
   CHECK_EQ(current, 0);
   CHECK_EQ(max, 0);
   io.idle = NULL;
+
+  // A long service path makes two reply lines longer than 512 bytes. The
+  // report keeps both when the buffer can hold them.
+  {
+    char longPath[181];
+    memset(longPath, 'p', 180);
+    longPath[180] = '\0';
+    NSDDCDebugRow wide[2];
+    memset(wide, 0, sizeof(wide));
+    wide[0].display = 3;
+    wide[0].service = 0;
+    wide[0].verdict = kNSDDCProbeSoftware;
+    wide[0].evidence = kNSDDCEvidenceNone;
+    wide[0].haveReply = true;
+    wide[0].writeState = kNSDDCIOCode;
+    wide[0].readState = kNSDDCIOCode;
+    snprintf(wide[0].servicePath, sizeof(wide[0].servicePath), "IOService:/%s", longPath);
+    wide[1].display = 2;
+    wide[1].service = 1;
+    wide[1].verdict = kNSDDCProbeSoftware;
+    wide[1].evidence = kNSDDCEvidenceNone;
+    wide[1].haveReply = true;
+    wide[1].writeState = kNSDDCIOCode;
+    wide[1].readState = kNSDDCIOCode;
+    snprintf(wide[1].servicePath, sizeof(wide[1].servicePath), "IOService:/%s", longPath);
+    char big[4096];
+    char small[512];
+    CHECK(nsDDCDebugReport(displays, builtin, 3, wide, 2, big, sizeof(big)) == 4);
+    CHECK(strstr(big, "ddc reply 3 ") != NULL);
+    CHECK(strstr(big, "ddc reply 2 ") != NULL);
+    CHECK(nsDDCDebugReport(displays, builtin, 3, wide, 2, small, sizeof(small)) == -1);
+    CHECK(strstr(small, "ddc reply 2 ") == NULL);
+  }
   NSDDCProbeFacts timed;
   memset(&timed, 0, sizeof(timed));
   timed.evidence = kNSDDCEvidenceTimedOut;
