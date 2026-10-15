@@ -193,11 +193,10 @@ int nsDDCProbeTarget(int current, int max);
 // tolerance, so a cached read of the old value would look close enough.
 bool nsDDCProbeLanded(int before, int written, int after);
 // One IOAVServiceReadI2C buffer. valid is a checksum-valid capabilities
-// (opcode 0xE3) or VCP (opcode 0x02) frame. The checksum seed is 0x50, never
-// 0x6E. The length byte keeps its 0x80 flag in the checksum and the low 7
-// bits are the count. A leading 0x50 or 0x51 is an offset byte, not part of
-// the frame. The address may be 0x6E, 0x6F, or missing (the buffer starts at
-// the length byte). brightness is set only for VCP 0x10, result 0, with
+// (opcode 0xE3) or VCP (opcode 0x02) frame. The checksum is 0x50 XOR every
+// byte except the last, and it must equal the last byte. The length byte may
+// be 0x51: that is the data address echoed by a read at 0x51, not a reason to
+// reject the frame. brightness is set only for VCP 0x10, result 0, with
 // current inside max.
 typedef struct {
   bool valid;

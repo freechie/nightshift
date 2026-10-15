@@ -458,6 +458,19 @@ static bool ddcConsider(const uint8_t *bytes, int count, int start, NSDDCReply *
   return false;
 }
 
+// m1ddc's 12-byte read: the last byte is the checksum of everything before
+// it, seeded with 0x50. The length byte may be 0x51.
+static bool ddcM1Reply(const uint8_t *bytes, int count, NSDDCReply *out) {
+  if (count < 4 || ddcXor(0x50, bytes, 0, count - 2) != bytes[count - 1]) {
+    return false;
+  }
+  int lenIndex = 0;
+  if (bytes[0] == 0x6E || bytes[0] == 0x6F || bytes[0] == 0x6e) {
+    lenIndex = 1;
+  }
+  return ddcTake(bytes, count, 0, lenIndex, count - 1, out);
+}
+
 bool nsDDCDecodeReply(const uint8_t *bytes, int count, NSDDCReply *out) {
   if (out == NULL) {
     return false;
@@ -468,6 +481,9 @@ bool nsDDCDecodeReply(const uint8_t *bytes, int count, NSDDCReply *out) {
   out->max = 0;
   if (bytes == NULL || count < 4) {
     return false;
+  }
+  if (ddcM1Reply(bytes, count, out)) {
+    return true;
   }
   // Only the front of the buffer. A checksum that appears later is not a
   // reply, and must not turn a write-only link into a brightness reading.

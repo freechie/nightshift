@@ -18,7 +18,7 @@ LOCKED = (
     "for (int cycle = 0; cycle < 2; cycle++)",
     "for (int attempt = 0; attempt < 4; attempt++)",
     "usleep(10000);",
-    "usleep(50000);",
+    "usleep(kDDCReadGap);",
     "usleep(kDDCBetweenReads);",
     "usleep(kDDCRecheck);",
     "slot->retries < 2",

@@ -1422,6 +1422,21 @@ static void checkProbe(void) {
   CHECK_EQ(decoded.current, 42);
   CHECK_EQ(decoded.max, 100);
 
+  // A 12-byte read at data address 0x51 can echo 0x51 in the length byte.
+  // The checksum is 0x50 XOR every byte except the last.
+  uint8_t echoed[12] = {0x6E, 0x51, 0x02, 0x00, 0x10, 0x00, 0x00, 100, 0x00, 42, 0x00, 0};
+  sum = 0x50;
+  for (int i = 0; i < 11; i++) {
+    sum ^= echoed[i];
+  }
+  echoed[11] = sum;
+  CHECK(nsDDCDecodeReply(echoed, 12, &decoded));
+  CHECK(decoded.brightness);
+  CHECK_EQ(decoded.current, 42);
+  CHECK_EQ(decoded.max, 100);
+  echoed[11] ^= 0xFF;
+  CHECK(!nsDDCDecodeReply(echoed, 12, &decoded));
+
   // A leading data-address byte is not part of the frame.
   uint8_t prefixed[12];
   prefixed[0] = 0x51;
