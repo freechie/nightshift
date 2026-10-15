@@ -598,3 +598,31 @@ NSAccessAction nsAccessAction(bool trusted, bool haveTaps) {
 bool nsPurchaseURLAllowed(const char *url, size_t length) {
   return nsPurchaseURLVerdict(url, length) == kNSLinkOK;
 }
+
+bool nsWorkspaceOpenAllowed(const char *url, size_t length, bool allowLoopbackHTTP) {
+  NSLinkVerdict purchase = nsPurchaseURLVerdict(url, length);
+  NSLinkVerdict origin = nsLicenseOriginVerdict(url, length, allowLoopbackHTTP);
+  if (purchase == kNSLinkOK) {
+    return true;
+  }
+  if (origin == kNSLinkOK) {
+    return false;
+  }
+  if (url == NULL) {
+    return false;
+  }
+  static const char *const pages[] = {
+      "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Accessibility",
+      "x-apple.systempreferences:com.apple.Displays-Settings.extension?nightShift",
+      "x-apple.systempreferences:com.apple.Notifications-Settings.extension",
+      "https://github.com/freechie/nightshift",
+      "https://github.com/freechie/nightshift/issues",
+  };
+  for (size_t i = 0; i < sizeof pages / sizeof pages[0]; i++) {
+    size_t n = strlen(pages[i]);
+    if (length == n && memcmp(url, pages[i], n) == 0) {
+      return true;
+    }
+  }
+  return false;
+}

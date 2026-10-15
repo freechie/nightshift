@@ -76,6 +76,10 @@ NSString *rampServerOrigin(void);
 // what opens.
 NSURL *rampPurchasePage(NSString *url);
 BOOL rampPurchaseURLAllowed(NSString *url);
+// The NSURL NSWorkspace may open for text, or nil. Same bytes as
+// rampPurchasePage for a Stripe page. Also the exact Settings and project
+// links. A license-server origin is nil.
+NSURL *rampWorkspaceURL(NSString *text);
 NSString *rampCheckoutURL(void);
 NSString *rampFetchLicenseToken(void);
 int rampInstallReported(NSString *token, NSString **stdoutLine, NSString **stderrLine);
