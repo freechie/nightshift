@@ -1508,7 +1508,9 @@ static BOOL handleControl(const char *buf, int fd) {
     return YES;
   }
   if (strcmp(buf, "ddc") == 0) {
-    char text[512];
+    // One reply line carries a full IORegistry path. 512 bytes fits the first
+    // display and drops the next display's reply.
+    char text[4096];
     ddcCopyDebug(text, (int)sizeof(text));
     if (text[0] == '\0') {
       dprintf(fd, "ddc\n");
