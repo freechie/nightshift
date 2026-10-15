@@ -32,7 +32,8 @@ all: nightshift nightshiftd $(BUNDLED)
 session-tap-check:
 	python3 scripts/check-session-tap.py
 
-test: session-tap-check secret-scan workspace-open-check nightshift nightshift-tests logic-tests server-test license-server-check
+test: socket-main-check session-tap-check secret-scan workspace-open-check nightshift nightshift-tests logic-tests server-test license-server-check
+	./socket-main-check --siblings nightshiftd.m
 	./nightshift-tests
 	./logic-tests
 	sh tests/cli.sh
@@ -48,6 +49,9 @@ secret-scan:
 # One NSWorkspace openURL:, and it calls both license verdicts.
 workspace-open-check:
 	sh scripts/check-workspace-open.sh
+
+socket-main-check: tests/socket-main-check.c
+	cc -std=c11 -Wall -Wextra -Werror -D_POSIX_C_SOURCE=200809L -o $@ tests/socket-main-check.c
 
 # The license server's tests: test.js needs only Node; prove.js also runs
 # the license command of nightshift-testkey. Both sign with a throwaway key.
@@ -108,7 +112,7 @@ package: license-server-check
 
 clean:
 	rm -rf nightshift nightshiftd nightshift-tests logic-tests nightshift-testkey \
-	    license-server-check $(LICENSE_STAMP) $(APP) $(DIST)
+	    socket-main-check license-server-check $(LICENSE_STAMP) $(APP) $(DIST)
 
 # Turns on scripts/hooks (the pre-commit secret scan) for this clone.
 hooks:

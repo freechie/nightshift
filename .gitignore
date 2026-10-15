@@ -3,6 +3,7 @@ nightshiftd
 nightshift-tests
 logic-tests
 nightshift-testkey
+socket-main-check
 license-server-check
 .license-server
 Nightshift.app/
