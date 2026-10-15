@@ -158,8 +158,16 @@ NSDDCProbeVerdict nsDDCProbeControl(const NSDDCProbeIO *io, int *current, int *m
 // Settings label. Controllable is "DDC/CI connected". Software is
 // "Software dimming" and is never the connected label.
 const char *nsDDCControlLabel(NSDDCProbeVerdict verdict);
-// Controllable keeps nsCombinedLevels. Software dims across the whole
-// 0-100 slider and does not write the lamp (*hardware is -1).
+// Power for the software-only shade. 1 is a linear map (slider percent in,
+// same percent out). 2.2 lifts the middle. See nsSoftwareDimShade.
+extern const double kNSSoftwareDimExponent;
+// Gamma percent for a display that is not DDC-controllable. 0 is fully
+// dimmed, 100 is undimmed, and a higher value is brighter. Linear percent is
+// too dark through the lower half, so this is p^(1/kNSSoftwareDimExponent):
+// 50 lands near 73. Set the exponent to 1 to restore a linear map.
+long nsSoftwareDimShade(long percent);
+// Controllable keeps nsCombinedLevels. Software uses nsSoftwareDimShade
+// across the whole 0-100 slider and does not write the lamp (*hardware is -1).
 void nsExternalBrightness(NSDDCProbeVerdict verdict, long percent, long floor,
                           long *hardware, long *software);
 // One brightness-key step on a scale of stops.

@@ -796,6 +796,20 @@ static void checkProbe(void) {
   CHECK_EQ(hw, combinedHw);
   CHECK_EQ(sw, combinedSw);
   CHECK(sw < 100);
+  // The DDC path is the combined model at every sample, including the
+  // software-dim curve's sample points. A floor still changes the split.
+  const long samples[] = {0, 25, 50, 75, 100};
+  for (int i = 0; i < 5; i++) {
+    long sample = samples[i];
+    nsExternalBrightness(kNSDDCProbeControllable, sample, 0, &hw, &sw);
+    nsCombinedLevels(sample, 0, &combinedHw, &combinedSw);
+    CHECK_EQ(hw, combinedHw);
+    CHECK_EQ(sw, combinedSw);
+    nsExternalBrightness(kNSDDCProbeControllable, sample, 20, &hw, &sw);
+    nsCombinedLevels(sample, 20, &combinedHw, &combinedSw);
+    CHECK_EQ(hw, combinedHw);
+    CHECK_EQ(sw, combinedSw);
+  }
 
   // Readback stays at 42. nsDDCNear would accept it; the probe must not.
   ProbePanel cached = probePanel(42, 100);
@@ -810,18 +824,44 @@ static void checkProbe(void) {
   CHECK_EQ(cached.written[1], 42);
   CHECK(strcmp(nsDDCControlLabel(kNSDDCProbeSoftware), "Software dimming") == 0);
   CHECK(strcmp(nsDDCControlLabel(kNSDDCProbeSoftware), "DDC/CI connected") != 0);
+  // p^(1/2.2), rounded. 50 is 73, brighter than a linear 50. Ends stay put.
+  CHECK_EQ(nsSoftwareDimShade(0), 0);
+  CHECK_EQ(nsSoftwareDimShade(25), 53);
+  CHECK_EQ(nsSoftwareDimShade(50), 73);
+  CHECK_EQ(nsSoftwareDimShade(75), 88);
+  CHECK_EQ(nsSoftwareDimShade(100), 100);
+  CHECK(nsSoftwareDimShade(50) > 50);
+  long prevShade = 0;
   for (long percent = 0; percent <= 100; percent += 1) {
+    long shade = nsSoftwareDimShade(percent);
     nsExternalBrightness(kNSDDCProbeSoftware, percent, 20, &hw, &sw);
     CHECK_EQ(hw, -1);
-    CHECK_EQ(sw, percent);
+    CHECK_EQ(sw, shade);
+    CHECK(sw >= prevShade);
+    if (percent > 0 && percent < 100) {
+      CHECK(sw > percent);
+    }
+    // The floor is a backlight idea. Software dimming ignores it.
+    nsExternalBrightness(kNSDDCProbeSoftware, percent, 0, &hw, &sw);
+    CHECK_EQ(hw, -1);
+    CHECK_EQ(sw, shade);
+    prevShade = shade;
   }
-  // Above the combined switch is still software, not a backlight write.
+  nsExternalBrightness(kNSDDCProbeSoftware, -5, 20, &hw, &sw);
+  CHECK_EQ(hw, -1);
+  CHECK_EQ(sw, 0);
+  nsExternalBrightness(kNSDDCProbeSoftware, 130, 20, &hw, &sw);
+  CHECK_EQ(hw, -1);
+  CHECK_EQ(sw, 100);
+  // Above the combined switch is still the curve, not a backlight write.
   nsExternalBrightness(kNSDDCProbeSoftware, 76, 0, &hw, &sw);
   CHECK_EQ(hw, -1);
-  CHECK_EQ(sw, 76);
+  CHECK_EQ(sw, 88);
+  CHECK(sw > 76);
   nsExternalBrightness(kNSDDCProbeSoftware, 56, 0, &hw, &sw);
   CHECK_EQ(hw, -1);
-  CHECK_EQ(sw, 56);
+  CHECK_EQ(sw, 77);
+  CHECK(sw > 56);
 
   // The number the UI saved (76) is not a panel read. Writing 78 and reading
   // 76 again is a miss, even though 76 is what listing displays would show.
