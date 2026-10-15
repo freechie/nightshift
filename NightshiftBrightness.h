@@ -42,6 +42,9 @@ BOOL ddcFailed(uint32_t display);
 BOOL ddcUnconfirmed(uint32_t display);
 BOOL ddcPending(uint32_t display);
 void probeDDC(void);
+// Lines from the last probe: "ddc <display> <service> <verdict> <evidence>".
+// Codes only. 0 when nothing has been probed. cap is the buffer size.
+int ddcCopyDebug(char *out, int cap);
 BOOL externalNeedsDDC(void);
 BOOL readDisplayBrightness(uint32_t display, float *level, BOOL *writable);
 NSScreen *screenForDisplay(uint32_t display);

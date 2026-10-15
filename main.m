@@ -686,6 +686,11 @@ int main(int argc, const char *argv[]) {
                          "failed to set True Tone", argc == 3);
     }
 
+    if (argc == 2 && strcmp(argv[1], "ddc") == 0) {
+      char reply[512];
+      return finishReply(askAll("ddc\n", reply, sizeof(reply)), reply, "failed to read ddc", NO);
+    }
+
     if (argc == 2 && strcmp(argv[1], "brightness") == 0) {
       char reply[2048];
       return finishReply(askAll("brightness\n", reply, sizeof(reply)), reply,
