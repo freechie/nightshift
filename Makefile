@@ -50,8 +50,11 @@ secret-scan:
 workspace-open-check:
 	sh scripts/check-workspace-open.sh
 
+# glibc with -std=c11 declares mkdtemp only when _POSIX_C_SOURCE is at least
+# 200809L. Apple's headers hide mkdtemp when that macro is set, so Darwin
+# leaves it off. The check itself is unchanged.
 socket-main-check: tests/socket-main-check.c
-	cc -std=c11 -Wall -Wextra -Werror -D_POSIX_C_SOURCE=200809L -o $@ tests/socket-main-check.c
+	cc -std=c11 -Wall -Wextra -Werror $(if $(filter Darwin,$(shell uname -s)),,-D_POSIX_C_SOURCE=200809L) -o $@ tests/socket-main-check.c
 
 # The license server's tests: test.js needs only Node; prove.js also runs
 # the license command of nightshift-testkey. Both sign with a throwaway key.
