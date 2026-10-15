@@ -846,7 +846,7 @@ static BOOL ddcI2C(IOAVServiceRef service, uint32_t address, uint8_t *data, uint
       }
       return NO;
     }
-    dispatch_semaphore_wait(done, DISPATCH_TIME_FOREVER);
+    // The call already stored its result. Do not wait on it again.
   }
   BOOL ok = job->result == 0;
   if (ok && !isWrite) {

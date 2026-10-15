@@ -553,7 +553,18 @@ static bool ddcBudgetOpen(const NSDDCProbeIO *io) {
   return io->budget == NULL || io->budget(io->ctx);
 }
 
-static NSDDCProbeVerdict ddcBudgetStop(NSDDCProbeIO *io, int *currentOut, int *maxOut) {
+// One restore. prior < 0 means the level before the test write is unknown.
+static void ddcPutBack(NSDDCProbeIO *io, bool *sent, int prior) {
+  if (io == NULL || io->write == NULL || sent == NULL || !*sent || prior < 0) {
+    return;
+  }
+  *sent = false;
+  (void)io->write(io->ctx, prior);
+}
+
+static NSDDCProbeVerdict ddcBudgetStop(NSDDCProbeIO *io, int *currentOut, int *maxOut, bool *sent,
+                                      int prior) {
+  ddcPutBack(io, sent, prior);
   NSDDCProbeFacts facts;
   memset(&facts, 0, sizeof(facts));
   facts.evidence = kNSDDCEvidenceTimedOut;
@@ -580,21 +591,26 @@ NSDDCProbeVerdict nsDDCProbeControl(NSDDCProbeIO *io, int *currentOut, int *maxO
   int before = 0;
   int scale = 0;
   bool readOk = false;
+  // Set once a test write may be on the panel. prior is the brightness the
+  // display had before that write.
+  bool sent = false;
+  int prior = -1;
   // HDMI often drops the first VCP read. A later try is still a read.
   // A call that does not return inside the budget ends the probe. It must
   // not fall through into a brightness write.
   for (int attempt = 0; attempt < 4; attempt++) {
     if (!ddcBudgetOpen(io)) {
-      return ddcBudgetStop(io, currentOut, maxOut);
+      return ddcBudgetStop(io, currentOut, maxOut, &sent, prior);
     }
     before = 0;
     scale = 0;
     if (io->read(io->ctx, &before, &scale) && scale > 0 && before >= 0 && before <= scale) {
       readOk = true;
+      prior = before;
       break;
     }
     if (!ddcBudgetOpen(io)) {
-      return ddcBudgetStop(io, currentOut, maxOut);
+      return ddcBudgetStop(io, currentOut, maxOut, &sent, prior);
     }
   }
   NSDDCProbeFacts facts;
@@ -603,11 +619,11 @@ NSDDCProbeVerdict nsDDCProbeControl(NSDDCProbeIO *io, int *currentOut, int *maxO
   facts.fallbackMax = io->fallbackMax;
   if (!readOk) {
     if (!ddcBudgetOpen(io)) {
-      return ddcBudgetStop(io, currentOut, maxOut);
+      return ddcBudgetStop(io, currentOut, maxOut, &sent, prior);
     }
     bool framed = io->framed != NULL && io->framed(io->ctx);
     if (!ddcBudgetOpen(io)) {
-      return ddcBudgetStop(io, currentOut, maxOut);
+      return ddcBudgetStop(io, currentOut, maxOut, &sent, prior);
     }
     if (!framed) {
       // The write function is there. Its return code, with no frame, is not
@@ -619,11 +635,22 @@ NSDDCProbeVerdict nsDDCProbeControl(NSDDCProbeIO *io, int *currentOut, int *maxO
     }
     int keepScale = 0;
     int keep = nsDDCProbeKeep(io->fallbackCurrent, io->fallbackMax, &keepScale);
+    // Full scale is the test write when no level was saved. A known
+    // pre-probe level is still what a failed probe has to put back, including
+    // when the scale itself was unknown.
+    if (prior < 0 && io->fallbackCurrent >= 1 && io->fallbackCurrent <= 10000) {
+      prior = io->fallbackCurrent;
+    }
+    sent = true;
     facts.evidence = kNSDDCEvidenceFramed;
     facts.writeOk = io->write(io->ctx, keep);
-    if (!ddcBudgetOpen(io)) {
-      return ddcBudgetStop(io, currentOut, maxOut);
+    if (!facts.writeOk && ddcBudgetOpen(io)) {
+      sent = false;
     }
+    if (!ddcBudgetOpen(io)) {
+      return ddcBudgetStop(io, currentOut, maxOut, &sent, prior);
+    }
+    sent = false;
     facts.fallbackCurrent = keep;
     facts.fallbackMax = keepScale;
     io->evidence = facts.writeOk ? kNSDDCEvidenceFramed : kNSDDCEvidenceNone;
@@ -632,12 +659,19 @@ NSDDCProbeVerdict nsDDCProbeControl(NSDDCProbeIO *io, int *currentOut, int *maxO
   }
   int target = nsDDCProbeTarget(before, scale);
   if (!ddcBudgetOpen(io)) {
-    return ddcBudgetStop(io, currentOut, maxOut);
+    return ddcBudgetStop(io, currentOut, maxOut, &sent, prior);
   }
-  if (target < 0 || !io->write(io->ctx, target)) {
+  if (target < 0) {
+    io->evidence = kNSDDCEvidenceNone;
+    return nsDDCProbeDecide(&facts, currentOut, maxOut);
+  }
+  prior = before;
+  sent = true;
+  if (!io->write(io->ctx, target)) {
     if (!ddcBudgetOpen(io)) {
-      return ddcBudgetStop(io, currentOut, maxOut);
+      return ddcBudgetStop(io, currentOut, maxOut, &sent, prior);
     }
+    sent = false;
     io->evidence = kNSDDCEvidenceNone;
     return nsDDCProbeDecide(&facts, currentOut, maxOut);
   }
@@ -648,13 +682,13 @@ NSDDCProbeVerdict nsDDCProbeControl(NSDDCProbeIO *io, int *currentOut, int *maxO
   bool sawReply = false;
   for (int attempt = 0; attempt < 4; attempt++) {
     if (!ddcBudgetOpen(io)) {
-      return ddcBudgetStop(io, currentOut, maxOut);
+      return ddcBudgetStop(io, currentOut, maxOut, &sent, prior);
     }
     int after = 0;
     int scaleAfter = 0;
     if (!io->read(io->ctx, &after, &scaleAfter)) {
       if (!ddcBudgetOpen(io)) {
-        return ddcBudgetStop(io, currentOut, maxOut);
+        return ddcBudgetStop(io, currentOut, maxOut, &sent, prior);
       }
       continue;
     }
@@ -664,15 +698,14 @@ NSDDCProbeVerdict nsDDCProbeControl(NSDDCProbeIO *io, int *currentOut, int *maxO
       break;
     }
   }
-  // The nudge already went out. Put the original back whether or not a
-  // confirmation read proved the panel moved. A timed-out bus does not get
-  // another write.
+  // The test write already went out. Put the original back on success and on
+  // a timeout. One attempt: the restore itself must not chain.
   if (!ddcBudgetOpen(io)) {
-    return ddcBudgetStop(io, currentOut, maxOut);
+    return ddcBudgetStop(io, currentOut, maxOut, &sent, prior);
   }
-  (void)io->write(io->ctx, before);
+  ddcPutBack(io, &sent, prior);
   if (!ddcBudgetOpen(io)) {
-    return ddcBudgetStop(io, currentOut, maxOut);
+    return ddcBudgetStop(io, currentOut, maxOut, &sent, prior);
   }
   if (landed) {
     facts.evidence = kNSDDCEvidenceRead;
