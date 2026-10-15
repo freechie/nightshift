@@ -730,13 +730,12 @@ static IOAVServiceRef serviceMatching(const DDCTarget *target, int *index) {
 }
 
 // DDC/CI wants a pause after a Set VCP before the monitor will answer the
-// next message with the new value (MonitorControl: 10 ms between writes,
-// 50 ms before a read, 20 ms between read retries). Worker only.
+// next message with the new value. m1ddc sends the request twice, 10ms
+// apart, then waits 10ms and reads. Worker only.
 static const useconds_t kDDCAfterWrite = 60000;
 static const useconds_t kDDCBetweenReads = 30000;
-// Gap before each copy of a DDC request. Two writes, then the 50ms read
-// wait, matches the Apple Silicon I2C timing that actually returns a frame.
-static const useconds_t kDDCWriteGap = 10000;
+// 10ms after each copy of a request. The second gap is the wait before the read.
+static const useconds_t kDDCReadGap = 10000;
 static const useconds_t kDDCRecheck = 100000;
 // One IOAVService call. Longer than a normal reply, short of pinning the queue.
 static const uint64_t kDDCI2CCallNs = 200000000ull;
@@ -858,8 +857,10 @@ static BOOL ddcI2C(IOAVServiceRef service, uint32_t address, uint8_t *data, uint
   return ok;
 }
 
+// Chip 0x37, data address 0x51 for the write and the read. Two sends, 10ms
+// apart, then one 12-byte read at that same address. No other offset.
 static BOOL ddcWriteRead(IOAVServiceRef service, uint8_t *request, int requestLen, uint8_t *reply,
-                         int replyLen, uint32_t readOffset, uint64_t deadline, BOOL *timedOut) {
+                         int replyLen, uint64_t deadline, BOOL *timedOut) {
   ddcWaitAfterWrite();
   int writeCycle = 0;
   BOOL wrote = NO;
@@ -870,7 +871,6 @@ static BOOL ddcWriteRead(IOAVServiceRef service, uint8_t *request, int requestLe
       }
       return NO;
     }
-    usleep(kDDCWriteGap);
     BOOL hung = NO;
     if (ddcI2C(service, 0x51, request, (uint32_t)requestLen, YES, deadline, &hung)) {
       wrote = YES;
@@ -880,6 +880,7 @@ static BOOL ddcWriteRead(IOAVServiceRef service, uint8_t *request, int requestLe
       }
       return NO;
     }
+    usleep(kDDCReadGap);
     writeCycle++;
   }
   if (!wrote) {
@@ -894,79 +895,49 @@ static BOOL ddcWriteRead(IOAVServiceRef service, uint8_t *request, int requestLe
     }
     return NO;
   }
-  usleep(50000);
+  uint8_t buf[12];
+  memset(buf, 0, sizeof(buf));
   BOOL hung = NO;
-  if (ddcI2C(service, readOffset, reply, (uint32_t)replyLen, NO, deadline, &hung)) {
-    return YES;
-  }
-  if (hung || replyLen <= 11) {
+  if (!ddcI2C(service, 0x51, buf, 12, NO, deadline, &hung)) {
     if (hung && timedOut != NULL) {
       *timedOut = YES;
     }
     return NO;
   }
-  memset(reply, 0, (size_t)replyLen);
-  hung = NO;
-  if (ddcI2C(service, readOffset, reply, 11, NO, deadline, &hung)) {
-    return YES;
-  }
-  if (hung && timedOut != NULL) {
-    *timedOut = YES;
-  }
-  return NO;
+  int n = replyLen < 12 ? replyLen : 12;
+  memcpy(reply, buf, (size_t)n);
+  return YES;
 }
 
-// Offset 0 first. 0x51 and 0x50 only after 0 returns nothing inside the deadline.
-static BOOL ddcReadFrame(IOAVServiceRef service, uint8_t *request, int requestLen, uint8_t *reply,
-                         int replyLen, NSDDCReply *decoded, BOOL brightnessOnly, uint64_t deadline,
-                         BOOL *timedOut) {
-  int tried = 0;
-  int offset0 = kNSDDCOffsetEmpty;
-  while (1) {
-    bool budgetLeft = deadline == 0 || ddcNow() < deadline;
-    int offset = nsDDCNextReadOffset(tried, offset0, budgetLeft);
-    if (offset < 0) {
-      if (tried > 0 && tried < 3 && offset0 == kNSDDCOffsetEmpty && !budgetLeft && timedOut != NULL) {
-        *timedOut = YES;
-      }
-      return NO;
+// One transaction at data address 0x51. The caller retries.
+static BOOL ddcReadFrame(IOAVServiceRef service, uint8_t *request, int requestLen,
+                         NSDDCReply *decoded, BOOL brightnessOnly, uint64_t deadline, BOOL *timedOut) {
+  uint8_t reply[12];
+  memset(reply, 0, sizeof(reply));
+  BOOL hung = NO;
+  if (!ddcWriteRead(service, request, requestLen, reply, 12, deadline, &hung)) {
+    if (hung && timedOut != NULL) {
+      *timedOut = YES;
     }
-    tried++;
-    memset(reply, 0, (size_t)replyLen);
-    BOOL hung = NO;
-    BOOL got = ddcWriteRead(service, request, requestLen, reply, replyLen, (uint32_t)offset, deadline,
-                            &hung);
-    if (hung) {
-      if (timedOut != NULL) {
-        *timedOut = YES;
-      }
-      return NO;
-    }
-    NSDDCReply found;
-    memset(&found, 0, sizeof(found));
-    BOOL frame = got && nsDDCDecodeReply(reply, replyLen, &found) &&
-                 (!brightnessOnly || found.brightness);
-    if (tried == 1) {
-      offset0 = frame ? kNSDDCOffsetFrame : kNSDDCOffsetEmpty;
-    }
-    if (frame) {
-      if (decoded != NULL) {
-        *decoded = found;
-      }
-      return YES;
-    }
+    return NO;
   }
+  NSDDCReply found;
+  memset(&found, 0, sizeof(found));
+  if (!nsDDCDecodeReply(reply, 12, &found) || (brightnessOnly && !found.brightness)) {
+    return NO;
+  }
+  if (decoded != NULL) {
+    *decoded = found;
+  }
+  return YES;
 }
 
 static BOOL ddcReadOnce(IOAVServiceRef service, int *current, int *max, uint64_t deadline,
                          BOOL *timedOut) {
   uint8_t request[4] = {0x82, 0x01, 0x10, 0};
   request[3] = (uint8_t)(0x6E ^ request[0] ^ request[1] ^ request[2]);
-  // 12 bytes so a leading 0x51 plus the 11-byte reply still fits.
-  uint8_t reply[12];
   NSDDCReply decoded;
-  if (!ddcReadFrame(service, request, 4, reply, (int)sizeof(reply), &decoded, YES, deadline,
-                    timedOut)) {
+  if (!ddcReadFrame(service, request, 4, &decoded, YES, deadline, timedOut)) {
     return NO;
   }
   *current = decoded.current;
@@ -984,15 +955,13 @@ static BOOL ddcCapabilitiesOnce(IOAVServiceRef service, int withDataAddress, uin
     seed = (uint8_t)(0x6E ^ 0x51);
   }
   request[4] = (uint8_t)(seed ^ request[0] ^ request[1] ^ request[2] ^ request[3]);
-  uint8_t reply[64];
-  return ddcReadFrame(service, request, 5, reply, (int)sizeof(reply), NULL, NO, deadline, timedOut);
+  return ddcReadFrame(service, request, 5, NULL, NO, deadline, timedOut);
 }
 
 static BOOL ddcVCPFrameOnce(IOAVServiceRef service, uint64_t deadline, BOOL *timedOut) {
   uint8_t request[4] = {0x82, 0x01, 0x10, 0};
   request[3] = (uint8_t)(0x6E ^ request[0] ^ request[1] ^ request[2]);
-  uint8_t reply[12];
-  return ddcReadFrame(service, request, 4, reply, (int)sizeof(reply), NULL, NO, deadline, timedOut);
+  return ddcReadFrame(service, request, 4, NULL, NO, deadline, timedOut);
 }
 
 // Brightness for a display that waits for the current probe to land
@@ -1753,35 +1722,13 @@ static bool ddcProbeBudget(void *ctx) {
   return probe != NULL && !probe->timedOut;
 }
 
-static int ddcProbeStatus(DDCProbeCtx *probe, uint32_t offset, int *current, int *max, BOOL brightness) {
-  uint8_t request[4] = {0x82, 0x01, 0x10, 0};
-  request[3] = (uint8_t)(0x6E ^ request[0] ^ request[1] ^ request[2]);
-  uint8_t reply[12];
-  BOOL hung = NO;
-  BOOL got = ddcWriteRead(probe->service, request, 4, reply, (int)sizeof(reply), offset, probe->deadline,
-                          &hung);
-  if (hung) {
-    probe->timedOut = YES;
-    return kNSDDCOffsetTimedOut;
-  }
-  NSDDCReply decoded;
-  if (got && nsDDCDecodeReply(reply, (int)sizeof(reply), &decoded) &&
-      (!brightness || decoded.brightness)) {
-    if (brightness && current != NULL && max != NULL) {
-      *current = decoded.current;
-      *max = decoded.max;
-    }
-    return kNSDDCOffsetFrame;
-  }
-  return kNSDDCOffsetEmpty;
-}
-
 static bool ddcProbeRead(void *ctx, int *current, int *max) {
   DDCProbeCtx *probe = ctx;
   if (probe->readsFinished) {
     return false;
   }
-  bool offset0Empty = false;
+  // Up to four tries, and only while this display's deadline has time left.
+  // Each try is one read at data address 0x51. There is no offset search.
   for (int attempt = 0; attempt < 4; attempt++) {
     if (probe->timedOut || (probe->deadline != 0 && ddcNow() >= probe->deadline)) {
       probe->timedOut = YES;
@@ -1791,34 +1738,13 @@ static bool ddcProbeRead(void *ctx, int *current, int *max) {
     if (attempt > 0) {
       usleep(kDDCBetweenReads);
     }
-    int status = ddcProbeStatus(probe, 0, current, max, YES);
-    if (status == kNSDDCOffsetFrame) {
+    BOOL hung = NO;
+    if (ddcReadOnce(probe->service, current, max, probe->deadline, &hung)) {
       probe->readsFinished = YES;
       return true;
     }
-    if (status == kNSDDCOffsetTimedOut) {
-      probe->readsFinished = YES;
-      return false;
-    }
-    offset0Empty = true;
-  }
-  int tried = 1;
-  while (offset0Empty && !probe->timedOut) {
-    bool budgetLeft = probe->deadline == 0 || ddcNow() < probe->deadline;
-    int offset = nsDDCNextReadOffset(tried, kNSDDCOffsetEmpty, budgetLeft);
-    if (offset < 0) {
-      if (!budgetLeft) {
-        probe->timedOut = YES;
-      }
-      break;
-    }
-    tried++;
-    int status = ddcProbeStatus(probe, (uint32_t)offset, current, max, YES);
-    if (status == kNSDDCOffsetFrame) {
-      probe->readsFinished = YES;
-      return true;
-    }
-    if (status == kNSDDCOffsetTimedOut) {
+    if (hung) {
+      probe->timedOut = YES;
       probe->readsFinished = YES;
       return false;
     }
