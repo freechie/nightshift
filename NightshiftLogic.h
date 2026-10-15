@@ -213,4 +213,16 @@ double nsTapRecoveryDelay(bool trusted, int recent);
 // minute), then every 30 s for as long as Nightshift runs.
 double nsTapRetryDelay(int tries);
 
+// What the once-a-second Accessibility check does. trusted is
+// AXIsProcessTrusted() now; haveTaps is whether the key taps exist. Drop
+// when access is gone and taps remain (macOS would otherwise stall all
+// input until it times them out), rebuild when access is back and they
+// are missing, otherwise keep.
+typedef enum {
+  kNSAccessKeep = 0,
+  kNSAccessDrop,
+  kNSAccessRebuild,
+} NSAccessAction;
+NSAccessAction nsAccessAction(bool trusted, bool haveTaps);
+
 #endif

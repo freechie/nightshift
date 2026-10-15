@@ -7939,6 +7939,7 @@ static void refreshMenu(void) {
 static AppDelegate *gAppDelegate = nil;
 
 static CFMachPortRef gBrightnessTaps[3];
+static CFRunLoopSourceRef gBrightnessTapSources[3];
 static int gBrightnessTapCount = 0;
 static long gBuiltinPercent = -1;
 static CFAbsoluteTime gLastBrightnessKey = 0;
@@ -8542,8 +8543,8 @@ static void watchHIDBrightness(void) {
 
 static void startBrightnessKeys(void);
 
-// Main thread. Disables, invalidates and releases the key taps; their run
-// loop sources go with the invalidated ports.
+// Main thread. Disables, invalidates and releases the key taps, and takes
+// their run loop sources off the tap thread's loop.
 static void removeBrightnessTaps(void) {
   for (int i = 0; i < gBrightnessTapCount; i++) {
     if (gBrightnessTaps[i] != NULL) {
@@ -8551,6 +8552,11 @@ static void removeBrightnessTaps(void) {
       CFMachPortInvalidate(gBrightnessTaps[i]);
       CFRelease(gBrightnessTaps[i]);
       gBrightnessTaps[i] = NULL;
+    }
+    if (gBrightnessTapSources[i] != NULL) {
+      CFRunLoopRemoveSource(tapRunLoop(), gBrightnessTapSources[i], kCFRunLoopCommonModes);
+      CFRelease(gBrightnessTapSources[i]);
+      gBrightnessTapSources[i] = NULL;
     }
   }
   gBrightnessTapCount = 0;
@@ -8634,9 +8640,9 @@ static BOOL installBrightnessTap(void) {
       continue;
     }
     CFRunLoopSourceRef source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0);
+    gBrightnessTapSources[gBrightnessTapCount] = source;
     gBrightnessTaps[gBrightnessTapCount++] = tap;
     CFRunLoopAddSource(loop, source, kCFRunLoopCommonModes);
-    CFRelease(source);
     CGEventTapEnable(tap, true);
   }
   CFRunLoopWakeUp(loop);
@@ -8699,6 +8705,63 @@ static void startBrightnessKeys(void) {
   scheduleTapRetry(retry);
 }
 
+// Main thread. Shows the Brightness Keys state in the menu and, when open,
+// in Settings.
+static void refreshKeysState(void) {
+  if (gMenu == nil) {
+    return;
+  }
+  [gMenu refresh];
+  if (gMenu.settings.window.isVisible) {
+    [gMenu.settings syncDisplays];
+  }
+}
+
+// Main thread, every second and on Accessibility change notices. Drops the
+// taps the moment Accessibility is revoked, before macOS stalls input
+// waiting on them to time out, and rebuilds them as soon as it is back.
+static void checkAccessibility(void) {
+  switch (nsAccessAction(AXIsProcessTrusted(), gBrightnessTapCount > 0)) {
+  case kNSAccessDrop:
+    dropTapsAndRetry();
+    refreshKeysState();
+    break;
+  case kNSAccessRebuild:
+    if (installBrightnessTap()) {
+      atomic_store(&gTapDisabledPending, false);
+      gTapTries = 0;
+      refreshKeysState();
+    }
+    break;
+  case kNSAccessKeep:
+    break;
+  }
+}
+
+static void watchAccessibility(void) {
+  NSTimer *timer = [NSTimer timerWithTimeInterval:1
+                                          repeats:YES
+                                            block:^(NSTimer *t) {
+                                              (void)t;
+                                              checkAccessibility();
+                                            }];
+  timer.tolerance = 0.1;
+  [NSRunLoop.mainRunLoop addTimer:timer forMode:NSRunLoopCommonModes];
+  // Undocumented and sent before the change lands, so it only shortens the
+  // wait; the timer works alone.
+  [NSDistributedNotificationCenter.defaultCenter
+      addObserverForName:@"com.apple.accessibility.api"
+                  object:nil
+                   queue:NSOperationQueue.mainQueue
+              usingBlock:^(NSNotification *note) {
+                (void)note;
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), ^{
+                                 checkAccessibility();
+                               });
+              }];
+}
+
 // Main thread. Re-reads every DDC channel, the confirmed ones included, as
 // soon as the queue is free.
 static void ddcRevalidate(void) {
@@ -8744,6 +8807,7 @@ static void installMenu(void) {
   }
   gMenu = [[MenuBar alloc] init];
   startBrightnessKeys();
+  watchAccessibility();
   [gMenu refresh];
 }
 

@@ -595,6 +595,11 @@ static void checkTapRecovery(void) {
   for (int n = 0; n < 100; n++) {
     CHECK(nsTapRetryDelay(n) > 0);
   }
+  // The Accessibility check: drop at once on revoke, rebuild on regrant.
+  CHECK_EQ(nsAccessAction(false, true), kNSAccessDrop);
+  CHECK_EQ(nsAccessAction(true, false), kNSAccessRebuild);
+  CHECK_EQ(nsAccessAction(true, true), kNSAccessKeep);
+  CHECK_EQ(nsAccessAction(false, false), kNSAccessKeep);
 }
 
 int main(void) {

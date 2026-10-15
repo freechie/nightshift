@@ -585,6 +585,16 @@ double nsTapRetryDelay(int tries) {
   return tries < 30 ? 2 : 30;
 }
 
+NSAccessAction nsAccessAction(bool trusted, bool haveTaps) {
+  if (!trusted && haveTaps) {
+    return kNSAccessDrop;
+  }
+  if (trusted && !haveTaps) {
+    return kNSAccessRebuild;
+  }
+  return kNSAccessKeep;
+}
+
 bool nsPurchaseURLAllowed(const char *url, size_t length) {
   return nsPurchaseURLVerdict(url, length) == kNSLinkOK;
 }
