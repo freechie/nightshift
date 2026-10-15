@@ -146,6 +146,10 @@ typedef struct {
   bool (*write)(void *ctx, int value);
   void *ctx;
   bool (*framed)(void *ctx);
+  // Optional. True when the last brightness read was a null message or an
+  // empty buffer. After the retries, that is not controllable and is not a
+  // reason to write the lamp.
+  bool (*idle)(void *ctx);
   // Optional. False means the last read or write did not finish inside the
   // probe's time budget. The probe stops, does not write again, and records
   // kNSDDCEvidenceTimedOut. NULL means the probe has no budget.
@@ -254,8 +258,18 @@ enum {
   kNSDDCIOTimeout = 2,
 };
 // Why a 12-byte VCP 0x10 buffer was not accepted. "ok" when the existing
-// decoder takes it as brightness. This does not decide acceptance.
+// decoder takes it as brightness. "null" is the DDC/CI null message
+// (6e 80 be): the panel is busy, not a bad length. This does not decide
+// acceptance.
 const char *nsDDCReplyReason(const uint8_t *bytes, int count);
+// True for a checksum-valid null message: source 0x6E, length 0x80, checksum
+// 0x50 XOR those two bytes. Padding after the third byte is ignored. A wrong
+// checksum is not a null message.
+bool nsDDCNullMessage(const uint8_t *bytes, int count);
+// Get VCP Feature payload written at I2C data address 0x51. The DDC/CI
+// request is 51 82 01 vcp chk. chk is 0x6E XOR 82 01 vcp. Opcode 0x01 is Get,
+// not Set (0x03).
+void nsDDCGetVCPRequest(uint8_t vcp, uint8_t out[4]);
 // "ddc reply <display> <write> <read> <reason> <12 hex bytes>".
 // write and read are "none", "timeout", or 0x-hex. False when out is short.
 bool nsDDCReplyLine(uint32_t display, int writeState, int writeCode, int readState, int readCode,

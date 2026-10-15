@@ -871,6 +871,8 @@ typedef struct {
 
 static DDCReplyCapture gBrightnessReply;
 static BOOL gBrightnessReplySet = NO;
+// Last brightness read was a null message or an empty buffer.
+static BOOL gBrightnessReplyIdle = NO;
 
 static void ddcRememberBrightnessReply(const DDCReplyCapture *cap) {
   if (cap == NULL) {
@@ -967,6 +969,14 @@ static BOOL ddcReadFrame(IOAVServiceRef service, uint8_t *request, int requestLe
                           record ? &cap : NULL);
   if (record) {
     ddcRememberBrightnessReply(&cap);
+    bool empty = true;
+    for (int i = 0; i < 12; i++) {
+      if (reply[i] != 0) {
+        empty = false;
+        break;
+      }
+    }
+    gBrightnessReplyIdle = nsDDCNullMessage(reply, 12) || empty ? YES : NO;
   }
   if (!got) {
     if (hung && timedOut != NULL) {
@@ -987,8 +997,10 @@ static BOOL ddcReadFrame(IOAVServiceRef service, uint8_t *request, int requestLe
 
 static BOOL ddcReadOnce(IOAVServiceRef service, int *current, int *max, uint64_t deadline,
                          BOOL *timedOut) {
-  uint8_t request[4] = {0x82, 0x01, 0x10, 0};
-  request[3] = (uint8_t)(0x6E ^ request[0] ^ request[1] ^ request[2]);
+  // Get VCP luminance. With data address 0x51 the message is 51 82 01 10 chk.
+  // Opcode 0x01 is Get, not a brightness Set (0x03).
+  uint8_t request[4];
+  nsDDCGetVCPRequest(0x10, request);
   NSDDCReply decoded;
   if (!ddcReadFrame(service, request, 4, &decoded, YES, deadline, timedOut, YES)) {
     return NO;
@@ -1012,8 +1024,8 @@ static BOOL ddcCapabilitiesOnce(IOAVServiceRef service, int withDataAddress, uin
 }
 
 static BOOL ddcVCPFrameOnce(IOAVServiceRef service, uint64_t deadline, BOOL *timedOut) {
-  uint8_t request[4] = {0x82, 0x01, 0x10, 0};
-  request[3] = (uint8_t)(0x6E ^ request[0] ^ request[1] ^ request[2]);
+  uint8_t request[4];
+  nsDDCGetVCPRequest(0x10, request);
   return ddcReadFrame(service, request, 4, NULL, NO, deadline, timedOut, YES);
 }
 
@@ -1253,6 +1265,7 @@ static bool ddcProbeRead(void *ctx, int *current, int *max);
 static bool ddcProbeWrite(void *ctx, int value);
 static bool ddcProbeFramed(void *ctx);
 static bool ddcProbeBudget(void *ctx);
+static bool ddcProbeIdle(void *ctx);
 
 BOOL setDisplayBrightness(uint32_t display, long percent);
 
@@ -1653,6 +1666,7 @@ void probeDDC(void) {
     }
     for (int i = 0; i < pending; i++) {
       gBrightnessReplySet = NO;
+      gBrightnessReplyIdle = NO;
       memset(&gBrightnessReply, 0, sizeof(gBrightnessReply));
       int serviceIndex = -1;
       IOAVServiceRef service = serviceMatching(&wanted[i], &serviceIndex);
@@ -1688,6 +1702,7 @@ void probeDDC(void) {
         io.write = ddcProbeWrite;
         io.framed = ddcProbeFramed;
         io.budget = ddcProbeBudget;
+        io.idle = ddcProbeIdle;
         io.ctx = &ctx;
         io.fallbackCurrent = ctx.fallbackCurrent;
         io.fallbackMax = ctx.fallbackMax;
@@ -1846,6 +1861,11 @@ static BOOL ddcWriteOnce(IOAVServiceRef service, int value, uint64_t deadline, B
 static bool ddcProbeBudget(void *ctx) {
   DDCProbeCtx *probe = ctx;
   return probe != NULL && !probe->timedOut;
+}
+
+static bool ddcProbeIdle(void *ctx) {
+  (void)ctx;
+  return gBrightnessReplyIdle ? true : false;
 }
 
 static bool ddcProbeRead(void *ctx, int *current, int *max) {
