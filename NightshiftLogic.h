@@ -146,6 +146,10 @@ typedef struct {
   bool (*write)(void *ctx, int value);
   void *ctx;
   bool (*framed)(void *ctx);
+  // Optional. False means the last read or write did not finish inside the
+  // probe's time budget. The probe stops, does not write again, and records
+  // kNSDDCEvidenceTimedOut. NULL means the probe has no budget.
+  bool (*budget)(void *ctx);
   // Last-known raw brightness, used only when brightness reads fail and a
   // framed reply proves the link. fallbackMax 0 means unknown: the value
   // kept is the top of a 100-step scale, never black.
@@ -170,6 +174,14 @@ enum {
   kNSDDCEvidenceUnchanged = 5,   // the panel answered and stayed on the old value
   kNSDDCEvidenceNotProbed = 6,   // debug line only: this external has not been probed
   kNSDDCEvidenceInFlight = 7,    // debug line only: a probe is running
+  kNSDDCEvidenceTimedOut = 8,    // a read or write did not return in time
+};
+
+// What one read subaddress did, for nsDDCNextReadOffset.
+enum {
+  kNSDDCOffsetEmpty = 0,      // returned within the budget, no frame
+  kNSDDCOffsetFrame = 1,      // a checksum-valid reply
+  kNSDDCOffsetTimedOut = 2,   // the call did not return within the budget
 };
 
 // Raw brightness to write: two steps from current when that stays on the
@@ -181,11 +193,10 @@ int nsDDCProbeTarget(int current, int max);
 // tolerance, so a cached read of the old value would look close enough.
 bool nsDDCProbeLanded(int before, int written, int after);
 // One IOAVServiceReadI2C buffer. valid is a checksum-valid capabilities
-// (opcode 0xE3) or VCP (opcode 0x02) frame. The checksum seed is 0x50, never
-// 0x6E. The length byte keeps its 0x80 flag in the checksum and the low 7
-// bits are the count. A leading 0x50 or 0x51 is an offset byte, not part of
-// the frame. The address may be 0x6E, 0x6F, or missing (the buffer starts at
-// the length byte). brightness is set only for VCP 0x10, result 0, with
+// (opcode 0xE3) or VCP (opcode 0x02) frame. The checksum is 0x50 XOR every
+// byte except the last, and it must equal the last byte. The length byte may
+// be 0x51: that is the data address echoed by a read at 0x51, not a reason to
+// reject the frame. brightness is set only for VCP 0x10, result 0, with
 // current inside max.
 typedef struct {
   bool valid;
@@ -214,14 +225,22 @@ typedef struct {
   int fallbackMax;
 } NSDDCProbeFacts;
 NSDDCProbeVerdict nsDDCProbeDecide(const NSDDCProbeFacts *facts, int *current, int *max);
+// Next I2C read subaddress. tried is how many subaddresses have already been
+// attempted. The first is always 0, and only while the display deadline has
+// not passed. 0x51 and 0x50 come next only when offset 0 returned nothing
+// (kNSDDCOffsetEmpty) inside that deadline. A timeout, a frame, or a spent
+// deadline stops the walk. -1 means do not read again.
+int nsDDCNextReadOffset(int tried, int offset0, bool budgetLeft);
 // Read (up to four tries), write nsDDCProbeTarget, read again, then write
 // the original back. The confirmation read is tried up to four times.
 // Controllable when one of those reads is the written value. When every
 // brightness read fails, a framed reply and a write of the kept value are
 // still controllable. A write with no valid reply, or a readback that stays
-// on the first value, is software-only. io->evidence receives the code.
-// When the first read works, *current and *max receive it. Either pointer
-// may be NULL. io may be NULL.
+// on the first value, is software-only. If a test write (the nudge, or full
+// scale when no level was saved) may have reached the panel and the probe
+// then fails or times out, the brightness from before that write is written
+// back. io->evidence receives the code. When the first read works, *current
+// and *max receive it. Either pointer may be NULL. io may be NULL.
 NSDDCProbeVerdict nsDDCProbeControl(NSDDCProbeIO *io, int *current, int *max);
 // "ddc <display> <service> <verdict> <evidence>". Service -1 is no match.
 // Nothing but those codes. False when the buffer cannot hold the line.
