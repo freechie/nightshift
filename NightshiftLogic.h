@@ -146,6 +146,10 @@ typedef struct {
   bool (*write)(void *ctx, int value);
   void *ctx;
   bool (*framed)(void *ctx);
+  // Optional. False means the last read or write did not finish inside the
+  // probe's time budget. The probe stops, does not write again, and records
+  // kNSDDCEvidenceTimedOut. NULL means the probe has no budget.
+  bool (*budget)(void *ctx);
   // Last-known raw brightness, used only when brightness reads fail and a
   // framed reply proves the link. fallbackMax 0 means unknown: the value
   // kept is the top of a 100-step scale, never black.
@@ -170,6 +174,14 @@ enum {
   kNSDDCEvidenceUnchanged = 5,   // the panel answered and stayed on the old value
   kNSDDCEvidenceNotProbed = 6,   // debug line only: this external has not been probed
   kNSDDCEvidenceInFlight = 7,    // debug line only: a probe is running
+  kNSDDCEvidenceTimedOut = 8,    // a read or write did not return in time
+};
+
+// What one read subaddress did, for nsDDCNextReadOffset.
+enum {
+  kNSDDCOffsetEmpty = 0,      // returned within the budget, no frame
+  kNSDDCOffsetFrame = 1,      // a checksum-valid reply
+  kNSDDCOffsetTimedOut = 2,   // the call did not return within the budget
 };
 
 // Raw brightness to write: two steps from current when that stays on the
@@ -214,6 +226,12 @@ typedef struct {
   int fallbackMax;
 } NSDDCProbeFacts;
 NSDDCProbeVerdict nsDDCProbeDecide(const NSDDCProbeFacts *facts, int *current, int *max);
+// Next I2C read subaddress. tried is how many subaddresses have already been
+// attempted. The first is always 0, and only while the display deadline has
+// not passed. 0x51 and 0x50 come next only when offset 0 returned nothing
+// (kNSDDCOffsetEmpty) inside that deadline. A timeout, a frame, or a spent
+// deadline stops the walk. -1 means do not read again.
+int nsDDCNextReadOffset(int tried, int offset0, bool budgetLeft);
 // Read (up to four tries), write nsDDCProbeTarget, read again, then write
 // the original back. The confirmation read is tried up to four times.
 // Controllable when one of those reads is the written value. When every
