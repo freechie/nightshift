@@ -143,6 +143,58 @@ static void checkMatching(void) {
   DDCTarget oneVisible = target(BNQ, 0x8032, 0, "", 2, false);
   CHECK_EQ(nsDDCPickCandidate(one, 2, &oneVisible), -1);
   CHECK_EQ(nsDDCPickCandidate(NULL, 0, &benq), -1);
+  CHECK_EQ(nsDDCPickCandidate(one, 2, NULL), -1);
+
+  // Framebuffer paths. A USB-C HDMI adapter can rewrite vendor and product.
+  // The pipe path still names the display, and only a unique path binds.
+  const char *benqPath = "IOService:/arm-io/AppleT600xIO/dispext0@88000000/AppleCLCD2";
+  const char *acerPath = "IOService:/arm-io/AppleT600xIO/dispext1@90000000/AppleCLCD2";
+  const char *benqTail = "dispext0@88000000/AppleCLCD2";
+  CHECK(nsDDCLocationSame(benqPath, benqPath));
+  CHECK(nsDDCLocationSame(benqPath, benqTail));
+  CHECK(nsDDCLocationSame(benqTail, benqPath));
+  CHECK(!nsDDCLocationSame("", benqPath));
+  CHECK(!nsDDCLocationSame("dispext0", "dispext0"));
+  CHECK(!nsDDCLocationSame(benqPath, acerPath));
+
+  DDCCandidate adapted[2];
+  adapted[0] = candidate(0x0AC8, 0x0001, 0, true, "");
+  adapted[1] = candidate(0x0AC8, 0x0001, 0, true, "");
+  strncpy(adapted[0].location, benqPath, sizeof(adapted[0].location) - 1);
+  strncpy(adapted[1].location, acerPath, sizeof(adapted[1].location) - 1);
+  DDCTarget benqPipe = target(BNQ, 0x8032, 0, "", 1, false);
+  strncpy(benqPipe.location, benqTail, sizeof(benqPipe.location) - 1);
+  DDCTarget acerPipe = target(0x04E7, 0x2720, 0, "", 1, false);
+  strncpy(acerPipe.location, acerPath, sizeof(acerPipe.location) - 1);
+  CHECK_EQ(nsDDCPickCandidate(adapted, 2, &benqPipe), 0);
+  CHECK_EQ(nsDDCPickCandidate(adapted, 2, &acerPipe), 1);
+  // The other monitor's path is not a fallback when the product was rewritten.
+  DDCTarget missingPipe = target(BNQ, 0x8032, 0, "", 1, false);
+  strncpy(missingPipe.location, "IOService:/arm-io/dispext2@1/AppleCLCD2",
+          sizeof(missingPipe.location) - 1);
+  CHECK_EQ(nsDDCPickCandidate(adapted, 2, &missingPipe), -1);
+  // The same tail on two services is ambiguous. Do not pick one.
+  DDCCandidate twinsPath[2];
+  twinsPath[0] = candidate(BNQ, 0x8032, 0, true, "dispext0");
+  twinsPath[1] = candidate(BNQ, 0x8032, 0, true, "dispext1");
+  strncpy(twinsPath[0].location, "IOService:/a/dispext0@1/AppleCLCD2",
+          sizeof(twinsPath[0].location) - 1);
+  strncpy(twinsPath[1].location, "IOService:/b/dispext0@1/AppleCLCD2",
+          sizeof(twinsPath[1].location) - 1);
+  DDCTarget sharedTail = target(BNQ, 0x8032, 0, "", 2, false);
+  strncpy(sharedTail.location, benqTail, sizeof(sharedTail.location) - 1);
+  // benqTail is dispext0@..., not dispext0@1. Use the shared tail.
+  strncpy(sharedTail.location, "dispext0@1/AppleCLCD2", sizeof(sharedTail.location) - 1);
+  CHECK_EQ(nsDDCPickCandidate(twinsPath, 2, &sharedTail), -1);
+  // No service recorded a path: product matching still applies.
+  DDCTarget locatedBenq = target(BNQ, 0x8032, 0, "", 1, false);
+  strncpy(locatedBenq.location, benqPath, sizeof(locatedBenq.location) - 1);
+  CHECK_EQ(nsDDCPickCandidate(one, 2, &locatedBenq), 0);
+  // An internal panel that happens to carry the path is not the external link.
+  DDCCandidate internalPipe[1];
+  internalPipe[0] = candidate(BNQ, 0x8032, 0, false, "disp0");
+  strncpy(internalPipe[0].location, benqPath, sizeof(internalPipe[0].location) - 1);
+  CHECK_EQ(nsDDCPickCandidate(internalPipe, 1, &benqPipe), -1);
 }
 
 static void checkSlots(void) {
@@ -836,6 +888,9 @@ typedef struct {
   bool failSecondRead;
   int confirmLag;  // confirmation reads that still report held
   int held;
+  int failFirst;  // the first N reads fail, later ones work
+  bool framed;
+  int framedCalls;
   int reads;
   int writes;
   int written[4];
@@ -844,7 +899,10 @@ typedef struct {
 static bool probeRead(void *ctx, int *current, int *max) {
   ProbePanel *panel = ctx;
   panel->reads++;
-  if (panel->failRead || (panel->failSecondRead && panel->reads > 1)) {
+  if (panel->failRead || panel->reads <= panel->failFirst) {
+    return false;
+  }
+  if (panel->failSecondRead && panel->writes > 0) {
     return false;
   }
   if (panel->max <= 0) {
@@ -861,6 +919,12 @@ static bool probeRead(void *ctx, int *current, int *max) {
     *current = panel->echoSaved ? panel->savedPercent : panel->panel;
   }
   return *current >= 0 && *current <= *max;
+}
+
+static bool probeFramed(void *ctx) {
+  ProbePanel *panel = ctx;
+  panel->framedCalls++;
+  return panel->framed;
 }
 
 static bool probeWrite(void *ctx, int value) {
@@ -912,7 +976,11 @@ static void checkProbe(void) {
   ProbePanel live = probePanel(42, 100);
   int current = -1;
   int max = -1;
-  NSDDCProbeIO io = {probeRead, probeWrite, &live};
+  NSDDCProbeIO io;
+  memset(&io, 0, sizeof(io));
+  io.read = probeRead;
+  io.write = probeWrite;
+  io.ctx = &live;
   CHECK_EQ(nsDDCProbeControl(&io, &current, &max), kNSDDCProbeControllable);
   CHECK_EQ(current, 42);
   CHECK_EQ(max, 100);
@@ -1089,6 +1157,194 @@ static void checkProbe(void) {
   io.ctx = &empty;
   CHECK_EQ(nsDDCProbeControl(&io, &current, &max), kNSDDCProbeSoftware);
   CHECK_EQ(empty.writes, 0);
+
+  // The first brightness reads fail; a later one is the panel. Still DDC.
+  ProbePanel late = probePanel(42, 100);
+  late.failFirst = 2;
+  io.ctx = &late;
+  io.framed = probeFramed;
+  late.framed = true;
+  CHECK_EQ(nsDDCProbeControl(&io, &current, &max), kNSDDCProbeControllable);
+  CHECK_EQ(late.reads, 4);
+  CHECK_EQ(late.framedCalls, 0);
+  CHECK_EQ(late.written[0], 44);
+  CHECK_EQ(late.written[1], 42);
+  CHECK_EQ(io.evidence, kNSDDCEvidenceRead);
+  CHECK_EQ(current, 42);
+  CHECK_EQ(max, 100);
+
+  // Brightness reads fail, a capabilities/VCP frame is valid, and the write
+  // path accepts the last-known value. That is DDC, not software dimming.
+  ProbePanel linked = probePanel(42, 100);
+  linked.failRead = true;
+  linked.framed = true;
+  io.ctx = &linked;
+  io.framed = probeFramed;
+  io.fallbackCurrent = 40;
+  io.fallbackMax = 100;
+  current = -1;
+  max = -1;
+  CHECK_EQ(nsDDCProbeControl(&io, &current, &max), kNSDDCProbeControllable);
+  CHECK_EQ(linked.writes, 1);
+  CHECK_EQ(linked.written[0], 40);
+  CHECK_EQ(linked.framedCalls, 1);
+  CHECK_EQ(current, 40);
+  CHECK_EQ(max, 100);
+  CHECK_EQ(io.evidence, kNSDDCEvidenceFramed);
+  nsExternalBrightness(kNSDDCProbeControllable, 40, 0, &hw, &sw);
+  nsCombinedLevels(40, 0, &combinedHw, &combinedSw);
+  CHECK_EQ(hw, combinedHw);
+  CHECK_EQ(sw, combinedSw);
+
+  // No last-known level: keep full scale, not black.
+  ProbePanel linkedFull = probePanel(10, 100);
+  linkedFull.failRead = true;
+  linkedFull.framed = true;
+  io.ctx = &linkedFull;
+  io.fallbackCurrent = 0;
+  io.fallbackMax = 0;
+  CHECK_EQ(nsDDCProbeControl(&io, &current, &max), kNSDDCProbeControllable);
+  CHECK_EQ(current, 100);
+  CHECK_EQ(max, 100);
+  CHECK_EQ(linkedFull.written[0], 100);
+  CHECK_EQ(nsDDCProbeKeep(0, 0, NULL), 100);
+  int keptScale = 0;
+  CHECK_EQ(nsDDCProbeKeep(40, 100, &keptScale), 40);
+  CHECK_EQ(keptScale, 100);
+  CHECK_EQ(nsDDCProbeKeep(0, 100, &keptScale), 100);
+
+  // The frame is real but the write is refused. Stay on software dimming.
+  ProbePanel framedDead = probePanel(42, 100);
+  framedDead.failRead = true;
+  framedDead.framed = true;
+  framedDead.failWrite = true;
+  io.ctx = &framedDead;
+  io.fallbackCurrent = 40;
+  io.fallbackMax = 100;
+  CHECK_EQ(nsDDCProbeControl(&io, &current, &max), kNSDDCProbeSoftware);
+  CHECK_EQ(framedDead.writes, 1);
+  CHECK_EQ(io.evidence, kNSDDCEvidenceNone);
+  CHECK_EQ(current, 0);
+  CHECK_EQ(max, 0);
+
+  // Write would return success and brightness reads fail. No framed reply:
+  // that is not evidence, and the lamp is not written.
+  ProbePanel writeOnly = probePanel(42, 100);
+  writeOnly.failRead = true;
+  writeOnly.framed = false;
+  io.ctx = &writeOnly;
+  io.framed = probeFramed;
+  io.fallbackCurrent = 40;
+  io.fallbackMax = 100;
+  CHECK_EQ(nsDDCProbeControl(&io, &current, &max), kNSDDCProbeSoftware);
+  CHECK_EQ(writeOnly.writes, 0);
+  CHECK_EQ(writeOnly.framedCalls, 1);
+  CHECK_EQ(io.evidence, kNSDDCEvidenceWriteOnly);
+  CHECK_EQ(current, 0);
+  nsExternalBrightness(kNSDDCProbeSoftware, 50, 20, &hw, &sw);
+  CHECK_EQ(hw, -1);
+  CHECK_EQ(sw, 73);
+
+  // A stuck readback is negative evidence. A framed callback must not
+  // overturn it, and the software curve stays the one on main.
+  ProbePanel stuckFrame = probePanel(42, 100);
+  stuckFrame.sticky = true;
+  stuckFrame.framed = true;
+  io.ctx = &stuckFrame;
+  io.framed = probeFramed;
+  CHECK_EQ(nsDDCProbeControl(&io, &current, &max), kNSDDCProbeSoftware);
+  CHECK_EQ(stuckFrame.framedCalls, 0);
+  CHECK_EQ(io.evidence, kNSDDCEvidenceUnchanged);
+  CHECK_EQ(stuckFrame.panel, 42);
+  nsExternalBrightness(kNSDDCProbeSoftware, 50, 0, &hw, &sw);
+  CHECK_EQ(hw, -1);
+  CHECK_EQ(sw, nsSoftwareDimShade(50));
+
+  NSDDCProbeFacts readOk;
+  memset(&readOk, 0, sizeof(readOk));
+  readOk.evidence = kNSDDCEvidenceRead;
+  readOk.writeOk = true;
+  readOk.current = 42;
+  readOk.max = 100;
+  CHECK_EQ(nsDDCProbeDecide(&readOk, &current, &max), kNSDDCProbeControllable);
+  CHECK_EQ(current, 42);
+  CHECK_EQ(max, 100);
+
+  NSDDCProbeFacts framedFacts;
+  memset(&framedFacts, 0, sizeof(framedFacts));
+  framedFacts.evidence = kNSDDCEvidenceFramed;
+  framedFacts.writeOk = true;
+  framedFacts.fallbackCurrent = 40;
+  framedFacts.fallbackMax = 100;
+  CHECK_EQ(nsDDCProbeDecide(&framedFacts, &current, &max), kNSDDCProbeControllable);
+  CHECK_EQ(current, 40);
+  CHECK_EQ(max, 100);
+
+  NSDDCProbeFacts writeOnlyFacts;
+  memset(&writeOnlyFacts, 0, sizeof(writeOnlyFacts));
+  writeOnlyFacts.evidence = kNSDDCEvidenceWriteOnly;
+  writeOnlyFacts.writeOk = true;
+  writeOnlyFacts.fallbackCurrent = 40;
+  writeOnlyFacts.fallbackMax = 100;
+  CHECK_EQ(nsDDCProbeDecide(&writeOnlyFacts, &current, &max), kNSDDCProbeSoftware);
+  CHECK_EQ(current, 0);
+  CHECK_EQ(max, 0);
+  nsExternalBrightness(kNSDDCProbeSoftware, 25, 0, &hw, &sw);
+  CHECK_EQ(hw, -1);
+  CHECK_EQ(sw, nsSoftwareDimShade(25));
+
+  NSDDCProbeFacts nothing;
+  memset(&nothing, 0, sizeof(nothing));
+  nothing.evidence = kNSDDCEvidenceNone;
+  CHECK_EQ(nsDDCProbeDecide(&nothing, &current, &max), kNSDDCProbeSoftware);
+  NSDDCProbeFacts noService;
+  memset(&noService, 0, sizeof(noService));
+  noService.evidence = kNSDDCEvidenceNoService;
+  noService.writeOk = true;
+  CHECK_EQ(nsDDCProbeDecide(&noService, &current, &max), kNSDDCProbeSoftware);
+  NSDDCProbeFacts unchanged;
+  memset(&unchanged, 0, sizeof(unchanged));
+  unchanged.evidence = kNSDDCEvidenceUnchanged;
+  unchanged.writeOk = true;
+  unchanged.current = 42;
+  unchanged.max = 100;
+  CHECK_EQ(nsDDCProbeDecide(&unchanged, &current, &max), kNSDDCProbeSoftware);
+  framedFacts.writeOk = false;
+  CHECK_EQ(nsDDCProbeDecide(&framedFacts, &current, &max), kNSDDCProbeSoftware);
+  CHECK_EQ(nsDDCProbeDecide(NULL, &current, &max), kNSDDCProbeSoftware);
+
+  uint8_t vcp[11] = {0x6E, 0x88, 0x02, 0x00, 0x10, 0x00, 0x00, 100, 0x00, 42, 0};
+  uint8_t sum = 0x50;
+  for (int i = 0; i < 10; i++) {
+    sum ^= vcp[i];
+  }
+  vcp[10] = sum;
+  CHECK(nsDDCFrameValid(vcp, 11));
+  vcp[10] ^= 0xFF;
+  CHECK(!nsDDCFrameValid(vcp, 11));
+  uint8_t caps[8] = {0x6E, 0x86, 0xE3, 0x00, 0x00, '(', 'p', 0};
+  sum = 0x50;
+  for (int i = 0; i < 7; i++) {
+    sum ^= caps[i];
+  }
+  caps[7] = sum;
+  CHECK(nsDDCFrameValid(caps, 8));
+  caps[2] = 0x00;
+  CHECK(!nsDDCFrameValid(caps, 8));
+  uint8_t garbage[11];
+  memset(garbage, 0, sizeof(garbage));
+  CHECK(!nsDDCFrameValid(garbage, 11));
+  CHECK(!nsDDCFrameValid(NULL, 11));
+
+  char line[64];
+  CHECK(nsDDCDebugLine(7, 1, kNSDDCProbeControllable, kNSDDCEvidenceRead, line, sizeof(line)));
+  CHECK(strcmp(line, "ddc 7 1 0 1") == 0);
+  CHECK(nsDDCDebugLine(9, -1, kNSDDCProbeSoftware, kNSDDCEvidenceNoService, line, sizeof(line)));
+  CHECK(strcmp(line, "ddc 9 -1 1 4") == 0);
+  CHECK(!nsDDCDebugLine(7, 1, 0, 1, line, 4));
+  CHECK(line[0] == '\0');
+  CHECK(!nsDDCDebugLine(7, 1, 3, 1, line, sizeof(line)));
+  CHECK(!nsDDCDebugLine(7, 1, 0, 9, line, sizeof(line)));
 }
 
 int main(void) {

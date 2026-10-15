@@ -18,8 +18,9 @@
 
 #include "NightshiftLogic.h"
 
-#include <math.h>
+#include <stdio.h>
 #include <string.h>
+#include <math.h>
 
 static int between(int from, int to) { return (to - from + 1440) % 1440; }
 
@@ -96,7 +97,67 @@ bool nsDDCPortName(const char *name, char stop, char *out, size_t cap) {
   return true;
 }
 
+bool nsDDCLocationSame(const char *a, const char *b) {
+  if (a == NULL || b == NULL || a[0] == '\0' || b[0] == '\0') {
+    return false;
+  }
+  // A bare port name is not a framebuffer path, even when the strings match.
+  if (strchr(a, '/') == NULL || strchr(b, '/') == NULL) {
+    return false;
+  }
+  if (strcmp(a, b) == 0) {
+    return true;
+  }
+  size_t la = strlen(a);
+  size_t lb = strlen(b);
+  const char *longer = a;
+  const char *shorter = b;
+  size_t ll = la;
+  size_t ls = lb;
+  if (la < lb) {
+    longer = b;
+    shorter = a;
+    ll = lb;
+    ls = la;
+  }
+  if (ls < 8) {
+    return false;
+  }
+  if (strcmp(longer + (ll - ls), shorter) != 0) {
+    return false;
+  }
+  return longer[ll - ls - 1] == '/';
+}
+
 int nsDDCPickCandidate(const DDCCandidate *candidates, int count, const DDCTarget *target) {
+  if (candidates == NULL || target == NULL || count <= 0) {
+    return -1;
+  }
+  // The registry path is the pipe. An adapter can rewrite vendor and product,
+  // so a unique path wins over those ids. Two paths for one display, or a
+  // path that is not among the services, is not a guess at another monitor.
+  if (target->location[0] != '\0') {
+    int hits = 0;
+    int last = -1;
+    int located = 0;
+    for (int i = 0; i < count; i++) {
+      const DDCCandidate *c = &candidates[i];
+      if (!c->external || c->location[0] == '\0') {
+        continue;
+      }
+      located++;
+      if (nsDDCLocationSame(c->location, target->location)) {
+        hits++;
+        last = i;
+      }
+    }
+    if (hits == 1) {
+      return last;
+    }
+    if (hits > 1 || located > 0) {
+      return -1;
+    }
+  }
   bool vendorKnown = target->vendor != 0 && target->vendor != 0xFFFFFFFFu;
   int sameModel = 0;
   int lastModel = -1;
@@ -311,7 +372,90 @@ bool nsDDCProbeLanded(int before, int written, int after) {
   return after == written;
 }
 
-NSDDCProbeVerdict nsDDCProbeControl(const NSDDCProbeIO *io, int *currentOut, int *maxOut) {
+static bool ddcChecksummed(const uint8_t *bytes, int last, uint8_t expect) {
+  uint8_t sum = 0x50;
+  for (int i = 0; i <= last; i++) {
+    sum ^= bytes[i];
+  }
+  return sum == expect;
+}
+
+bool nsDDCFrameValid(const uint8_t *bytes, int count) {
+  if (bytes == NULL || count < 4) {
+    return false;
+  }
+  if (bytes[0] != 0x6E && bytes[0] != 0x6e) {
+    return false;
+  }
+  if (bytes[2] != 0x02 && bytes[2] != 0xE3) {
+    return false;
+  }
+  int length = bytes[1] & 0x7F;
+  // Length is the count of bytes after the length byte, checksum included.
+  if (length >= 2 && 2 + length <= count &&
+      ddcChecksummed(bytes, length, bytes[1 + length])) {
+    return true;
+  }
+  // IOAVServiceReadI2C of a VCP reply is 11 bytes, checksum at index 10,
+  // even when the length nibble is not 9.
+  if (count >= 11 && ddcChecksummed(bytes, 9, bytes[10])) {
+    return true;
+  }
+  return false;
+}
+
+int nsDDCProbeKeep(int fallbackCurrent, int fallbackMax, int *scaleOut) {
+  int scale = 100;
+  if (fallbackMax > 0 && fallbackMax <= 10000) {
+    scale = fallbackMax;
+  }
+  if (scaleOut != NULL) {
+    *scaleOut = scale;
+  }
+  if (fallbackMax > 0 && fallbackCurrent >= 1 && fallbackCurrent <= scale) {
+    return fallbackCurrent;
+  }
+  return scale;
+}
+
+NSDDCProbeVerdict nsDDCProbeDecide(const NSDDCProbeFacts *facts, int *current, int *max) {
+  if (current != NULL) {
+    *current = 0;
+  }
+  if (max != NULL) {
+    *max = 0;
+  }
+  if (facts == NULL) {
+    return kNSDDCProbeSoftware;
+  }
+  if (facts->evidence == kNSDDCEvidenceRead && facts->max > 0 && facts->current >= 0 &&
+      facts->current <= facts->max) {
+    if (current != NULL) {
+      *current = facts->current;
+    }
+    if (max != NULL) {
+      *max = facts->max;
+    }
+    return kNSDDCProbeControllable;
+  }
+  // A capabilities or VCP frame proves the panel answered. The write has to
+  // succeed as well. The value kept is the last-known raw level, or full
+  // brightness when that is unknown, so the probe does not black the panel.
+  if (facts->evidence == kNSDDCEvidenceFramed && facts->writeOk) {
+    int scale = 0;
+    int keep = nsDDCProbeKeep(facts->fallbackCurrent, facts->fallbackMax, &scale);
+    if (current != NULL) {
+      *current = keep;
+    }
+    if (max != NULL) {
+      *max = scale;
+    }
+    return kNSDDCProbeControllable;
+  }
+  return kNSDDCProbeSoftware;
+}
+
+NSDDCProbeVerdict nsDDCProbeControl(NSDDCProbeIO *io, int *currentOut, int *maxOut) {
   if (currentOut != NULL) {
     *currentOut = 0;
   }
@@ -319,33 +463,65 @@ NSDDCProbeVerdict nsDDCProbeControl(const NSDDCProbeIO *io, int *currentOut, int
     *maxOut = 0;
   }
   if (io == NULL || io->read == NULL || io->write == NULL) {
+    if (io != NULL) {
+      io->evidence = kNSDDCEvidenceNone;
+    }
     return kNSDDCProbeSoftware;
   }
+  io->evidence = kNSDDCEvidenceNone;
   int before = 0;
   int scale = 0;
-  if (!io->read(io->ctx, &before, &scale) || scale <= 0 || before < 0 || before > scale) {
-    return kNSDDCProbeSoftware;
+  bool readOk = false;
+  // HDMI often drops the first VCP read. A later try is still a read.
+  for (int attempt = 0; attempt < 4; attempt++) {
+    before = 0;
+    scale = 0;
+    if (io->read(io->ctx, &before, &scale) && scale > 0 && before >= 0 && before <= scale) {
+      readOk = true;
+      break;
+    }
   }
-  if (currentOut != NULL) {
-    *currentOut = before;
-  }
-  if (maxOut != NULL) {
-    *maxOut = scale;
+  NSDDCProbeFacts facts;
+  memset(&facts, 0, sizeof(facts));
+  facts.fallbackCurrent = io->fallbackCurrent;
+  facts.fallbackMax = io->fallbackMax;
+  if (!readOk) {
+    bool framed = io->framed != NULL && io->framed(io->ctx);
+    if (!framed) {
+      // The write function is there. Its return code, with no frame, is not
+      // evidence the packet reached the panel.
+      facts.evidence = kNSDDCEvidenceWriteOnly;
+      facts.writeOk = true;
+      io->evidence = facts.evidence;
+      return nsDDCProbeDecide(&facts, currentOut, maxOut);
+    }
+    int keepScale = 0;
+    int keep = nsDDCProbeKeep(io->fallbackCurrent, io->fallbackMax, &keepScale);
+    facts.evidence = kNSDDCEvidenceFramed;
+    facts.writeOk = io->write(io->ctx, keep);
+    facts.fallbackCurrent = keep;
+    facts.fallbackMax = keepScale;
+    io->evidence = facts.writeOk ? kNSDDCEvidenceFramed : kNSDDCEvidenceNone;
+    facts.evidence = io->evidence;
+    return nsDDCProbeDecide(&facts, currentOut, maxOut);
   }
   int target = nsDDCProbeTarget(before, scale);
   if (target < 0 || !io->write(io->ctx, target)) {
-    return kNSDDCProbeSoftware;
+    io->evidence = kNSDDCEvidenceNone;
+    return nsDDCProbeDecide(&facts, currentOut, maxOut);
   }
   // A slow panel can report the pre-write value once. Keep reading until one
   // sample is the value just written, or four tries are used up. A cached
   // read stays on the first value for every try and does not pass.
   bool landed = false;
+  bool sawReply = false;
   for (int attempt = 0; attempt < 4; attempt++) {
     int after = 0;
     int scaleAfter = 0;
     if (!io->read(io->ctx, &after, &scaleAfter)) {
       continue;
     }
+    sawReply = true;
     if (scaleAfter == scale && nsDDCProbeLanded(before, target, after)) {
       landed = true;
       break;
@@ -354,7 +530,38 @@ NSDDCProbeVerdict nsDDCProbeControl(const NSDDCProbeIO *io, int *currentOut, int
   // The nudge already went out. Put the original back whether or not a
   // confirmation read proved the panel moved.
   (void)io->write(io->ctx, before);
-  return landed ? kNSDDCProbeControllable : kNSDDCProbeSoftware;
+  if (landed) {
+    facts.evidence = kNSDDCEvidenceRead;
+    facts.writeOk = true;
+    facts.current = before;
+    facts.max = scale;
+  } else if (sawReply) {
+    facts.evidence = kNSDDCEvidenceUnchanged;
+  } else {
+    facts.evidence = kNSDDCEvidenceNone;
+  }
+  io->evidence = facts.evidence;
+  return nsDDCProbeDecide(&facts, currentOut, maxOut);
+}
+
+bool nsDDCDebugLine(uint32_t display, int service, int verdict, int evidence, char *out,
+                    size_t cap) {
+  if (out == NULL || cap == 0) {
+    return false;
+  }
+  out[0] = '\0';
+  if (verdict != kNSDDCProbeControllable && verdict != kNSDDCProbeSoftware) {
+    return false;
+  }
+  if (evidence < kNSDDCEvidenceNone || evidence > kNSDDCEvidenceUnchanged) {
+    return false;
+  }
+  int wrote = snprintf(out, cap, "ddc %u %d %d %d", display, service, verdict, evidence);
+  if (wrote < 0 || (size_t)wrote >= cap) {
+    out[0] = '\0';
+    return false;
+  }
+  return true;
 }
 
 const char *nsDDCControlLabel(NSDDCProbeVerdict verdict) {

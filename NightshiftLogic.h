@@ -48,6 +48,11 @@ typedef struct {
   uint32_t serial;   // EDID bytes 12-15, 0 when the monitor leaves it unset
   bool external;     // "Location" is "External", or the property is missing
   char port[32];     // "dispext0" from the parent "dispext0:dcpav-service-epic:0"
+  // IORegistry path of the framebuffer that sits with this service
+  // (AppleCLCD2 / IOMobileFramebuffer, including the built-in HDMI pipe).
+  // Empty when the walk could not see one. Adapters may rewrite vendor and
+  // product; this path does not.
+  char location[256];
 } DDCCandidate;
 
 // What CoreGraphics knows about the display being matched.
@@ -56,15 +61,21 @@ typedef struct {
   uint32_t model;
   uint32_t serial;
   char port[32];      // "dispext0" from CoreDisplay's IODisplayLocation, "" if unknown
+  char location[256]; // that IODisplayLocation, or "" when CoreDisplay has none
   int twins;          // online displays with this vendor and model, this one included
   bool serialShared;  // another of those twins reports the same nonzero serial
 } DDCTarget;
 
 // Copies the part of name before stop ("dispext0" from "dispext0@88000000").
 bool nsDDCPortName(const char *name, char stop, char *out, size_t cap);
+// True when both paths name the same framebuffer. Equal strings match. So
+// does a longer path whose tail, at a slash, is the shorter one. Empty
+// strings and bare port names (no slash) do not match.
+bool nsDDCLocationSame(const char *a, const char *b);
 // The index of the one candidate that is certainly this display, or -1 when
-// it is ambiguous and the shade should be used. Never trades a known brand
-// for a guess.
+// it is ambiguous and the shade should be used. A unique location match wins
+// even when an adapter rewrote vendor or product. Two location hits, or a
+// target location that misses every located service, is not a guess.
 int nsDDCPickCandidate(const DDCCandidate *candidates, int count, const DDCTarget *target);
 
 // MARK: DDC slots and readback
@@ -128,16 +139,36 @@ void nsCombinedLevels(long percent, long floor, long *hardware, long *software);
 
 // read and write talk to the panel (raw VCP 0x10). They must not answer from
 // Nightshift's saved brightness or the number the UI is showing.
+// framed, when set, is true only for a checksum-valid DDC capabilities or
+// VCP reply. A write that returns success is not this.
 typedef struct {
   bool (*read)(void *ctx, int *current, int *max);
   bool (*write)(void *ctx, int value);
   void *ctx;
+  bool (*framed)(void *ctx);
+  // Last-known raw brightness, used only when brightness reads fail and a
+  // framed reply proves the link. fallbackMax 0 means unknown: the value
+  // kept is the top of a 100-step scale, never black.
+  int fallbackCurrent;
+  int fallbackMax;
+  // Set by nsDDCProbeControl. One of the kNSDDCEvidence values.
+  int evidence;
 } NSDDCProbeIO;
 
 typedef enum {
-  kNSDDCProbeControllable = 0,  // the panel followed a write
-  kNSDDCProbeSoftware = 1,      // unchanged readback, or a read/write error
+  kNSDDCProbeControllable = 0,  // a read landed, or a framed reply and a write
+  kNSDDCProbeSoftware = 1,      // no proof, or a write the panel did not follow
 } NSDDCProbeVerdict;
+
+// What the probe was able to prove. Codes only; the debug line prints these.
+enum {
+  kNSDDCEvidenceNone = 0,        // nothing answered, or the write was refused
+  kNSDDCEvidenceRead = 1,        // a VCP 0x10 readback was the value written
+  kNSDDCEvidenceFramed = 2,      // capabilities or other VCP frame, and a write
+  kNSDDCEvidenceWriteOnly = 3,   // write path present, no valid reply
+  kNSDDCEvidenceNoService = 4,   // no unambiguous service
+  kNSDDCEvidenceUnchanged = 5,   // the panel answered and stayed on the old value
+};
 
 // Raw brightness to write: two steps from current when that stays on the
 // scale, otherwise one. -1 when the scale cannot move. The step is raw, not
@@ -147,14 +178,40 @@ int nsDDCProbeTarget(int current, int max);
 // read. Exact, not nsDDCNear: a one- or two-step nudge sits inside that
 // tolerance, so a cached read of the old value would look close enough.
 bool nsDDCProbeLanded(int before, int written, int after);
-// Read, write nsDDCProbeTarget, read again, then write the original back.
-// The confirmation read is tried up to four times: a slow panel can still
-// answer with the old value once. Controllable only when one of those reads
-// is the written value. A read or write error, or a readback that never
-// leaves the first value, is software-only. When the first read works,
-// *current and *max receive it (the value written back). Either pointer may
-// be NULL.
-NSDDCProbeVerdict nsDDCProbeControl(const NSDDCProbeIO *io, int *current, int *max);
+// Checksum-valid DDC reply: capabilities (opcode 0xE3) or a VCP reply
+// (opcode 0x02). Accepts a length-prefixed frame and the 11-byte VCP layout
+// Apple's I2C read returns. Garbage and a bare write ack are not valid.
+bool nsDDCFrameValid(const uint8_t *bytes, int count);
+// Raw value to keep when brightness cannot be read. Scale 100 and the top
+// of that scale when fallbackMax is 0. Never returns 0.
+int nsDDCProbeKeep(int fallbackCurrent, int fallbackMax, int *scale);
+// Policy for one probe. Read that landed is controllable. A framed reply
+// plus a successful write is controllable, at the kept value. Write-only,
+// an unchanged readback, a missing service, and anything ambiguous stay
+// software dimming. *current and *max receive the value to publish, or 0
+// when the verdict is software. Either pointer may be NULL.
+typedef struct {
+  int evidence;
+  bool writeOk;
+  int current;
+  int max;
+  int fallbackCurrent;
+  int fallbackMax;
+} NSDDCProbeFacts;
+NSDDCProbeVerdict nsDDCProbeDecide(const NSDDCProbeFacts *facts, int *current, int *max);
+// Read (up to four tries), write nsDDCProbeTarget, read again, then write
+// the original back. The confirmation read is tried up to four times.
+// Controllable when one of those reads is the written value. When every
+// brightness read fails, a framed reply and a write of the kept value are
+// still controllable. A write with no valid reply, or a readback that stays
+// on the first value, is software-only. io->evidence receives the code.
+// When the first read works, *current and *max receive it. Either pointer
+// may be NULL. io may be NULL.
+NSDDCProbeVerdict nsDDCProbeControl(NSDDCProbeIO *io, int *current, int *max);
+// "ddc <display> <service> <verdict> <evidence>". Service -1 is no match.
+// Nothing but those codes. False when the buffer cannot hold the line.
+bool nsDDCDebugLine(uint32_t display, int service, int verdict, int evidence, char *out,
+                    size_t cap);
 // Settings label. Controllable is "DDC/CI connected". Software is
 // "Software dimming" and is never the connected label.
 const char *nsDDCControlLabel(NSDDCProbeVerdict verdict);
