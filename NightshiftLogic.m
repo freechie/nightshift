@@ -737,6 +737,89 @@ NSDDCProbeVerdict nsDDCProbeControl(NSDDCProbeIO *io, int *currentOut, int *maxO
   return nsDDCProbeDecide(&facts, currentOut, maxOut);
 }
 
+const char *nsDDCReplyReason(const uint8_t *bytes, int count) {
+  NSDDCReply reply;
+  if (nsDDCDecodeReply(bytes, count, &reply) && reply.brightness) {
+    return "ok";
+  }
+  if (bytes == NULL || count <= 0) {
+    return "all zeros";
+  }
+  bool zeros = true;
+  for (int i = 0; i < count; i++) {
+    if (bytes[i] != 0) {
+      zeros = false;
+      break;
+    }
+  }
+  if (zeros) {
+    return "all zeros";
+  }
+  if (bytes[0] != 0x6E && bytes[0] != 0x6F && bytes[0] != 0x6e) {
+    return "wrong first byte";
+  }
+  if (count < 2) {
+    return "bad length";
+  }
+  uint8_t length = bytes[1];
+  bool lengthOk = length == 0x51 ||
+                  ((length & 0x80) != 0 && (length & 0x7F) >= 3 && (length & 0x7F) <= 32);
+  if (!lengthOk) {
+    return "bad length";
+  }
+  if (count < 2 || ddcXor(0x50, bytes, 0, count - 2) != bytes[count - 1]) {
+    return "checksum mismatch";
+  }
+  return "wrong opcode or VCP code";
+}
+
+static bool ddcIOToken(int state, int code, char *out, size_t cap) {
+  int wrote = 0;
+  if (state == kNSDDCIOTimeout) {
+    wrote = snprintf(out, cap, "timeout");
+  } else if (state == kNSDDCIOCode) {
+    wrote = snprintf(out, cap, "0x%x", (unsigned)code);
+  } else {
+    wrote = snprintf(out, cap, "none");
+  }
+  return wrote > 0 && (size_t)wrote < cap;
+}
+
+bool nsDDCReplyLine(uint32_t display, int writeState, int writeCode, int readState, int readCode,
+                    const uint8_t *bytes, int count, char *out, size_t cap) {
+  if (out == NULL || cap == 0) {
+    return false;
+  }
+  out[0] = '\0';
+  uint8_t raw[12];
+  memset(raw, 0, sizeof(raw));
+  if (bytes != NULL && count > 0) {
+    int n = count < 12 ? count : 12;
+    memcpy(raw, bytes, (size_t)n);
+  }
+  char writeToken[32];
+  char readToken[32];
+  if (!ddcIOToken(writeState, writeCode, writeToken, sizeof(writeToken)) ||
+      !ddcIOToken(readState, readCode, readToken, sizeof(readToken))) {
+    return false;
+  }
+  int wrote = snprintf(out, cap, "ddc reply %u %s %s %s", display, writeToken, readToken,
+                       nsDDCReplyReason(raw, 12));
+  if (wrote < 0 || (size_t)wrote >= cap) {
+    out[0] = '\0';
+    return false;
+  }
+  for (int i = 0; i < 12; i++) {
+    int next = snprintf(out + wrote, cap - (size_t)wrote, " %02x", raw[i]);
+    if (next < 0 || (size_t)next >= cap - (size_t)wrote) {
+      out[0] = '\0';
+      return false;
+    }
+    wrote += next;
+  }
+  return true;
+}
+
 bool nsDDCDebugLine(uint32_t display, int service, int verdict, int evidence, char *out,
                     size_t cap) {
   if (out == NULL || cap == 0) {
@@ -778,11 +861,13 @@ int nsDDCDebugReport(const uint32_t *displays, const int *builtin, int displayCo
     int service = -1;
     int verdict = kNSDDCProbeSoftware;
     int evidence = kNSDDCEvidenceNotProbed;
+    const NSDDCDebugRow *row = NULL;
     for (int r = 0; r < rowCount; r++) {
       if (rows[r].display == displays[i]) {
         service = rows[r].service;
         verdict = rows[r].verdict;
         evidence = rows[r].evidence;
+        row = &rows[r];
         break;
       }
     }
@@ -797,6 +882,20 @@ int nsDDCDebugReport(const uint32_t *displays, const int *builtin, int displayCo
     }
     used += (size_t)wrote;
     lines++;
+    if (row != NULL && row->haveReply) {
+      char reply[160];
+      if (!nsDDCReplyLine(displays[i], row->writeState, row->writeCode, row->readState,
+                          row->readCode, row->reply, 12, reply, sizeof(reply))) {
+        continue;
+      }
+      wrote = snprintf(out + used, cap - used, "%s\n", reply);
+      if (wrote < 0 || (size_t)wrote >= cap - used) {
+        out[used] = '\0';
+        return -1;
+      }
+      used += (size_t)wrote;
+      lines++;
+    }
   }
   return lines;
 }

@@ -246,12 +246,33 @@ NSDDCProbeVerdict nsDDCProbeControl(NSDDCProbeIO *io, int *current, int *max);
 // Nothing but those codes. False when the buffer cannot hold the line.
 bool nsDDCDebugLine(uint32_t display, int service, int verdict, int evidence, char *out,
                     size_t cap);
-// One recorded probe row. evidence is a kNSDDCEvidence value.
+// How an IOReturn is shown on the reply line. none: the call was not made.
+// code: print 0x and the value. timeout: the call did not return in time.
+enum {
+  kNSDDCIONone = 0,
+  kNSDDCIOCode = 1,
+  kNSDDCIOTimeout = 2,
+};
+// Why a 12-byte VCP 0x10 buffer was not accepted. "ok" when the existing
+// decoder takes it as brightness. This does not decide acceptance.
+const char *nsDDCReplyReason(const uint8_t *bytes, int count);
+// "ddc reply <display> <write> <read> <reason> <12 hex bytes>".
+// write and read are "none", "timeout", or 0x-hex. False when out is short.
+bool nsDDCReplyLine(uint32_t display, int writeState, int writeCode, int readState, int readCode,
+                    const uint8_t *bytes, int count, char *out, size_t cap);
+// One recorded probe row. evidence is a kNSDDCEvidence value. haveReply
+// adds the raw brightness-read line after the status line.
 typedef struct {
   uint32_t display;
   int service;
   int verdict;
   int evidence;
+  bool haveReply;
+  int writeState;
+  int writeCode;
+  int readState;
+  int readCode;
+  uint8_t reply[12];
 } NSDDCDebugRow;
 // One line per external, in display order, each ending in a newline.
 // builtin[i] != 0 skips that display. A display with no row is not-probed

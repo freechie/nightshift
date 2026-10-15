@@ -771,7 +771,7 @@ typedef struct {
 } DDCI2CJob;
 
 static BOOL ddcI2C(IOAVServiceRef service, uint32_t address, uint8_t *data, uint32_t length,
-                   BOOL isWrite, uint64_t deadline, BOOL *timedOut) {
+                   BOOL isWrite, uint64_t deadline, BOOL *timedOut, IOReturn *status) {
   if (timedOut != NULL) {
     *timedOut = NO;
   }
@@ -848,6 +848,9 @@ static BOOL ddcI2C(IOAVServiceRef service, uint32_t address, uint8_t *data, uint
     // The call already stored its result. Do not wait on it again.
   }
   BOOL ok = job->result == 0;
+  if (status != NULL) {
+    *status = job->result;
+  }
   if (ok && !isWrite) {
     memcpy(data, job->bytes, length);
   }
@@ -857,11 +860,34 @@ static BOOL ddcI2C(IOAVServiceRef service, uint32_t address, uint8_t *data, uint
   return ok;
 }
 
+// Most recent VCP 0x10 transaction. Diagnostic only; acceptance is unchanged.
+typedef struct {
+  int writeState;
+  int writeCode;
+  int readState;
+  int readCode;
+  uint8_t bytes[12];
+} DDCReplyCapture;
+
+static DDCReplyCapture gBrightnessReply;
+static BOOL gBrightnessReplySet = NO;
+
+static void ddcRememberBrightnessReply(const DDCReplyCapture *cap) {
+  if (cap == NULL) {
+    return;
+  }
+  gBrightnessReply = *cap;
+  gBrightnessReplySet = YES;
+}
+
 // Chip 0x37, data address 0x51 for the write and the read. Two sends, 10ms
 // apart, then one 12-byte read at that same address. No other offset.
 static BOOL ddcWriteRead(IOAVServiceRef service, uint8_t *request, int requestLen, uint8_t *reply,
-                         int replyLen, uint64_t deadline, BOOL *timedOut) {
+                         int replyLen, uint64_t deadline, BOOL *timedOut, DDCReplyCapture *cap) {
   ddcWaitAfterWrite();
+  if (cap != NULL) {
+    memset(cap, 0, sizeof(*cap));
+  }
   int writeCycle = 0;
   BOOL wrote = NO;
   while (writeCycle < 2) {
@@ -869,12 +895,21 @@ static BOOL ddcWriteRead(IOAVServiceRef service, uint8_t *request, int requestLe
       if (timedOut != NULL) {
         *timedOut = YES;
       }
+      if (cap != NULL && cap->writeState == kNSDDCIONone) {
+        cap->writeState = kNSDDCIOTimeout;
+      }
       return NO;
     }
     BOOL hung = NO;
-    if (ddcI2C(service, 0x51, request, (uint32_t)requestLen, YES, deadline, &hung)) {
+    IOReturn code = 0;
+    if (ddcI2C(service, 0x51, request, (uint32_t)requestLen, YES, deadline, &hung, &code)) {
       wrote = YES;
-    } else if (hung) {
+    }
+    if (cap != NULL) {
+      cap->writeState = hung ? kNSDDCIOTimeout : kNSDDCIOCode;
+      cap->writeCode = hung ? 0 : (int)code;
+    }
+    if (hung) {
       if (timedOut != NULL) {
         *timedOut = YES;
       }
@@ -893,12 +928,22 @@ static BOOL ddcWriteRead(IOAVServiceRef service, uint8_t *request, int requestLe
     if (timedOut != NULL) {
       *timedOut = YES;
     }
+    if (cap != NULL) {
+      cap->readState = kNSDDCIOTimeout;
+    }
     return NO;
   }
   uint8_t buf[12];
   memset(buf, 0, sizeof(buf));
   BOOL hung = NO;
-  if (!ddcI2C(service, 0x51, buf, 12, NO, deadline, &hung)) {
+  IOReturn code = 0;
+  BOOL readOk = ddcI2C(service, 0x51, buf, 12, NO, deadline, &hung, &code);
+  if (cap != NULL) {
+    memcpy(cap->bytes, buf, sizeof(cap->bytes));
+    cap->readState = hung ? kNSDDCIOTimeout : kNSDDCIOCode;
+    cap->readCode = hung ? 0 : (int)code;
+  }
+  if (!readOk) {
     if (hung && timedOut != NULL) {
       *timedOut = YES;
     }
@@ -911,11 +956,19 @@ static BOOL ddcWriteRead(IOAVServiceRef service, uint8_t *request, int requestLe
 
 // One transaction at data address 0x51. The caller retries.
 static BOOL ddcReadFrame(IOAVServiceRef service, uint8_t *request, int requestLen,
-                         NSDDCReply *decoded, BOOL brightnessOnly, uint64_t deadline, BOOL *timedOut) {
+                         NSDDCReply *decoded, BOOL brightnessOnly, uint64_t deadline, BOOL *timedOut,
+                         BOOL record) {
   uint8_t reply[12];
   memset(reply, 0, sizeof(reply));
+  DDCReplyCapture cap;
+  memset(&cap, 0, sizeof(cap));
   BOOL hung = NO;
-  if (!ddcWriteRead(service, request, requestLen, reply, 12, deadline, &hung)) {
+  BOOL got = ddcWriteRead(service, request, requestLen, reply, 12, deadline, &hung,
+                          record ? &cap : NULL);
+  if (record) {
+    ddcRememberBrightnessReply(&cap);
+  }
+  if (!got) {
     if (hung && timedOut != NULL) {
       *timedOut = YES;
     }
@@ -937,7 +990,7 @@ static BOOL ddcReadOnce(IOAVServiceRef service, int *current, int *max, uint64_t
   uint8_t request[4] = {0x82, 0x01, 0x10, 0};
   request[3] = (uint8_t)(0x6E ^ request[0] ^ request[1] ^ request[2]);
   NSDDCReply decoded;
-  if (!ddcReadFrame(service, request, 4, &decoded, YES, deadline, timedOut)) {
+  if (!ddcReadFrame(service, request, 4, &decoded, YES, deadline, timedOut, YES)) {
     return NO;
   }
   *current = decoded.current;
@@ -955,13 +1008,13 @@ static BOOL ddcCapabilitiesOnce(IOAVServiceRef service, int withDataAddress, uin
     seed = (uint8_t)(0x6E ^ 0x51);
   }
   request[4] = (uint8_t)(seed ^ request[0] ^ request[1] ^ request[2] ^ request[3]);
-  return ddcReadFrame(service, request, 5, NULL, NO, deadline, timedOut);
+  return ddcReadFrame(service, request, 5, NULL, NO, deadline, timedOut, NO);
 }
 
 static BOOL ddcVCPFrameOnce(IOAVServiceRef service, uint64_t deadline, BOOL *timedOut) {
   uint8_t request[4] = {0x82, 0x01, 0x10, 0};
   request[3] = (uint8_t)(0x6E ^ request[0] ^ request[1] ^ request[2]);
-  return ddcReadFrame(service, request, 4, NULL, NO, deadline, timedOut);
+  return ddcReadFrame(service, request, 4, NULL, NO, deadline, timedOut, YES);
 }
 
 // Brightness for a display that waits for the current probe to land
@@ -1320,6 +1373,12 @@ typedef struct {
   int service;
   int verdict;
   int evidence;
+  BOOL haveReply;
+  int writeState;
+  int writeCode;
+  int readState;
+  int readCode;
+  uint8_t reply[12];
 } DDCDebugRow;
 
 static DDCDebugRow gDDCDebug[8];
@@ -1352,12 +1411,40 @@ static void ddcNoteDebug(uint32_t display, int service, int verdict, int evidenc
   gDDCDebug[slot].service = service;
   gDDCDebug[slot].verdict = verdict;
   gDDCDebug[slot].evidence = evidence;
+  gDDCDebug[slot].haveReply = NO;
   if (!ddcDebugOn()) {
     return;
   }
   char line[64];
   if (nsDDCDebugLine(display, service, verdict, evidence, line, sizeof(line))) {
     fprintf(stderr, "%s\n", line);
+  }
+}
+
+static void ddcNoteReply(uint32_t display, int writeState, int writeCode, int readState, int readCode,
+                         const uint8_t *bytes) {
+  for (int i = 0; i < gDDCDebugCount; i++) {
+    if (gDDCDebug[i].display != display) {
+      continue;
+    }
+    gDDCDebug[i].haveReply = YES;
+    gDDCDebug[i].writeState = writeState;
+    gDDCDebug[i].writeCode = writeCode;
+    gDDCDebug[i].readState = readState;
+    gDDCDebug[i].readCode = readCode;
+    memset(gDDCDebug[i].reply, 0, sizeof(gDDCDebug[i].reply));
+    if (bytes != NULL) {
+      memcpy(gDDCDebug[i].reply, bytes, sizeof(gDDCDebug[i].reply));
+    }
+    if (!ddcDebugOn()) {
+      return;
+    }
+    char line[160];
+    if (nsDDCReplyLine(display, writeState, writeCode, readState, readCode, gDDCDebug[i].reply, 12,
+                       line, sizeof(line))) {
+      fprintf(stderr, "%s\n", line);
+    }
+    return;
   }
 }
 
@@ -1401,6 +1488,18 @@ int ddcCopyDebug(char *out, int cap) {
         break;
       }
       used += wrote;
+      if (gDDCDebug[i].haveReply) {
+        char reply[160];
+        if (nsDDCReplyLine(gDDCDebug[i].display, gDDCDebug[i].writeState, gDDCDebug[i].writeCode,
+                           gDDCDebug[i].readState, gDDCDebug[i].readCode, gDDCDebug[i].reply, 12,
+                           reply, sizeof(reply))) {
+          wrote = snprintf(out + used, (size_t)(cap - used), "%s\n", reply);
+          if (wrote < 0 || used + wrote >= cap) {
+            break;
+          }
+          used += wrote;
+        }
+      }
     }
     return gDDCDebugCount;
   }
@@ -1415,6 +1514,12 @@ int ddcCopyDebug(char *out, int cap) {
     rows[i].service = gDDCDebug[i].service;
     rows[i].verdict = gDDCDebug[i].verdict;
     rows[i].evidence = gDDCDebug[i].evidence;
+    rows[i].haveReply = gDDCDebug[i].haveReply ? true : false;
+    rows[i].writeState = gDDCDebug[i].writeState;
+    rows[i].writeCode = gDDCDebug[i].writeCode;
+    rows[i].readState = gDDCDebug[i].readState;
+    rows[i].readCode = gDDCDebug[i].readCode;
+    memcpy(rows[i].reply, gDDCDebug[i].reply, sizeof(rows[i].reply));
   }
   int lines = nsDDCDebugReport(ids, builtin, count, rows, rowCount, out, (size_t)cap);
   return lines < 0 ? 0 : lines;
@@ -1535,12 +1640,20 @@ void probeDDC(void) {
       int serviceIndex;
       int evidence;
       IOAVServiceRef service;
+      BOOL haveReply;
+      int writeState;
+      int writeCode;
+      int readState;
+      int readCode;
+      uint8_t reply[12];
     } DDCResult;
     DDCResult *results = pending > 0 ? calloc((size_t)pending, sizeof(DDCResult)) : NULL;
     if (results == NULL) {
       pending = 0;
     }
     for (int i = 0; i < pending; i++) {
+      gBrightnessReplySet = NO;
+      memset(&gBrightnessReply, 0, sizeof(gBrightnessReply));
       int serviceIndex = -1;
       IOAVServiceRef service = serviceMatching(&wanted[i], &serviceIndex);
       results[i].display = targets[i];
@@ -1584,6 +1697,14 @@ void probeDDC(void) {
         }
         results[i].evidence = io.evidence;
       }
+      if (gBrightnessReplySet) {
+        results[i].haveReply = YES;
+        results[i].writeState = gBrightnessReply.writeState;
+        results[i].writeCode = gBrightnessReply.writeCode;
+        results[i].readState = gBrightnessReply.readState;
+        results[i].readCode = gBrightnessReply.readCode;
+        memcpy(results[i].reply, gBrightnessReply.bytes, sizeof(results[i].reply));
+      }
     }
     dispatch_async(dispatch_get_main_queue(), ^{
       if (gDDCEpoch != probeEpoch) {
@@ -1602,6 +1723,10 @@ void probeDDC(void) {
         int verdict =
             results[i].max > 0 ? kNSDDCProbeControllable : kNSDDCProbeSoftware;
         ddcNoteDebug(results[i].display, results[i].serviceIndex, verdict, results[i].evidence);
+        if (results[i].haveReply) {
+          ddcNoteReply(results[i].display, results[i].writeState, results[i].writeCode,
+                       results[i].readState, results[i].readCode, results[i].reply);
+        }
         // A write confirmed or moved this channel while the probe was out, so
         // these reads are stale. Publishing them would reset current and
         // posted and drop queued writes. The result owns its service.
@@ -1704,7 +1829,7 @@ static BOOL ddcWriteOnce(IOAVServiceRef service, int value, uint64_t deadline, B
   for (int cycle = 0; cycle < 2; cycle++) {
     usleep(10000);
     BOOL hung = NO;
-    if (ddcI2C(service, 0x51, request, 6, YES, deadline, &hung)) {
+    if (ddcI2C(service, 0x51, request, 6, YES, deadline, &hung, NULL)) {
       wrote = YES;
     }
     if (hung) {
