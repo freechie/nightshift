@@ -458,6 +458,47 @@ long nsSafeBrightness(long percent, bool builtin, int otherLitDisplays) {
   return otherLitDisplays > 0 ? 0 : 1;
 }
 
+int nsCommandWarmthDirection(unsigned hotKeyID) {
+  if (hotKeyID == 1) {
+    return -1;
+  }
+  if (hotKeyID == 2) {
+    return 1;
+  }
+  return 0;
+}
+
+long nsCommandWarmthStep(void) {
+  return 5;
+}
+
+long nsCommandWarmthNext(long percent, int direction) {
+  if (percent < 0) {
+    percent = 0;
+  }
+  if (percent > 100) {
+    percent = 100;
+  }
+  if (direction == 1 || direction == -1) {
+    percent += direction * nsCommandWarmthStep();
+  }
+  if (percent < 0) {
+    percent = 0;
+  }
+  if (percent > 100) {
+    percent = 100;
+  }
+  return percent;
+}
+
+double nsCommandWarmthRepeatGap(double seconds) {
+  // NaN fails this comparison, so it takes the floor too.
+  if (!(seconds >= 0.02)) {
+    return 0.02;
+  }
+  return seconds;
+}
+
 bool nsCountsAsLit(NSOtherDisplay display) {
   if (display.asleep || display.mirrored) {
     return false;

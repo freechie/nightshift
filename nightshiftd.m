@@ -5248,6 +5248,10 @@ static NSImage *sidebarTile(NSInteger pane, CGFloat size) {
 - (void)refresh;
 - (void)syncLoginItem;
 - (void)syncStatusItem;
+// The Current slider. preview is a drag tick (shown, not saved). commit is
+// the mouse-up: one applyWarmth, the same path nowMoved uses on release.
+- (void)previewCurrentIntensity:(long)value;
+- (void)commitCurrentIntensity:(long)value;
 @end
 
 @implementation MenuBar
@@ -5733,18 +5737,32 @@ static NSImage *sidebarTile(NSInteger pane, CGFloat size) {
   }
 }
 
-- (void)nowMoved:(NSSlider *)slider {
-  long value = (long)llround(slider.doubleValue);
-  self.panel.nowValue.stringValue = [NSString stringWithFormat:@"%ld%%", value];
-  long saved = self.panel.savedMax;
-  if ([self holdingFull] || (rampLicensed() && saved >= 1 && value > saved)) {
-    [self.panel previewMax:value];
-  } else if (saved >= 1) {
-    [self.panel previewMax:saved];
+- (void)previewCurrentIntensity:(long)value {
+  if (value < 0) {
+    value = 0;
   }
-  if (!sliderSettled()) {
-    self.tracking = YES;
-    return;
+  if (value > 100) {
+    value = 100;
+  }
+  if (self.panel != nil) {
+    self.panel.nowSlider.doubleValue = value;
+    self.panel.nowValue.stringValue = [NSString stringWithFormat:@"%ld%%", value];
+    long saved = self.panel.savedMax;
+    if ([self holdingFull] || (rampLicensed() && saved >= 1 && value > saved)) {
+      [self.panel previewMax:value];
+    } else if (saved >= 1) {
+      [self.panel previewMax:saved];
+    }
+  }
+  self.tracking = YES;
+}
+
+- (void)commitCurrentIntensity:(long)value {
+  if (value < 0) {
+    value = 0;
+  }
+  if (value > 100) {
+    value = 100;
   }
   self.tracking = NO;
   long live = 0;
@@ -5773,6 +5791,15 @@ static NSImage *sidebarTile(NSInteger pane, CGFloat size) {
     return;
   }
   [self refresh];
+}
+
+- (void)nowMoved:(NSSlider *)slider {
+  long value = (long)llround(slider.doubleValue);
+  if (!sliderSettled()) {
+    [self previewCurrentIntensity:value];
+    return;
+  }
+  [self commitCurrentIntensity:value];
 }
 
 - (void)maxMoved:(NSSlider *)slider {
@@ -6705,6 +6732,11 @@ static OSStatus brightnessHotKey(EventHandlerCallRef next, EventRef event, void 
                         sizeof(hotKey), NULL, &hotKey) != noErr) {
     return eventNotHandledErr;
   }
+  // Cmd+F1 / Cmd+F2 use another signature. Without this they would also
+  // step through the plain brightness keys.
+  if (hotKey.signature != 'NShk') {
+    return eventNotHandledErr;
+  }
   deliverBrightness(hotKey.id == 1 ? 1 : -1);
   return noErr;
 }
@@ -6722,11 +6754,204 @@ static void registerBrightnessHotKeys(void) {
   }
 }
 
+// Cmd+F1 lowers Night Shift intensity, Cmd+F2 raises it. The value is the
+// menu's Current slider. Nothing here changes display brightness.
+//
+// "Use F1, F2, etc. keys as standard function keys" on: the keyboard reports
+// F1 and F2, so Command arrives as kVK_F1 (122) / kVK_F2 (120) with cmdKey.
+// RegisterEventHotKey sees that. macOS may already own Cmd+F1 (mirroring)
+// or Cmd+F2; a failed registration is logged as its error code and skipped.
+//
+// The setting off: F1 and F2 are the brightness keys. Command does not turn
+// them into F1/F2. A built-in keyboard sends a media key
+// (NX_KEYTYPE_BRIGHTNESS_DOWN 3 / UP 2, system-defined subtype 8) with
+// Command set in the event flags. That is not a virtual key code.
+// RegisterEventHotKey cannot bind it, and this does not add an event tap.
+// Those presses stay on the existing brightness-key path. Cmd+Fn+F1/F2 is
+// a real F-key and hits the registration above.
+//
+// Carbon reports the chord once on press and once on release, with no
+// repeat. The hold repeats on the main queue and only previews, the way
+// the Current slider moves before mouse-up. Release calls
+// commitCurrentIntensity, which is that slider's save.
+static EventHotKeyRef gCommandHotKeys[2];
+static EventHandlerRef gCommandHotKeyHandler = NULL;
+static int gCommandHoldGeneration = 0;
+static int gCommandHoldDirection = 0;
+static long gCommandHoldPercent = -1;
+static BOOL gCommandHoldDirty = NO;
+
+static long commandWarmthNow(void) {
+  long now = 0;
+  long maxv = 0;
+  const char *state = NULL;
+  int full = -1;
+  if (!warmthStatus(&now, &maxv, &state, &full)) {
+    return -1;
+  }
+  return nsCommandWarmthNext(now, 0);
+}
+
+static void commandWarmthClearHold(void) {
+  gCommandHoldDirection = 0;
+  gCommandHoldPercent = -1;
+  gCommandHoldDirty = NO;
+  if (gMenu != nil) {
+    gMenu.tracking = NO;
+  }
+}
+
+// Main thread. A repeat previews the next Current value. release saves it
+// once, through the slider's mouse-up path, and does not take another step.
+static void commandWarmthTick(BOOL release) {
+  if (release) {
+    if (gCommandHoldDirty && gCommandHoldPercent >= 0 && gMenu != nil) {
+      [gMenu commitCurrentIntensity:gCommandHoldPercent];
+    }
+    commandWarmthClearHold();
+    return;
+  }
+  if (gCommandHoldDirection == 0) {
+    return;
+  }
+  if (gCommandHoldPercent < 0) {
+    long now = commandWarmthNow();
+    if (now < 0) {
+      return;
+    }
+    gCommandHoldPercent = now;
+  }
+  long next = nsCommandWarmthNext(gCommandHoldPercent, gCommandHoldDirection);
+  if (next == gCommandHoldPercent) {
+    return;
+  }
+  gCommandHoldDirty = YES;
+  gCommandHoldPercent = next;
+  if (gMenu != nil) {
+    [gMenu previewCurrentIntensity:next];
+  }
+}
+
+static void scheduleCommandWarmthRepeat(int generation, BOOL first) {
+  NSTimeInterval seconds = first ? NSEvent.keyRepeatDelay : NSEvent.keyRepeatInterval;
+  double gap = nsCommandWarmthRepeatGap(seconds);
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(gap * NSEC_PER_SEC)),
+                 dispatch_get_main_queue(), ^{
+                   if (generation != gCommandHoldGeneration || gCommandHoldDirection == 0) {
+                     return;
+                   }
+                   commandWarmthTick(NO);
+                   scheduleCommandWarmthRepeat(generation, NO);
+                 });
+}
+
+static void commandWarmthHotKeyOnMain(UInt32 kind, EventHotKeyID hotKey) {
+  int direction = nsCommandWarmthDirection(hotKey.id);
+  if (direction == 0) {
+    return;
+  }
+  if (kind == kEventHotKeyReleased) {
+    if (direction != gCommandHoldDirection) {
+      return;
+    }
+    gCommandHoldGeneration++;
+    commandWarmthTick(YES);
+    return;
+  }
+  if (kind != kEventHotKeyPressed) {
+    return;
+  }
+  if (gCommandHoldDirection == direction) {
+    return;
+  }
+  if (gMenu != nil && gMenu.tracking) {
+    return;
+  }
+  if (gCommandHoldDirection != 0) {
+    gCommandHoldGeneration++;
+    commandWarmthTick(YES);
+  }
+  gCommandHoldDirection = direction;
+  gCommandHoldGeneration++;
+  int generation = gCommandHoldGeneration;
+  commandWarmthTick(NO);
+  scheduleCommandWarmthRepeat(generation, YES);
+}
+
+static OSStatus commandWarmthHotKey(EventHandlerCallRef next, EventRef event, void *user) {
+  (void)next;
+  (void)user;
+  EventHotKeyID hotKey;
+  if (GetEventParameter(event, kEventParamDirectObject, typeEventHotKeyID, NULL, sizeof(hotKey),
+                        NULL, &hotKey) != noErr) {
+    return eventNotHandledErr;
+  }
+  if (hotKey.signature != 'NScm') {
+    return eventNotHandledErr;
+  }
+  UInt32 kind = GetEventKind(event);
+  if (![NSThread isMainThread]) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+      commandWarmthHotKeyOnMain(kind, hotKey);
+    });
+    return noErr;
+  }
+  commandWarmthHotKeyOnMain(kind, hotKey);
+  return noErr;
+}
+
+static void registerCommandWarmthHotKeys(void) {
+  if (gCommandHotKeyHandler != NULL) {
+    return;
+  }
+  EventTypeSpec types[2] = {
+      {kEventClassKeyboard, kEventHotKeyPressed},
+      {kEventClassKeyboard, kEventHotKeyReleased},
+  };
+  EventHandlerRef handler = NULL;
+  OSStatus err = InstallApplicationEventHandler(commandWarmthHotKey, 2, types, NULL, &handler);
+  if (err != noErr) {
+    NSLog(@"%d", (int)err);
+    return;
+  }
+  gCommandHotKeyHandler = handler;
+  const UInt32 codes[2] = {kVK_F1, kVK_F2};
+  const UInt32 ids[2] = {1, 2};
+  for (UInt32 i = 0; i < 2; i++) {
+    EventHotKeyID hotKey = {'NScm', ids[i]};
+    EventHotKeyRef ref = NULL;
+    err = RegisterEventHotKey(codes[i], cmdKey, hotKey, GetApplicationEventTarget(), 0, &ref);
+    if (err != noErr) {
+      NSLog(@"%d", (int)err);
+      continue;
+    }
+    gCommandHotKeys[i] = ref;
+  }
+}
+
+static void unregisterCommandWarmthHotKeys(void) {
+  gCommandHoldGeneration++;
+  if (gCommandHoldDirection != 0) {
+    commandWarmthTick(YES);
+  }
+  for (int i = 0; i < 2; i++) {
+    if (gCommandHotKeys[i] != NULL) {
+      UnregisterEventHotKey(gCommandHotKeys[i]);
+      gCommandHotKeys[i] = NULL;
+    }
+  }
+  if (gCommandHotKeyHandler != NULL) {
+    RemoveEventHandler(gCommandHotKeyHandler);
+    gCommandHotKeyHandler = NULL;
+  }
+}
+
 static void startBrightnessKeys(void) {
   if (!gHIDWatching) {
     gHIDWatching = YES;
     watchHIDBrightness();
     registerBrightnessHotKeys();
+    registerCommandWarmthHotKeys();
     rememberBuiltin();
     probeDDC();
   }
@@ -6817,6 +7042,7 @@ static void teardownDaemon(void) {
     return;
   }
   done = YES;
+  unregisterCommandWarmthHotKeys();
   settleBrightnessOnQuit();
   gBlackCursorCount = 0;
   cancelCursorHide();
