@@ -2486,8 +2486,29 @@ static BOOL menuMotionAllowed(void) {
   NSAccessibilityPostNotification(self, NSAccessibilityLayoutChangedNotification);
 }
 
+// The Pro badge sits in the Ramp header and has its own click. That click
+// opens Pro; the title and the chevron still collapse the section.
+- (BOOL)clickHandledBySubview:(id)sender {
+  if (![sender isKindOfClass:[NSClickGestureRecognizer class]] || self.superview == nil) {
+    return NO;
+  }
+  NSClickGestureRecognizer *click = sender;
+  NSPoint local = [click locationInView:self];
+  NSView *hit = [self hitTest:[self convertPoint:local toView:self.superview]];
+  for (NSView *view = hit; view != nil && view != self; view = view.superview) {
+    for (NSGestureRecognizer *recognizer in view.gestureRecognizers) {
+      if (recognizer != click && [recognizer isKindOfClass:[NSClickGestureRecognizer class]]) {
+        return YES;
+      }
+    }
+  }
+  return NO;
+}
+
 - (void)clicked:(id)sender {
-  (void)sender;
+  if ([self clickHandledBySubview:sender]) {
+    return;
+  }
   [self toggle];
 }
 
@@ -2574,6 +2595,8 @@ static NSStackView *menuSection(NSArray<NSView *> *views, CGFloat spacing) {
 @property(nonatomic, strong) NSTextField *maxName;
 // On the Ramp title when the ramp isn't licensed; clicking it opens Pro.
 @property(nonatomic, strong) PillView *rampPro;
+@property(nonatomic, strong) SectionHeader *rampHeader;
+@property(nonatomic, strong) NSStackView *rampBody;
 @property(nonatomic, strong) SectionHeader *fullRow;
 @property(nonatomic, strong) NSTextField *fullTime;
 @property(nonatomic) BOOL fullCollapsed;
@@ -2817,6 +2840,8 @@ static void openBrightnessKeyAccess(void) {
 
   // Max and Full at are the Pro ramp, so they share one section with one
   // PRO badge. Without Pro they show grayed out and the badge opens Pro.
+  // The section collapses like Brightness and Appearance. Full at keeps its
+  // own disclosure while Ramp is open.
   PillView *rampPro = [[PillView alloc] initWithText:@"PRO"
                                               color:NSColor.controlAccentColor
                                               solid:YES];
@@ -2826,18 +2851,26 @@ static void openBrightnessKeyAccess(void) {
                                     initWithTarget:self
                                             action:@selector(rampProClicked:)]];
   self.rampPro = rampPro;
-  NSStackView *rampTitle =
-      [NSStackView stackViewWithViews:@[ [self sectionLabel:@"Ramp"], rampPro ]];
-  rampTitle.orientation = NSUserInterfaceLayoutOrientationHorizontal;
-  rampTitle.alignment = NSLayoutAttributeCenterY;
-  rampTitle.spacing = 8;
-  NSStackView *rampSection =
-      menuSection(@[ rampTitle, pay, maxRow, buy, fullRow, clockWell ], 10);
-  [rampSection setCustomSpacing:14 afterView:maxRow];
-  [rampSection setCustomSpacing:14 afterView:buy];
-  [rampSection setCustomSpacing:6 afterView:fullRow];
+  SectionHeader *rampHeader =
+      [[SectionHeader alloc] initWithTitle:[self sectionLabel:@"Ramp"]
+                                 accessory:rampPro
+                            chevronLeading:NO];
+  rampHeader.toggled = ^(SectionHeader *header) {
+    [panel sectionHeaderToggled:header];
+  };
+  self.rampHeader = rampHeader;
+  NSStackView *rampBody = menuSection(@[ pay, maxRow, buy, fullRow, clockWell ], 10);
+  [rampBody setCustomSpacing:14 afterView:maxRow];
+  [rampBody setCustomSpacing:14 afterView:buy];
+  [rampBody setCustomSpacing:6 afterView:fullRow];
+  self.rampBody = rampBody;
+  NSStackView *rampSection = menuSection(@[ rampHeader, rampBody ], 10);
 
   self.collapsedSections = readCollapsedSections();
+  BOOL rampClosed = [self.collapsedSections containsObject:@"ramp"];
+  [rampHeader setCollapsed:rampClosed animated:NO];
+  rampBody.hidden = rampClosed;
+
   SectionHeader *brightHeader =
       [[SectionHeader alloc] initWithTitle:[self sectionLabel:@"Brightness"]
                                  accessory:nil
@@ -3167,17 +3200,28 @@ static void openBrightnessKeyAccess(void) {
     self.fullCollapsed = header.collapsed;
     self.clockWell.hidden = self.fullCollapsed;
   } else {
-    BOOL bright = header == self.brightHeader;
-    NSString *name = bright ? @"brightness" : @"appearance";
-    NSView *body = bright ? self.brightBody : self.appearanceBody;
-    if (header.collapsed) {
-      body.hidden = YES;
-      [self.collapsedSections addObject:name];
-    } else {
-      [self revealBody:body];
-      [self.collapsedSections removeObject:name];
+    NSString *name = nil;
+    NSView *body = nil;
+    if (header == self.rampHeader) {
+      name = @"ramp";
+      body = self.rampBody;
+    } else if (header == self.brightHeader) {
+      name = @"brightness";
+      body = self.brightBody;
+    } else if (header == self.appearanceHeader) {
+      name = @"appearance";
+      body = self.appearanceBody;
     }
-    writeCollapsedSections(self.collapsedSections);
+    if (body != nil) {
+      if (header.collapsed) {
+        body.hidden = YES;
+        [self.collapsedSections addObject:name];
+      } else {
+        [self revealBody:body];
+        [self.collapsedSections removeObject:name];
+      }
+      writeCollapsedSections(self.collapsedSections);
+    }
   }
   if (self.sectionToggled != nil) {
     self.sectionToggled();
@@ -4226,7 +4270,6 @@ static void hugControls(NSView *view) {
   NSStackView *maxControl = [self hstack:@[ less, self.maxSlider, more, self.maxValue ]
                                  spacing:8];
   self.maxRow = [self row:@"Max" caption:@"" control:maxControl below:YES];
-  NSView *warmth = [self section:@"Warmth" accessory:nil rows:@[ self.maxRow ] footer:nil];
 
   self.fullAtPicker = [[NSDatePicker alloc] initWithFrame:NSZeroRect];
   self.fullAtPicker.datePickerStyle = NSDatePickerStyleTextFieldAndStepper;
@@ -4247,13 +4290,13 @@ static void hugControls(NSView *view) {
   [self addWords:@"Ramp"];
   NSView *ramp = [self section:@"Evening Ramp"
                      accessory:pro
-                          rows:@[ self.fullAtRow ]
+                          rows:@[ self.maxRow, self.fullAtRow ]
                         footer:@"On a Custom schedule, warmth starts low and climbs to Max over "
                                @"two hours, or by Full at. After Full at, it holds at Max."];
   // PHASE 2: a Ramp length row (popup: 1, 2, 3 hours) joins Evening Ramp, and
   // a "Tonight" section with the warmth-over-time chart goes here, between
   // Evening Ramp and the end of the page.
-  return [self pageWithSections:@[ schedule, warmth, ramp ] stack:NULL];
+  return [self pageWithSections:@[ schedule, ramp ] stack:NULL];
 }
 
 - (void)syncNightShift {
