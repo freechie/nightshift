@@ -1508,9 +1508,9 @@ static BOOL handleControl(const char *buf, int fd) {
     return YES;
   }
   if (strcmp(buf, "ddc") == 0) {
-    // Each reply line carries the bound path and the m1ddc path. A short
-    // buffer cuts the next display's path mid-word (…/DCPEXT1En).
-    char text[16384];
+    // Same size the `nightshift ddc` client reads. The cut was the client's
+    // 512-byte buffer, not this one.
+    char text[kNSDDCClientCap];
     ddcCopyDebug(text, (int)sizeof(text));
     if (text[0] == '\0') {
       dprintf(fd, "ddc\n");

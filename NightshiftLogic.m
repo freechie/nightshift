@@ -1020,6 +1020,41 @@ int nsDDCDebugReport(const uint32_t *displays, const int *builtin, int displayCo
   return lines;
 }
 
+size_t nsDDCClientPull(char *out, size_t cap, size_t used, const void *chunk, size_t chunkLen) {
+  if (out == NULL || chunk == NULL || cap < 2 || chunkLen == 0 || used >= cap - 1) {
+    return 0;
+  }
+  size_t room = cap - 1 - used;
+  if (chunkLen > room) {
+    chunkLen = room;
+  }
+  memcpy(out + used, chunk, chunkLen);
+  return chunkLen;
+}
+
+bool nsDDCClientFinish(char *out, size_t used, size_t cap) {
+  if (out == NULL || cap == 0) {
+    return false;
+  }
+  if (used >= cap) {
+    used = cap - 1;
+  }
+  out[used] = '\0';
+  if (used == 0 || strchr(out, '\n') == NULL) {
+    out[0] = '\0';
+    return false;
+  }
+  if (used + 1 >= cap && out[used - 1] != '\n') {
+    char *last = strrchr(out, '\n');
+    if (last == NULL) {
+      out[0] = '\0';
+      return false;
+    }
+    last[1] = '\0';
+  }
+  return out[0] != '\0';
+}
+
 const char *nsDDCControlLabel(NSDDCProbeVerdict verdict) {
   if (verdict == kNSDDCProbeControllable) {
     return "DDC/CI connected";

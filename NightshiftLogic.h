@@ -314,6 +314,17 @@ typedef struct {
 // number of lines, or -1 when out cannot hold them (out stays terminated).
 int nsDDCDebugReport(const uint32_t *displays, const int *builtin, int displayCount,
                      const NSDDCDebugRow *rows, int rowCount, char *out, size_t cap);
+// `nightshift ddc` receive buffer, including the NUL. The daemon's ddc text
+// is the same size. The client used to read into 512 bytes and cut the second
+// display's path at DCPEXT1En.
+enum { kNSDDCClientCap = 4096 };
+// Store one socket read into that buffer. Bytes past cap-1 are not stored.
+// Returns how many bytes were kept.
+size_t nsDDCClientPull(char *out, size_t cap, size_t used, const void *chunk, size_t chunkLen);
+// NUL-terminate a whole ddc reply after the socket hits EOF or the buffer
+// fills. A buffer that filled mid-line drops that partial line. False when
+// no complete line remains.
+bool nsDDCClientFinish(char *out, size_t used, size_t cap);
 // Settings label. Controllable is "DDC/CI connected". Software is
 // "Software dimming" and is never the connected label.
 const char *nsDDCControlLabel(NSDDCProbeVerdict verdict);

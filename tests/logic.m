@@ -1654,13 +1654,20 @@ static void checkProbe(void) {
   CHECK_EQ(max, 0);
   io.idle = NULL;
 
-  // A long service path makes two reply lines longer than 512 bytes. The
-  // report keeps both when the buffer can hold them.
+  // Two long paths. The daemon text fits in kNSDDCClientCap. The client
+  // reads that text in chunks into the same size buffer, and both paths
+  // survive. A 512-byte client buffer still loses the second path.
   {
-    char longPath[181];
-    memset(longPath, 'p', 180);
-    longPath[180] = '\0';
-    memcpy(longPath + 180 - 16, "DCPEXT1Endpoint", 16);
+    char body3[181];
+    char body2[181];
+    memset(body3, 'a', 180);
+    memset(body2, 'b', 180);
+    body3[180] = '\0';
+    body2[180] = '\0';
+    const char *tail3 = "dispext0/DCPAVServiceProxy";
+    const char *tail2 = "RTBuddy(DCPEXT1)/DCPEXT1Endpoint";
+    memcpy(body3 + 180 - strlen(tail3), tail3, strlen(tail3));
+    memcpy(body2 + 180 - strlen(tail2), tail2, strlen(tail2));
     NSDDCDebugRow wide[2];
     memset(wide, 0, sizeof(wide));
     wide[0].display = 3;
@@ -1670,7 +1677,7 @@ static void checkProbe(void) {
     wide[0].haveReply = true;
     wide[0].writeState = kNSDDCIOCode;
     wide[0].readState = kNSDDCIOCode;
-    snprintf(wide[0].servicePath, sizeof(wide[0].servicePath), "IOService:/%s", longPath);
+    snprintf(wide[0].servicePath, sizeof(wide[0].servicePath), "IOService:/%s", body3);
     snprintf(wide[0].m1ddcPath, sizeof(wide[0].m1ddcPath), "%s", wide[0].servicePath);
     snprintf(wide[0].edidName, sizeof(wide[0].edidName), "Acer XV272U V");
     wide[0].vendor = 1265;
@@ -1683,29 +1690,61 @@ static void checkProbe(void) {
     wide[1].haveReply = true;
     wide[1].writeState = kNSDDCIOCode;
     wide[1].readState = kNSDDCIOCode;
-    snprintf(wide[1].servicePath, sizeof(wide[1].servicePath), "IOService:/%s", longPath);
+    snprintf(wide[1].servicePath, sizeof(wide[1].servicePath), "IOService:/%s", body2);
     snprintf(wide[1].m1ddcPath, sizeof(wide[1].m1ddcPath), "IOService:/dcpext0/dispext0/DCPAVServiceProxy");
     snprintf(wide[1].edidName, sizeof(wide[1].edidName), "BenQ GL2460");
     wide[1].vendor = 2513;
     wide[1].product = 24611;
     wide[1].serial = 7;
-    char big[8192];
+    char daemon[8192];
     char small[512];
-    CHECK(nsDDCDebugReport(displays, builtin, 3, wide, 2, big, sizeof(big)) == 4);
-    CHECK(strstr(big, "ddc reply 3 ") != NULL);
-    CHECK(strstr(big, "ddc reply 2 ") != NULL);
-    CHECK(strstr(big, "name=\"Acer XV272U V\"") != NULL);
-    CHECK(strstr(big, "name=\"BenQ GL2460\"") != NULL);
-    CHECK(strstr(big, "match=same") != NULL);
-    CHECK(strstr(big, "match=DIFFERENT") != NULL);
-    CHECK(strstr(big, "vendor=1265") != NULL);
-    CHECK(strstr(big, "vendor=2513") != NULL);
-    char *tail = strstr(big, "DCPEXT1Endpoint");
-    CHECK(tail != NULL);
-    CHECK(strstr(tail + 1, "DCPEXT1Endpoint") != NULL);
+    CHECK(kNSDDCClientCap == 4096);
+    CHECK(nsDDCDebugReport(displays, builtin, 3, wide, 2, daemon, sizeof(daemon)) == 4);
+    CHECK(strstr(daemon, "name=\"Acer XV272U V\"") != NULL);
+    CHECK(strstr(daemon, "name=\"BenQ GL2460\"") != NULL);
+    CHECK(strstr(daemon, "match=same") != NULL);
+    CHECK(strstr(daemon, "match=DIFFERENT") != NULL);
+    CHECK(strlen(daemon) + 1 <= kNSDDCClientCap);
     CHECK(nsDDCDebugReport(displays, builtin, 3, wide, 2, small, sizeof(small)) == -1);
     CHECK(strstr(small, "ddc reply 2 ") == NULL);
     CHECK(strstr(small, "DCPEXT1En") == NULL);
+
+    char client[kNSDDCClientCap];
+    size_t used = 0;
+    size_t off = 0;
+    size_t len = strlen(daemon);
+    while (off < len) {
+      size_t step = 64;
+      if (step > len - off) {
+        step = len - off;
+      }
+      size_t got = nsDDCClientPull(client, sizeof(client), used, daemon + off, step);
+      CHECK_EQ((long)got, (long)step);
+      used += got;
+      off += step;
+    }
+    CHECK(nsDDCClientFinish(client, used, sizeof(client)));
+    CHECK(strstr(client, wide[0].servicePath) != NULL);
+    CHECK(strstr(client, wide[1].servicePath) != NULL);
+    CHECK(strstr(client, "dispext0/DCPAVServiceProxy") != NULL);
+    CHECK(strstr(client, "RTBuddy(DCPEXT1)/DCPEXT1Endpoint") != NULL);
+
+    char old[512];
+    used = 0;
+    off = 0;
+    while (off < len && used + 1 < sizeof(old)) {
+      size_t step = 64;
+      if (step > len - off) {
+        step = len - off;
+      }
+      size_t got = nsDDCClientPull(old, sizeof(old), used, daemon + off, step);
+      used += got;
+      off += got;
+    }
+    CHECK(off < len);
+    CHECK(nsDDCClientFinish(old, used, sizeof(old)));
+    CHECK(strstr(old, wide[1].servicePath) == NULL);
+    CHECK(strstr(old, "DCPEXT1Endpoint") == NULL);
   }
   NSDDCProbeFacts timed;
   memset(&timed, 0, sizeof(timed));

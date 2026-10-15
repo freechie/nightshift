@@ -14,6 +14,7 @@
 // limitations under the License.
 
 #import "NightShift.h"
+#include "NightshiftLogic.h"
 #import <errno.h>
 #import <fcntl.h>
 #import <limits.h>
@@ -132,14 +133,15 @@ static int talk(const char *line, char *reply, size_t cap, BOOL whole) {
 
   size_t used = 0;
   while (used + 1 < cap) {
+    char chunk[512];
     ssize_t n;
     do {
-      n = read(fd, reply + used, cap - 1 - used);
+      n = read(fd, chunk, sizeof(chunk));
     } while (n < 0 && errno == EINTR);
     if (n <= 0) {
       break;
     }
-    used += (size_t)n;
+    used += nsDDCClientPull(reply, cap, used, chunk, (size_t)n);
     if (!whole) {
       break;
     }
@@ -148,21 +150,15 @@ static int talk(const char *line, char *reply, size_t cap, BOOL whole) {
   if (used == 0) {
     return 1;
   }
-  reply[used] = '\0';
-  char *nl = strchr(reply, '\n');
-  if (nl == NULL) {
-    return 1;
-  }
   if (!whole) {
-    *nl = '\0';
-  } else if (used + 1 >= cap && reply[used - 1] != '\n') {
-    // The buffer filled mid-line. Keep complete lines so a path is not
-    // printed cut off at a word.
-    char *last = strrchr(reply, '\n');
-    if (last == NULL) {
+    reply[used] = '\0';
+    char *nl = strchr(reply, '\n');
+    if (nl == NULL) {
       return 1;
     }
-    last[1] = '\0';
+    *nl = '\0';
+  } else if (!nsDDCClientFinish(reply, used, cap)) {
+    return 1;
   }
   if (reply[0] == '\0' || strcmp(reply, "failed") == 0 ||
       strncmp(reply, "failed\n", 7) == 0) {
@@ -695,8 +691,9 @@ int main(int argc, const char *argv[]) {
     }
 
     if (argc == 2 && strcmp(argv[1], "ddc") == 0) {
-      // 512 cut the second display's path mid-word (…/RTBuddy(DCPEXT1)/DCPEXT1En).
-      char reply[16384];
+      // Was 512, which cut the second display at …/RTBuddy(DCPEXT1)/DCPEXT1En.
+      // Same size as the daemon's ddc text, so the read runs to EOF.
+      char reply[kNSDDCClientCap];
       return finishReply(askAll("ddc\n", reply, sizeof(reply)), reply, "failed to read ddc", NO);
     }
 
