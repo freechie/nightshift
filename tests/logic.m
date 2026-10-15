@@ -656,6 +656,234 @@ static void checkTapRecovery(void) {
   CHECK_EQ(nsAccessAction(false, false), kNSAccessKeep);
 }
 
+// A pretend panel. sticky reads ignore writes (a cached brightness). echo
+// reads return savedPercent and ignore the panel (the UI's saved number).
+typedef struct {
+  int panel;
+  int max;
+  int savedPercent;
+  bool sticky;
+  bool echoSaved;
+  bool failRead;
+  bool failWrite;
+  bool failSecondRead;
+  int confirmLag;  // confirmation reads that still report held
+  int held;
+  int reads;
+  int writes;
+  int written[4];
+} ProbePanel;
+
+static bool probeRead(void *ctx, int *current, int *max) {
+  ProbePanel *panel = ctx;
+  panel->reads++;
+  if (panel->failRead || (panel->failSecondRead && panel->reads > 1)) {
+    return false;
+  }
+  if (panel->max <= 0) {
+    return false;
+  }
+  *max = panel->max;
+  // echoSaved is the UI's saved percent, not the panel. sticky leaves the
+  // panel where the first read found it. confirmLag is a slow panel: the
+  // first confirmation reads still show the pre-write value.
+  if (panel->writes > 0 && panel->confirmLag > 0) {
+    panel->confirmLag--;
+    *current = panel->held;
+  } else {
+    *current = panel->echoSaved ? panel->savedPercent : panel->panel;
+  }
+  return *current >= 0 && *current <= *max;
+}
+
+static bool probeWrite(void *ctx, int value) {
+  ProbePanel *panel = ctx;
+  if (panel->writes < 4) {
+    panel->written[panel->writes] = value;
+  }
+  panel->writes++;
+  if (panel->failWrite) {
+    return false;
+  }
+  if (!panel->sticky && !panel->echoSaved) {
+    panel->panel = value;
+  }
+  return true;
+}
+
+static ProbePanel probePanel(int panel, int max) {
+  ProbePanel p;
+  memset(&p, 0, sizeof(p));
+  p.panel = panel;
+  p.max = max;
+  return p;
+}
+
+static void checkProbe(void) {
+  // Two raw steps when they fit; one when they don't; none on an empty scale.
+  CHECK_EQ(nsDDCProbeTarget(42, 100), 44);
+  CHECK_EQ(nsDDCProbeTarget(0, 100), 2);
+  CHECK_EQ(nsDDCProbeTarget(100, 100), 98);
+  CHECK_EQ(nsDDCProbeTarget(99, 100), 97);
+  CHECK_EQ(nsDDCProbeTarget(0, 1), 1);
+  CHECK_EQ(nsDDCProbeTarget(1, 1), 0);
+  CHECK_EQ(nsDDCProbeTarget(42, 0), -1);
+  CHECK_EQ(nsDDCProbeTarget(-1, 100), -1);
+
+  // The second read must be the written value. A cached 42 is "near" 44 on
+  // this scale (tolerance 5) and must still fail.
+  CHECK(nsDDCNear(42, 44, 100));
+  CHECK(!nsDDCProbeLanded(42, 44, 42));
+  CHECK(nsDDCProbeLanded(42, 44, 44));
+  CHECK(!nsDDCProbeLanded(42, 44, 43));
+  CHECK(!nsDDCProbeLanded(42, 42, 42));
+  // Minimum tolerance is 2, so a two-step nudge is still "near" the old value.
+  CHECK(nsDDCNear(100, 102, 255));
+  CHECK(!nsDDCProbeLanded(100, 102, 100));
+  CHECK(nsDDCProbeLanded(100, 102, 102));
+
+  ProbePanel live = probePanel(42, 100);
+  int current = -1;
+  int max = -1;
+  NSDDCProbeIO io = {probeRead, probeWrite, &live};
+  CHECK_EQ(nsDDCProbeControl(&io, &current, &max), kNSDDCProbeControllable);
+  CHECK_EQ(current, 42);
+  CHECK_EQ(max, 100);
+  CHECK_EQ(live.panel, 42);  // original written back
+  CHECK_EQ(live.writes, 2);
+  CHECK_EQ(live.written[0], 44);
+  CHECK_EQ(live.written[1], 42);
+  CHECK_EQ(live.reads, 2);
+
+  // The first confirmation read is still the old value. A later read shows
+  // the write, so the panel is controllable and the original is restored.
+  ProbePanel slow = probePanel(42, 100);
+  slow.confirmLag = 1;
+  slow.held = 42;
+  io.ctx = &slow;
+  CHECK_EQ(nsDDCProbeControl(&io, &current, &max), kNSDDCProbeControllable);
+  CHECK_EQ(slow.reads, 3);
+  CHECK_EQ(slow.written[0], 44);
+  CHECK_EQ(slow.written[1], 42);
+  CHECK_EQ(slow.panel, 42);
+  CHECK_EQ(slow.confirmLag, 0);
+
+  // Every confirmation read stays at 42. Retrying must not turn that into a pass.
+  ProbePanel stuck = probePanel(42, 100);
+  stuck.sticky = true;
+  stuck.confirmLag = 4;
+  stuck.held = 42;
+  io.ctx = &stuck;
+  CHECK_EQ(nsDDCProbeControl(&io, &current, &max), kNSDDCProbeSoftware);
+  CHECK_EQ(stuck.reads, 5);
+  CHECK_EQ(stuck.panel, 42);
+  CHECK(strcmp(nsDDCControlLabel(kNSDDCProbeControllable), "DDC/CI connected") == 0);
+  long hw = -1;
+  long sw = -1;
+  long combinedHw = 0;
+  long combinedSw = 0;
+  nsExternalBrightness(kNSDDCProbeControllable, 76, 0, &hw, &sw);
+  nsCombinedLevels(76, 0, &combinedHw, &combinedSw);
+  CHECK_EQ(hw, combinedHw);
+  CHECK_EQ(sw, combinedSw);
+  CHECK(hw > 0 && sw == 100);
+  nsExternalBrightness(kNSDDCProbeControllable, 56, 20, &hw, &sw);
+  nsCombinedLevels(56, 20, &combinedHw, &combinedSw);
+  CHECK_EQ(hw, combinedHw);
+  CHECK_EQ(sw, combinedSw);
+  nsExternalBrightness(kNSDDCProbeControllable, 40, 20, &hw, &sw);
+  nsCombinedLevels(40, 20, &combinedHw, &combinedSw);
+  CHECK_EQ(hw, combinedHw);
+  CHECK_EQ(sw, combinedSw);
+  CHECK(sw < 100);
+
+  // Readback stays at 42. nsDDCNear would accept it; the probe must not.
+  ProbePanel cached = probePanel(42, 100);
+  cached.sticky = true;
+  current = 99;
+  max = 99;
+  io.ctx = &cached;
+  CHECK_EQ(nsDDCProbeControl(&io, &current, &max), kNSDDCProbeSoftware);
+  CHECK_EQ(cached.panel, 42);
+  CHECK_EQ(cached.writes, 2);
+  CHECK_EQ(cached.written[0], 44);
+  CHECK_EQ(cached.written[1], 42);
+  CHECK(strcmp(nsDDCControlLabel(kNSDDCProbeSoftware), "Software dimming") == 0);
+  CHECK(strcmp(nsDDCControlLabel(kNSDDCProbeSoftware), "DDC/CI connected") != 0);
+  for (long percent = 0; percent <= 100; percent += 1) {
+    nsExternalBrightness(kNSDDCProbeSoftware, percent, 20, &hw, &sw);
+    CHECK_EQ(hw, -1);
+    CHECK_EQ(sw, percent);
+  }
+  // Above the combined switch is still software, not a backlight write.
+  nsExternalBrightness(kNSDDCProbeSoftware, 76, 0, &hw, &sw);
+  CHECK_EQ(hw, -1);
+  CHECK_EQ(sw, 76);
+  nsExternalBrightness(kNSDDCProbeSoftware, 56, 0, &hw, &sw);
+  CHECK_EQ(hw, -1);
+  CHECK_EQ(sw, 56);
+
+  // The number the UI saved (76) is not a panel read. Writing 78 and reading
+  // 76 again is a miss, even though 76 is what listing displays would show.
+  ProbePanel saved = probePanel(42, 100);
+  saved.echoSaved = true;
+  saved.savedPercent = 76;
+  io.ctx = &saved;
+  CHECK_EQ(nsDDCProbeControl(&io, &current, &max), kNSDDCProbeSoftware);
+  CHECK_EQ(saved.writes, 2);
+  CHECK_EQ(saved.written[0], 78);
+  CHECK_EQ(saved.written[1], 76);
+  CHECK_EQ(saved.panel, 42);
+
+  ProbePanel deadRead = probePanel(42, 100);
+  deadRead.failRead = true;
+  io.ctx = &deadRead;
+  CHECK_EQ(nsDDCProbeControl(&io, &current, &max), kNSDDCProbeSoftware);
+  CHECK_EQ(deadRead.writes, 0);
+  CHECK(strcmp(nsDDCControlLabel(kNSDDCProbeSoftware), "DDC/CI connected") != 0);
+
+  ProbePanel deadWrite = probePanel(42, 100);
+  deadWrite.failWrite = true;
+  io.ctx = &deadWrite;
+  CHECK_EQ(nsDDCProbeControl(&io, &current, &max), kNSDDCProbeSoftware);
+  CHECK_EQ(deadWrite.writes, 1);
+  CHECK_EQ(deadWrite.panel, 42);
+
+  ProbePanel deadSecond = probePanel(50, 100);
+  deadSecond.failSecondRead = true;
+  io.ctx = &deadSecond;
+  CHECK_EQ(nsDDCProbeControl(&io, &current, &max), kNSDDCProbeSoftware);
+  CHECK_EQ(deadSecond.writes, 2);
+  CHECK_EQ(deadSecond.written[1], 50);
+  CHECK_EQ(deadSecond.panel, 50);
+
+  ProbePanel top = probePanel(100, 100);
+  io.ctx = &top;
+  CHECK_EQ(nsDDCProbeControl(&io, &current, &max), kNSDDCProbeControllable);
+  CHECK_EQ(top.written[0], 98);
+  CHECK_EQ(top.written[1], 100);
+  CHECK_EQ(top.panel, 100);
+  CHECK_EQ(current, 100);
+
+  ProbePanel wide = probePanel(100, 255);
+  io.ctx = &wide;
+  CHECK_EQ(nsDDCProbeControl(&io, &current, &max), kNSDDCProbeControllable);
+  CHECK_EQ(wide.written[0], 102);
+  CHECK_EQ(wide.panel, 100);
+  CHECK_EQ(max, 255);
+
+  io.ctx = NULL;
+  io.read = NULL;
+  CHECK_EQ(nsDDCProbeControl(NULL, &current, &max), kNSDDCProbeSoftware);
+  CHECK_EQ(nsDDCProbeControl(&io, NULL, NULL), kNSDDCProbeSoftware);
+  ProbePanel empty = probePanel(0, 0);
+  io.read = probeRead;
+  io.write = probeWrite;
+  io.ctx = &empty;
+  CHECK_EQ(nsDDCProbeControl(&io, &current, &max), kNSDDCProbeSoftware);
+  CHECK_EQ(empty.writes, 0);
+}
+
 int main(void) {
   checkTapRecovery();
   checkMediaKeys();
@@ -665,6 +893,7 @@ int main(void) {
   checkReadback();
   checkSplit();
   checkSafety();
+  checkProbe();
   checkHosts();
   checkWorkspaceOpens();
   if (gFailures != 0) {
