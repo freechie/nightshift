@@ -1221,13 +1221,6 @@ static long ddcFloorPercent(uint32_t display) {
   return ddcRawPercent(slot->floorRaw, scale);
 }
 
-long ddcBrightnessFloor(uint32_t display) {
-  if (!ddcReady(display)) {
-    return -1;
-  }
-  return ddcFloorPercent(display);
-}
-
 static long lampToCombined(long lamp, long floor) { return nsLampToCombined(lamp, floor); }
 
 static void combinedLevels(long percent, long floor, long *hardware, long *software) {
@@ -1699,10 +1692,6 @@ static int litDisplaysBesides(uint32_t display) {
     };
   }
   return nsLitDisplays(others, n);
-}
-
-int otherLitDisplayCount(uint32_t display) {
-  return litDisplaysBesides(display);
 }
 
 // The percent display may be set to. Black on an external display only while
