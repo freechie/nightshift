@@ -499,11 +499,14 @@ static void portFromPath(const char *path, char *out, size_t cap) {
 // CGDisplay, so the path is kept either way. The port name is the dispext
 // segment, including when the framebuffer class is not AppleCLCD2.
 static void displayPipe(CGDirectDisplayID display, char *port, size_t portCap, char *location,
-                        size_t locationCap) {
+                        size_t locationCap, char *fullLocation, size_t fullCap) {
   static DisplayInfoFn info = NULL;
   static dispatch_once_t once;
   port[0] = '\0';
   location[0] = '\0';
+  if (fullLocation != NULL && fullCap > 0) {
+    fullLocation[0] = '\0';
+  }
   dispatch_once(&once, ^{
     info = (DisplayInfoFn)dlsym(RTLD_DEFAULT, "CoreDisplay_DisplayCreateInfoDictionary");
     if (info == NULL) {
@@ -528,7 +531,12 @@ static void displayPipe(CGDirectDisplayID display, char *port, size_t portCap, c
   if (!ok) {
     return;
   }
+  // location[] is what matching already used (256). fullLocation keeps the
+  // CoreDisplay string for the m1ddc walk when that string is longer.
   copyLocation(path, location, locationCap);
+  if (fullLocation != NULL && fullCap > 0) {
+    copyLocation(path, fullLocation, fullCap);
+  }
   portFromPath(path, port, portCap);
 }
 
@@ -657,8 +665,10 @@ static void inheritFramebuffer(io_service_t service, DDCCandidate *candidate) {
   }
 }
 
-// IORegistry path of the DCPAVServiceProxy bound for the display in progress.
+// IORegistry path of the DCPAVServiceProxy bound for the display in progress,
+// and the EDID 0xFC name from that same service when the block is present.
 static char gBoundServicePath[512];
+static char gBoundEdidName[16];
 
 // index, when set, receives the candidate ordinal or -1. The service is the
 // one path or identity that is unambiguous. EDID is optional: a framebuffer
@@ -667,6 +677,8 @@ static IOAVServiceRef serviceMatching(const DDCTarget *target, int *index) {
   if (index != NULL) {
     *index = -1;
   }
+  gBoundServicePath[0] = '\0';
+  gBoundEdidName[0] = '\0';
   io_iterator_t iter = 0;
   if (IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("DCPAVServiceProxy"),
                                    &iter) != KERN_SUCCESS) {
@@ -676,9 +688,10 @@ static IOAVServiceRef serviceMatching(const DDCTarget *target, int *index) {
   IOAVServiceRef services[8];
   DDCCandidate candidates[8];
   char servicePaths[8][512];
+  char edidNames[8][16];
   int count = 0;
   memset(servicePaths, 0, sizeof(servicePaths));
-  gBoundServicePath[0] = '\0';
+  memset(edidNames, 0, sizeof(edidNames));
   while ((service = IOIteratorNext(iter))) {
     DDCCandidate c;
     memset(&c, 0, sizeof(c));
@@ -717,6 +730,7 @@ static IOAVServiceRef serviceMatching(const DDCTarget *target, int *index) {
       c.product = (uint32_t)(bytes[10] | (bytes[11] << 8));
       c.serial = (uint32_t)(bytes[12] | (bytes[13] << 8) | (bytes[14] << 16) |
                             ((uint32_t)bytes[15] << 24));
+      nsDDCEDIDName(bytes, (int)CFDataGetLength(edid), edidNames[count], sizeof(edidNames[count]));
     }
     if (edid != NULL) {
       CFRelease(edid);
@@ -746,8 +760,84 @@ static IOAVServiceRef serviceMatching(const DDCTarget *target, int *index) {
   }
   if (pick >= 0) {
     snprintf(gBoundServicePath, sizeof(gBoundServicePath), "%s", servicePaths[pick]);
+    snprintf(gBoundEdidName, sizeof(gBoundEdidName), "%s", edidNames[pick]);
   }
   return pick >= 0 ? services[pick] : NULL;
+}
+
+// m1ddc 1.2.0 getDisplayAVService, diagnostic only. A recursive service-plane
+// iterator walks until a node's path equals this display's IODisplayLocation,
+// then the next DCPAVServiceProxy whose Location is External. The proxy
+// nightshift writes is still the one serviceMatching picked.
+static void ddcM1ddcProxyPath(const char *displayLocation, char *out, size_t cap) {
+  if (out == NULL || cap == 0) {
+    return;
+  }
+  out[0] = '\0';
+  if (displayLocation == NULL || displayLocation[0] == '\0') {
+    return;
+  }
+  io_registry_entry_t root = IORegistryGetRootEntry(kIOMainPortDefault);
+  if (root == MACH_PORT_NULL) {
+    return;
+  }
+  io_iterator_t iter = 0;
+  kern_return_t kr =
+      IORegistryEntryCreateIterator(root, kIOServicePlane, kIORegistryIterateRecursively, &iter);
+  IOObjectRelease(root);
+  if (kr != KERN_SUCCESS || iter == 0) {
+    return;
+  }
+  io_service_t service;
+  BOOL located = NO;
+  while ((service = IOIteratorNext(iter)) != MACH_PORT_NULL) {
+    if (!located) {
+      io_string_t path;
+      path[0] = '\0';
+      if (IORegistryEntryGetPath(service, kIOServicePlane, path) == KERN_SUCCESS &&
+          strcmp(path, displayLocation) == 0) {
+        located = YES;
+      }
+      IOObjectRelease(service);
+      continue;
+    }
+    io_name_t name;
+    name[0] = '\0';
+    if (IORegistryEntryGetName(service, name) != KERN_SUCCESS ||
+        strcmp(name, "DCPAVServiceProxy") != 0) {
+      IOObjectRelease(service);
+      continue;
+    }
+    IOAVServiceRef av = IOAVServiceCreateWithService(kCFAllocatorDefault, service);
+    if (av == NULL) {
+      IOObjectRelease(service);
+      continue;
+    }
+    CFTypeRef location = IORegistryEntrySearchCFProperty(service, kIOServicePlane, CFSTR("Location"),
+                                                        kCFAllocatorDefault, kIORegistryIterateRecursively);
+    BOOL external = location != NULL && CFGetTypeID(location) == CFStringGetTypeID() &&
+                    CFStringCompare((CFStringRef)location, CFSTR("External"), 0) == kCFCompareEqualTo;
+    if (location != NULL) {
+      CFRelease(location);
+    }
+    if (!external) {
+      CFRelease(av);
+      IOObjectRelease(service);
+      continue;
+    }
+    io_string_t path;
+    path[0] = '\0';
+    if (IORegistryEntryGetPath(service, kIOServicePlane, path) != KERN_SUCCESS || path[0] == '\0') {
+      CFRelease(av);
+      IOObjectRelease(service);
+      continue;
+    }
+    snprintf(out, cap, "%s", path);
+    CFRelease(av);
+    IOObjectRelease(service);
+    break;
+  }
+  IOObjectRelease(iter);
 }
 
 // DDC/CI wants a pause after a Set VCP before the monitor will answer the
@@ -1426,6 +1516,11 @@ typedef struct {
   char servicePath[512];
   uint8_t outbound[5];
   int outboundCount;
+  uint32_t vendor;
+  uint32_t product;
+  uint32_t serial;
+  char edidName[16];
+  char m1ddcPath[512];
 } DDCDebugRow;
 
 static DDCDebugRow gDDCDebug[8];
@@ -1459,6 +1554,11 @@ static void ddcNoteDebug(uint32_t display, int service, int verdict, int evidenc
   gDDCDebug[slot].verdict = verdict;
   gDDCDebug[slot].evidence = evidence;
   gDDCDebug[slot].haveReply = NO;
+  gDDCDebug[slot].vendor = 0;
+  gDDCDebug[slot].product = 0;
+  gDDCDebug[slot].serial = 0;
+  gDDCDebug[slot].edidName[0] = '\0';
+  gDDCDebug[slot].m1ddcPath[0] = '\0';
   if (!ddcDebugOn()) {
     return;
   }
@@ -1470,7 +1570,8 @@ static void ddcNoteDebug(uint32_t display, int service, int verdict, int evidenc
 
 static void ddcNoteReply(uint32_t display, int writeState, int writeCode, int readState, int readCode,
                          const uint8_t *bytes, const char *servicePath, const uint8_t *outbound,
-                         int outboundCount) {
+                         int outboundCount, uint32_t vendor, uint32_t product, uint32_t serial,
+                         const char *edidName, const char *m1ddcPath) {
   for (int i = 0; i < gDDCDebugCount; i++) {
     if (gDDCDebug[i].display != display) {
       continue;
@@ -1494,13 +1595,25 @@ static void ddcNoteReply(uint32_t display, int writeState, int writeCode, int re
       memcpy(gDDCDebug[i].outbound, outbound, (size_t)n);
       gDDCDebug[i].outboundCount = n;
     }
+    gDDCDebug[i].vendor = vendor;
+    gDDCDebug[i].product = product;
+    gDDCDebug[i].serial = serial;
+    gDDCDebug[i].edidName[0] = '\0';
+    if (edidName != NULL) {
+      snprintf(gDDCDebug[i].edidName, sizeof(gDDCDebug[i].edidName), "%s", edidName);
+    }
+    gDDCDebug[i].m1ddcPath[0] = '\0';
+    if (m1ddcPath != NULL) {
+      snprintf(gDDCDebug[i].m1ddcPath, sizeof(gDDCDebug[i].m1ddcPath), "%s", m1ddcPath);
+    }
     if (!ddcDebugOn()) {
       return;
     }
-    char line[768];
+    char line[4096];
     if (nsDDCReplyLine(display, writeState, writeCode, readState, readCode, gDDCDebug[i].reply, 12,
                        gDDCDebug[i].servicePath, gDDCDebug[i].outbound, gDDCDebug[i].outboundCount,
-                       line, sizeof(line))) {
+                       gDDCDebug[i].vendor, gDDCDebug[i].product, gDDCDebug[i].serial,
+                       gDDCDebug[i].edidName, gDDCDebug[i].m1ddcPath, line, sizeof(line))) {
       fprintf(stderr, "%s\n", line);
     }
     return;
@@ -1544,17 +1657,20 @@ int ddcCopyDebug(char *out, int cap) {
       }
       int wrote = snprintf(out + used, (size_t)(cap - used), "%s\n", line);
       if (wrote < 0 || used + wrote >= cap) {
+        out[used] = '\0';
         break;
       }
       used += wrote;
       if (gDDCDebug[i].haveReply) {
-        char reply[768];
+        char reply[4096];
         if (nsDDCReplyLine(gDDCDebug[i].display, gDDCDebug[i].writeState, gDDCDebug[i].writeCode,
                            gDDCDebug[i].readState, gDDCDebug[i].readCode, gDDCDebug[i].reply, 12,
                            gDDCDebug[i].servicePath, gDDCDebug[i].outbound, gDDCDebug[i].outboundCount,
-                           reply, sizeof(reply))) {
+                           gDDCDebug[i].vendor, gDDCDebug[i].product, gDDCDebug[i].serial,
+                           gDDCDebug[i].edidName, gDDCDebug[i].m1ddcPath, reply, sizeof(reply))) {
           wrote = snprintf(out + used, (size_t)(cap - used), "%s\n", reply);
           if (wrote < 0 || used + wrote >= cap) {
+            out[used] = '\0';
             break;
           }
           used += wrote;
@@ -1583,6 +1699,11 @@ int ddcCopyDebug(char *out, int cap) {
     snprintf(rows[i].servicePath, sizeof(rows[i].servicePath), "%s", gDDCDebug[i].servicePath);
     rows[i].outboundCount = gDDCDebug[i].outboundCount;
     memcpy(rows[i].outbound, gDDCDebug[i].outbound, sizeof(rows[i].outbound));
+    rows[i].vendor = gDDCDebug[i].vendor;
+    rows[i].product = gDDCDebug[i].product;
+    rows[i].serial = gDDCDebug[i].serial;
+    snprintf(rows[i].edidName, sizeof(rows[i].edidName), "%s", gDDCDebug[i].edidName);
+    snprintf(rows[i].m1ddcPath, sizeof(rows[i].m1ddcPath), "%s", gDDCDebug[i].m1ddcPath);
   }
   int lines = nsDDCDebugReport(ids, builtin, count, rows, rowCount, out, (size_t)cap);
   return lines < 0 ? 0 : lines;
@@ -1672,7 +1793,9 @@ void probeDDC(void) {
     int count = orderedDisplays(ids, 16);
     uint32_t targets[8];
     DDCTarget wanted[8];
+    char fullLocations[8][512];
     int pending = 0;
+    memset(fullLocations, 0, sizeof(fullLocations));
     for (int i = 0; i < count && pending < 8; i++) {
       if (CGDisplayIsBuiltin(ids[i]) || (!revalidate && snapshotReady(&seen, ids[i]))) {
         continue;
@@ -1692,7 +1815,8 @@ void probeDDC(void) {
           t->serialShared = YES;
         }
       }
-      displayPipe(ids[i], t->port, sizeof(t->port), t->location, sizeof(t->location));
+      displayPipe(ids[i], t->port, sizeof(t->port), t->location, sizeof(t->location),
+                  fullLocations[pending], sizeof(fullLocations[pending]));
       targets[pending] = ids[i];
       pending++;
     }
@@ -1712,6 +1836,11 @@ void probeDDC(void) {
       char servicePath[512];
       uint8_t outbound[5];
       int outboundCount;
+      uint32_t vendor;
+      uint32_t product;
+      uint32_t serial;
+      char edidName[16];
+      char m1ddcPath[512];
     } DDCResult;
     DDCResult *results = pending > 0 ? calloc((size_t)pending, sizeof(DDCResult)) : NULL;
     if (results == NULL) {
@@ -1723,9 +1852,14 @@ void probeDDC(void) {
       gBrightnessOutboundCount = 0;
       memset(&gBrightnessReply, 0, sizeof(gBrightnessReply));
       memset(gBrightnessOutbound, 0, sizeof(gBrightnessOutbound));
+      ddcM1ddcProxyPath(fullLocations[i], results[i].m1ddcPath, sizeof(results[i].m1ddcPath));
       int serviceIndex = -1;
       IOAVServiceRef service = serviceMatching(&wanted[i], &serviceIndex);
       results[i].display = targets[i];
+      results[i].vendor = wanted[i].vendor;
+      results[i].product = wanted[i].model;
+      results[i].serial = wanted[i].serial;
+      snprintf(results[i].edidName, sizeof(results[i].edidName), "%s", gBoundEdidName);
       results[i].service = service;
       results[i].serviceIndex = service == NULL ? -1 : serviceIndex;
       snprintf(results[i].servicePath, sizeof(results[i].servicePath), "%s", gBoundServicePath);
@@ -1799,7 +1933,9 @@ void probeDDC(void) {
         if (results[i].haveReply) {
           ddcNoteReply(results[i].display, results[i].writeState, results[i].writeCode,
                        results[i].readState, results[i].readCode, results[i].reply,
-                       results[i].servicePath, results[i].outbound, results[i].outboundCount);
+                       results[i].servicePath, results[i].outbound, results[i].outboundCount,
+                       results[i].vendor, results[i].product, results[i].serial, results[i].edidName,
+                       results[i].m1ddcPath);
         }
         // A write confirmed or moved this channel while the probe was out, so
         // these reads are stale. Publishing them would reset current and

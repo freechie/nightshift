@@ -155,6 +155,14 @@ static int talk(const char *line, char *reply, size_t cap, BOOL whole) {
   }
   if (!whole) {
     *nl = '\0';
+  } else if (used + 1 >= cap && reply[used - 1] != '\n') {
+    // The buffer filled mid-line. Keep complete lines so a path is not
+    // printed cut off at a word.
+    char *last = strrchr(reply, '\n');
+    if (last == NULL) {
+      return 1;
+    }
+    last[1] = '\0';
   }
   if (reply[0] == '\0' || strcmp(reply, "failed") == 0 ||
       strncmp(reply, "failed\n", 7) == 0) {
@@ -687,7 +695,8 @@ int main(int argc, const char *argv[]) {
     }
 
     if (argc == 2 && strcmp(argv[1], "ddc") == 0) {
-      char reply[512];
+      // 512 cut the second display's path mid-word (…/RTBuddy(DCPEXT1)/DCPEXT1En).
+      char reply[16384];
       return finishReply(askAll("ddc\n", reply, sizeof(reply)), reply, "failed to read ddc", NO);
     }
 

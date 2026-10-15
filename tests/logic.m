@@ -1479,7 +1479,7 @@ static void checkProbe(void) {
   rows[1].service = 1;
   rows[1].verdict = kNSDDCProbeSoftware;
   rows[1].evidence = kNSDDCEvidenceInFlight;
-  char report[128];
+  char report[2048];
   CHECK_EQ(nsDDCDebugReport(displays, builtin, 3, rows, 1, report, sizeof(report)), 2);
   CHECK(strcmp(report, "ddc 3 0 1 3\nddc 2 -1 1 6\n") == 0);
   CHECK_EQ(nsDDCDebugReport(displays, builtin, 3, rows, 2, report, sizeof(report)), 2);
@@ -1549,21 +1549,79 @@ static void checkProbe(void) {
   }
   echoLen[11] = replySum;
   CHECK(strcmp(nsDDCReplyReason(echoLen, 12), "ok") == 0);
-  char replyLine[160];
+  char replyLine[2048];
   uint8_t outbound[5] = {0x51, 0x82, 0x01, 0x10, 0xfd};
-  CHECK(nsDDCReplyLine(3, kNSDDCIOCode, 0, kNSDDCIOCode, 0xe00002c7, zeros, 12, NULL, NULL, 0,
-                       replyLine, sizeof(replyLine)));
+  CHECK(nsDDCReplyLine(3, kNSDDCIOCode, 0, kNSDDCIOCode, 0xe00002c7, zeros, 12, NULL, NULL, 0, 0, 0,
+                       0, NULL, NULL, replyLine, sizeof(replyLine)));
   CHECK(strcmp(replyLine,
-               "ddc reply 3 0x0 0xe00002c7 all zeros 00 00 00 00 00 00 00 00 00 00 00 00 path=- out=-") ==
-        0);
-  CHECK(nsDDCReplyLine(2, kNSDDCIOTimeout, 0, kNSDDCIONone, 0, echoLen, 12,
-                       "IOService:/dispext0", outbound, 5, replyLine, sizeof(replyLine)));
-  char expectReply[256];
+               "ddc reply 3 0x0 0xe00002c7 all zeros 00 00 00 00 00 00 00 00 00 00 00 00 "
+               "path=- out=- vendor=0 product=0 serial=0 name=- m1ddc=- match=-") == 0);
+  CHECK(nsDDCReplyLine(2, kNSDDCIOTimeout, 0, kNSDDCIONone, 0, echoLen, 12, "IOService:/dispext0",
+                       outbound, 5, 0, 0, 0, NULL, NULL, replyLine, sizeof(replyLine)));
+  char expectReply[2048];
   snprintf(expectReply, sizeof(expectReply),
            "ddc reply 2 timeout none ok 6e 51 02 00 10 00 00 64 00 2a 00 %02x "
-           "path=IOService:/dispext0 out=51 82 01 10 fd",
+           "path=IOService:/dispext0 out=51 82 01 10 fd "
+           "vendor=0 product=0 serial=0 name=- m1ddc=- match=-",
            echoLen[11]);
   CHECK(strcmp(replyLine, expectReply) == 0);
+
+  uint8_t edid[128];
+  memset(edid, 0, sizeof(edid));
+  int nameOff = 54 + 18;
+  edid[nameOff + 3] = 0xFC;
+  memcpy(edid + nameOff + 5, "BenQ GL2460", 11);
+  edid[nameOff + 5 + 11] = 0x0A;
+  char monitor[16];
+  CHECK(nsDDCEDIDName(edid, 128, monitor, sizeof(monitor)));
+  CHECK(strcmp(monitor, "BenQ GL2460") == 0);
+  memcpy(edid + nameOff + 5, "Acer XV272U V", 13);
+  CHECK(nsDDCEDIDName(edid, 128, monitor, sizeof(monitor)));
+  CHECK(strcmp(monitor, "Acer XV272U V") == 0);
+  CHECK(!nsDDCEDIDName(edid, 127, monitor, sizeof(monitor)));
+  CHECK(monitor[0] == '\0');
+  edid[nameOff + 3] = 0xFF;
+  CHECK(!nsDDCEDIDName(edid, 128, monitor, sizeof(monitor)));
+
+  const char *acerProxy = "IOService:/dcpext0/dispext0/DCPAVServiceProxy";
+  CHECK(nsDDCReplyLine(3, kNSDDCIOCode, 0, kNSDDCIOCode, 0, zeros, 12, acerProxy, outbound, 5, 1265,
+                       121, 42, "Acer XV272U V", acerProxy, replyLine, sizeof(replyLine)));
+  CHECK(strstr(replyLine, "vendor=1265") != NULL);
+  CHECK(strstr(replyLine, "product=121") != NULL);
+  CHECK(strstr(replyLine, "serial=42") != NULL);
+  CHECK(strstr(replyLine, "name=\"Acer XV272U V\"") != NULL);
+  CHECK(strstr(replyLine, "m1ddc=IOService:/dcpext0/dispext0/DCPAVServiceProxy") != NULL);
+  CHECK(strstr(replyLine, "match=same") != NULL);
+  CHECK(nsDDCReplyLine(2, kNSDDCIOCode, 0, kNSDDCIOCode, 0, zeros, 12,
+                       "IOService:/dcpext1/dispext1/DCPAVServiceProxy", NULL, 0, 2513, 24611, 7,
+                       "BenQ GL2460", acerProxy, replyLine, sizeof(replyLine)));
+  CHECK(strstr(replyLine, "name=\"BenQ GL2460\"") != NULL);
+  CHECK(strstr(replyLine, "vendor=2513") != NULL);
+  CHECK(strstr(replyLine, "product=24611") != NULL);
+  CHECK(strstr(replyLine, "serial=7") != NULL);
+  CHECK(strstr(replyLine, "match=DIFFERENT") != NULL);
+  CHECK(nsDDCReplyLine(2, kNSDDCIOCode, 0, kNSDDCIOCode, 0, zeros, 12, acerProxy, NULL, 0, 1, 2, 3,
+                       "Dell", NULL, replyLine, sizeof(replyLine)));
+  CHECK(strstr(replyLine, "name=Dell") != NULL);
+  CHECK(strstr(replyLine, "match=-") != NULL);
+
+  // A path longer than the old 512-byte client read is copied whole. A short
+  // buffer fails empty instead of cutting the path at DCPEXT1En.
+  char longCut[601];
+  memset(longCut, 'Q', 600);
+  longCut[600] = '\0';
+  memcpy(longCut + 600 - 16, "DCPEXT1Endpoint", 16);
+  CHECK(nsDDCReplyLine(2, kNSDDCIOCode, 0, kNSDDCIOCode, 0, zeros, 12, longCut, NULL, 0, 2513, 24611,
+                       7, "BenQ GL2460", "IOService:/other", replyLine, sizeof(replyLine)));
+  CHECK(strstr(replyLine, longCut) != NULL);
+  CHECK(strstr(replyLine, "DCPEXT1Endpoint") != NULL);
+  CHECK(strstr(replyLine, "DCPEXT1En ") == NULL);
+  char clipped[512];
+  memset(clipped, 'x', sizeof(clipped));
+  CHECK(!nsDDCReplyLine(2, kNSDDCIOCode, 0, kNSDDCIOCode, 0, zeros, 12, longCut, NULL, 0, 2513,
+                        24611, 7, "BenQ GL2460", "IOService:/other", clipped, sizeof(clipped)));
+  CHECK(clipped[0] == '\0');
+
   rows[0].haveReply = true;
   rows[0].writeState = kNSDDCIOCode;
   rows[0].writeCode = 0;
@@ -1572,7 +1630,8 @@ static void checkProbe(void) {
   CHECK_EQ(nsDDCDebugReport(displays, builtin, 3, rows, 1, report, sizeof(report)), 3);
   CHECK(strcmp(report,
                "ddc 3 0 1 3\n"
-               "ddc reply 3 0x0 0x0 all zeros 00 00 00 00 00 00 00 00 00 00 00 00 path=- out=-\n"
+               "ddc reply 3 0x0 0x0 all zeros 00 00 00 00 00 00 00 00 00 00 00 00 "
+               "path=- out=- vendor=0 product=0 serial=0 name=- m1ddc=- match=-\n"
                "ddc 2 -1 1 6\n") == 0);
 
   // Null or empty after the reads: not controllable, and no brightness Set.
@@ -1601,6 +1660,7 @@ static void checkProbe(void) {
     char longPath[181];
     memset(longPath, 'p', 180);
     longPath[180] = '\0';
+    memcpy(longPath + 180 - 16, "DCPEXT1Endpoint", 16);
     NSDDCDebugRow wide[2];
     memset(wide, 0, sizeof(wide));
     wide[0].display = 3;
@@ -1611,6 +1671,11 @@ static void checkProbe(void) {
     wide[0].writeState = kNSDDCIOCode;
     wide[0].readState = kNSDDCIOCode;
     snprintf(wide[0].servicePath, sizeof(wide[0].servicePath), "IOService:/%s", longPath);
+    snprintf(wide[0].m1ddcPath, sizeof(wide[0].m1ddcPath), "%s", wide[0].servicePath);
+    snprintf(wide[0].edidName, sizeof(wide[0].edidName), "Acer XV272U V");
+    wide[0].vendor = 1265;
+    wide[0].product = 121;
+    wide[0].serial = 42;
     wide[1].display = 2;
     wide[1].service = 1;
     wide[1].verdict = kNSDDCProbeSoftware;
@@ -1619,13 +1684,28 @@ static void checkProbe(void) {
     wide[1].writeState = kNSDDCIOCode;
     wide[1].readState = kNSDDCIOCode;
     snprintf(wide[1].servicePath, sizeof(wide[1].servicePath), "IOService:/%s", longPath);
-    char big[4096];
+    snprintf(wide[1].m1ddcPath, sizeof(wide[1].m1ddcPath), "IOService:/dcpext0/dispext0/DCPAVServiceProxy");
+    snprintf(wide[1].edidName, sizeof(wide[1].edidName), "BenQ GL2460");
+    wide[1].vendor = 2513;
+    wide[1].product = 24611;
+    wide[1].serial = 7;
+    char big[8192];
     char small[512];
     CHECK(nsDDCDebugReport(displays, builtin, 3, wide, 2, big, sizeof(big)) == 4);
     CHECK(strstr(big, "ddc reply 3 ") != NULL);
     CHECK(strstr(big, "ddc reply 2 ") != NULL);
+    CHECK(strstr(big, "name=\"Acer XV272U V\"") != NULL);
+    CHECK(strstr(big, "name=\"BenQ GL2460\"") != NULL);
+    CHECK(strstr(big, "match=same") != NULL);
+    CHECK(strstr(big, "match=DIFFERENT") != NULL);
+    CHECK(strstr(big, "vendor=1265") != NULL);
+    CHECK(strstr(big, "vendor=2513") != NULL);
+    char *tail = strstr(big, "DCPEXT1Endpoint");
+    CHECK(tail != NULL);
+    CHECK(strstr(tail + 1, "DCPEXT1Endpoint") != NULL);
     CHECK(nsDDCDebugReport(displays, builtin, 3, wide, 2, small, sizeof(small)) == -1);
     CHECK(strstr(small, "ddc reply 2 ") == NULL);
+    CHECK(strstr(small, "DCPEXT1En") == NULL);
   }
   NSDDCProbeFacts timed;
   memset(&timed, 0, sizeof(timed));

@@ -273,12 +273,19 @@ bool nsDDCNullMessage(const uint8_t *bytes, int count);
 // 82 01 10 fd, so the message with the offset is 51 82 01 10 fd. Opcode 0x01
 // is Get, not Set (0x03).
 void nsDDCGetVCPRequest(uint8_t vcp, uint8_t out[4]);
-// "ddc reply <display> <write> <read> <reason> <12 hex bytes> path=<svc> out=<bytes>".
-// write and read are "none", "timeout", or 0x-hex. servicePath NULL or empty
-// prints path=-. outbound NULL prints out=-. False when out is short.
+// "ddc reply ... path=<svc> out=<bytes> vendor=<n> product=<n> serial=<n>
+// name=<edid> m1ddc=<path> match=same|DIFFERENT".
+// write and read are "none", "timeout", or 0x-hex. Empty path, name, or
+// m1ddc path prints "-". match=- when m1ddc path is unknown. The path is
+// copied in full; a short out fails the call instead of cutting a word.
+// False when out is short.
 bool nsDDCReplyLine(uint32_t display, int writeState, int writeCode, int readState, int readCode,
                     const uint8_t *bytes, int count, const char *servicePath,
-                    const uint8_t *outbound, int outboundCount, char *out, size_t cap);
+                    const uint8_t *outbound, int outboundCount, uint32_t vendor, uint32_t product,
+                    uint32_t serial, const char *edidName, const char *m1ddcPath, char *out,
+                    size_t cap);
+// Monitor name from an EDID descriptor tagged 0xFC. False when none is present.
+bool nsDDCEDIDName(const uint8_t *edid, int count, char *out, size_t cap);
 // One recorded probe row. evidence is a kNSDDCEvidence value. haveReply
 // adds the raw brightness-read line after the status line.
 typedef struct {
@@ -295,6 +302,11 @@ typedef struct {
   char servicePath[512];
   uint8_t outbound[5];
   int outboundCount;
+  uint32_t vendor;
+  uint32_t product;
+  uint32_t serial;
+  char edidName[16];
+  char m1ddcPath[512];
 } NSDDCDebugRow;
 // One line per external, in display order, each ending in a newline.
 // builtin[i] != 0 skips that display. A display with no row is not-probed

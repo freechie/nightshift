@@ -744,6 +744,36 @@ NSDDCProbeVerdict nsDDCProbeControl(NSDDCProbeIO *io, int *currentOut, int *maxO
   return nsDDCProbeDecide(&facts, currentOut, maxOut);
 }
 
+bool nsDDCEDIDName(const uint8_t *edid, int count, char *out, size_t cap) {
+  if (out == NULL || cap == 0) {
+    return false;
+  }
+  out[0] = '\0';
+  if (edid == NULL || count < 128) {
+    return false;
+  }
+  for (int block = 0; block < 4; block++) {
+    int off = 54 + block * 18;
+    if (edid[off] != 0 || edid[off + 1] != 0 || edid[off + 2] != 0 || edid[off + 3] != 0xFC) {
+      continue;
+    }
+    size_t n = 0;
+    for (int i = 0; i < 13 && n + 1 < cap; i++) {
+      unsigned char c = edid[off + 5 + i];
+      if (c == 0x0A || c == 0x00) {
+        break;
+      }
+      if (c < 0x20 || c > 0x7E) {
+        continue;
+      }
+      out[n++] = (char)c;
+    }
+    out[n] = '\0';
+    return n > 0;
+  }
+  return false;
+}
+
 bool nsDDCNullMessage(const uint8_t *bytes, int count) {
   if (bytes == NULL || count < 3) {
     return false;
@@ -817,7 +847,9 @@ static bool ddcIOToken(int state, int code, char *out, size_t cap) {
 
 bool nsDDCReplyLine(uint32_t display, int writeState, int writeCode, int readState, int readCode,
                     const uint8_t *bytes, int count, const char *servicePath,
-                    const uint8_t *outbound, int outboundCount, char *out, size_t cap) {
+                    const uint8_t *outbound, int outboundCount, uint32_t vendor, uint32_t product,
+                    uint32_t serial, const char *edidName, const char *m1ddcPath, char *out,
+                    size_t cap) {
   if (out == NULL || cap == 0) {
     return false;
   }
@@ -861,22 +893,47 @@ bool nsDDCReplyLine(uint32_t display, int writeState, int writeCode, int readSta
       out[0] = '\0';
       return false;
     }
-    return true;
-  }
-  next = snprintf(out + wrote, cap - (size_t)wrote, " out=");
-  if (next < 0 || (size_t)next >= cap - (size_t)wrote) {
-    out[0] = '\0';
-    return false;
-  }
-  wrote += next;
-  int n = outboundCount > 8 ? 8 : outboundCount;
-  for (int i = 0; i < n; i++) {
-    next = snprintf(out + wrote, cap - (size_t)wrote, "%s%02x", i == 0 ? "" : " ", outbound[i]);
+    wrote += next;
+  } else {
+    next = snprintf(out + wrote, cap - (size_t)wrote, " out=");
     if (next < 0 || (size_t)next >= cap - (size_t)wrote) {
       out[0] = '\0';
       return false;
     }
     wrote += next;
+    int n = outboundCount > 8 ? 8 : outboundCount;
+    for (int i = 0; i < n; i++) {
+      next = snprintf(out + wrote, cap - (size_t)wrote, "%s%02x", i == 0 ? "" : " ", outbound[i]);
+      if (next < 0 || (size_t)next >= cap - (size_t)wrote) {
+        out[0] = '\0';
+        return false;
+      }
+      wrote += next;
+    }
+  }
+  char nameToken[80];
+  int nameWrote = 0;
+  if (edidName == NULL || edidName[0] == '\0') {
+    nameWrote = snprintf(nameToken, sizeof(nameToken), "-");
+  } else if (strchr(edidName, ' ') != NULL) {
+    nameWrote = snprintf(nameToken, sizeof(nameToken), "\"%s\"", edidName);
+  } else {
+    nameWrote = snprintf(nameToken, sizeof(nameToken), "%s", edidName);
+  }
+  if (nameWrote < 0 || (size_t)nameWrote >= sizeof(nameToken)) {
+    out[0] = '\0';
+    return false;
+  }
+  const char *m1 = (m1ddcPath != NULL && m1ddcPath[0] != '\0') ? m1ddcPath : "-";
+  const char *match = "-";
+  if (m1ddcPath != NULL && m1ddcPath[0] != '\0') {
+    match = (servicePath != NULL && strcmp(servicePath, m1ddcPath) == 0) ? "same" : "DIFFERENT";
+  }
+  next = snprintf(out + wrote, cap - (size_t)wrote, " vendor=%u product=%u serial=%u name=%s m1ddc=%s match=%s",
+                  vendor, product, serial, nameToken, m1, match);
+  if (next < 0 || (size_t)next >= cap - (size_t)wrote) {
+    out[0] = '\0';
+    return false;
   }
   return true;
 }
@@ -944,10 +1001,11 @@ int nsDDCDebugReport(const uint32_t *displays, const int *builtin, int displayCo
     used += (size_t)wrote;
     lines++;
     if (row != NULL && row->haveReply) {
-      char reply[768];
+      char reply[4096];
       if (!nsDDCReplyLine(displays[i], row->writeState, row->writeCode, row->readState,
                           row->readCode, row->reply, 12, row->servicePath, row->outbound,
-                          row->outboundCount, reply, sizeof(reply))) {
+                          row->outboundCount, row->vendor, row->product, row->serial, row->edidName,
+                          row->m1ddcPath, reply, sizeof(reply))) {
         continue;
       }
       wrote = snprintf(out + used, cap - used, "%s\n", reply);
