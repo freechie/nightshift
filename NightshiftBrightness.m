@@ -1836,7 +1836,8 @@ BOOL setDisplayBrightnessThen(uint32_t display, long percent, BrightnessDone don
   if (ddcFailed(display) && screenForDisplay(display) != nil) {
     restoreGamma(display);
     nsExternalBrightness(kNSDDCProbeSoftware, percent, floor, &hardware, &software);
-    percent = software;
+    // software is the gamma percent. The saved number stays the slider
+    // percent, so a later move does not curve the curve.
     applyDim(display, software);
     ok = finishBrightness(display, percent);
   } else if (screenForDisplay(display) != nil) {
