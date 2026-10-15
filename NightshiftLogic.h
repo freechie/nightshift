@@ -168,6 +168,8 @@ enum {
   kNSDDCEvidenceWriteOnly = 3,   // write path present, no valid reply
   kNSDDCEvidenceNoService = 4,   // no unambiguous service
   kNSDDCEvidenceUnchanged = 5,   // the panel answered and stayed on the old value
+  kNSDDCEvidenceNotProbed = 6,   // debug line only: this external has not been probed
+  kNSDDCEvidenceInFlight = 7,    // debug line only: a probe is running
 };
 
 // Raw brightness to write: two steps from current when that stays on the
@@ -178,9 +180,22 @@ int nsDDCProbeTarget(int current, int max);
 // read. Exact, not nsDDCNear: a one- or two-step nudge sits inside that
 // tolerance, so a cached read of the old value would look close enough.
 bool nsDDCProbeLanded(int before, int written, int after);
-// Checksum-valid DDC reply: capabilities (opcode 0xE3) or a VCP reply
-// (opcode 0x02). Accepts a length-prefixed frame and the 11-byte VCP layout
-// Apple's I2C read returns. Garbage and a bare write ack are not valid.
+// One IOAVServiceReadI2C buffer. valid is a checksum-valid capabilities
+// (opcode 0xE3) or VCP (opcode 0x02) frame. The checksum seed is 0x50, never
+// 0x6E. The length byte keeps its 0x80 flag in the checksum and the low 7
+// bits are the count. A leading 0x50 or 0x51 is an offset byte, not part of
+// the frame. The address may be 0x6E, 0x6F, or missing (the buffer starts at
+// the length byte). brightness is set only for VCP 0x10, result 0, with
+// current inside max.
+typedef struct {
+  bool valid;
+  bool brightness;
+  int current;
+  int max;
+} NSDDCReply;
+bool nsDDCDecodeReply(const uint8_t *bytes, int count, NSDDCReply *out);
+// True when nsDDCDecodeReply marks the buffer valid. Garbage and a bare
+// write ack are not valid.
 bool nsDDCFrameValid(const uint8_t *bytes, int count);
 // Raw value to keep when brightness cannot be read. Scale 100 and the top
 // of that scale when fallbackMax is 0. Never returns 0.
@@ -212,6 +227,19 @@ NSDDCProbeVerdict nsDDCProbeControl(NSDDCProbeIO *io, int *current, int *max);
 // Nothing but those codes. False when the buffer cannot hold the line.
 bool nsDDCDebugLine(uint32_t display, int service, int verdict, int evidence, char *out,
                     size_t cap);
+// One recorded probe row. evidence is a kNSDDCEvidence value.
+typedef struct {
+  uint32_t display;
+  int service;
+  int verdict;
+  int evidence;
+} NSDDCDebugRow;
+// One line per external, in display order, each ending in a newline.
+// builtin[i] != 0 skips that display. A display with no row is not-probed
+// (service -1, software dimming, kNSDDCEvidenceNotProbed). Returns the
+// number of lines, or -1 when out cannot hold them (out stays terminated).
+int nsDDCDebugReport(const uint32_t *displays, const int *builtin, int displayCount,
+                     const NSDDCDebugRow *rows, int rowCount, char *out, size_t cap);
 // Settings label. Controllable is "DDC/CI connected". Software is
 // "Software dimming" and is never the connected label.
 const char *nsDDCControlLabel(NSDDCProbeVerdict verdict);
