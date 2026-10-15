@@ -499,6 +499,23 @@ double nsCommandWarmthRepeatGap(double seconds) {
   return seconds;
 }
 
+NSWarmthMediaAction nsCommandWarmthMediaAction(int direction, bool down, bool repeat,
+                                               int heldDirection) {
+  if (direction != 1 && direction != -1) {
+    return kNSWarmthMediaIgnore;
+  }
+  if (!down) {
+    return heldDirection == direction ? kNSWarmthMediaEnd : kNSWarmthMediaIgnore;
+  }
+  // A second down for the direction already held, or a repeat, must not
+  // step. The hold timer is the only repeat. A repeat does not begin a hold,
+  // so it cannot race the hotkey's own press and step twice.
+  if (repeat || heldDirection == direction) {
+    return heldDirection == direction ? kNSWarmthMediaRepeat : kNSWarmthMediaIgnore;
+  }
+  return kNSWarmthMediaBegin;
+}
+
 bool nsCountsAsLit(NSOtherDisplay display) {
   if (display.asleep || display.mirrored) {
     return false;
@@ -746,6 +763,33 @@ int nsMediaBrightnessKey(long data1, bool *down) {
   long code = (data1 >> 16) & 0xFFFF;
   *down = ((data1 >> 8) & 0xFF) == 0xA;
   return code == 2 ? 1 : code == 3 ? -1 : 0;
+}
+
+bool nsMediaKeyRepeat(long data1) {
+  return (data1 & 0xFF) != 0;
+}
+
+static const uint64_t kNSChordModifiers = (uint64_t)kNSModifierShift | (uint64_t)kNSModifierControl |
+                                         (uint64_t)kNSModifierOption | (uint64_t)kNSModifierCommand |
+                                         (uint64_t)kNSModifierHelp | (uint64_t)kNSModifierFunction;
+
+NSMediaRoute nsMediaBrightnessRoute(long data1, uint64_t modifierFlags, bool *down) {
+  bool pressed = false;
+  int direction = nsMediaBrightnessKey(data1, &pressed);
+  if (down != NULL) {
+    *down = pressed;
+  }
+  if (direction == 0) {
+    return kNSMediaRouteNone;
+  }
+  uint64_t mods = modifierFlags & kNSChordModifiers;
+  if ((mods & (uint64_t)kNSModifierCommand) == 0) {
+    return kNSMediaRouteBrightness;
+  }
+  if (mods == (uint64_t)kNSModifierCommand) {
+    return kNSMediaRouteIntensity;
+  }
+  return kNSMediaRouteUntouched;
 }
 
 uint64_t nsMediaTapMaskBits(void) {

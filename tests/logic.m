@@ -678,6 +678,123 @@ static void checkMediaKeys(void) {
   CHECK(!nsMediaTapMaskAllowed(mask | 1));
 }
 
+// fnState off: Cmd+F1/F2 arrive as brightness media keys. Command alone
+// follows the intensity hotkey. No Command stays brightness. Command plus
+// any other chord modifier is not taken.
+static long mediaData(int code, int state, int repeat) {
+  return ((long)code << 16) | ((long)state << 8) | (long)(repeat & 0xFF);
+}
+
+static void checkBrightnessChord(void) {
+  const int downKey = 3;
+  const int upKey = 2;
+  const int press = 0xA;
+  const int release = 0xB;
+  bool down = false;
+  long brightDown = mediaData(downKey, press, 0);
+  long brightUp = mediaData(upKey, press, 0);
+  long brightDownUp = mediaData(downKey, release, 0);
+  long brightUpUp = mediaData(upKey, release, 0);
+
+  CHECK_EQ(nsMediaBrightnessRoute(brightDown, kNSModifierCommand, &down), kNSMediaRouteIntensity);
+  CHECK(down);
+  CHECK_EQ(nsMediaBrightnessKey(brightDown, &down), -1);
+  CHECK_EQ(nsMediaBrightnessKey(brightDown, &down), nsCommandWarmthDirection(1));
+  CHECK(!nsMediaKeyRepeat(brightDown));
+
+  CHECK_EQ(nsMediaBrightnessRoute(brightUp, kNSModifierCommand, &down), kNSMediaRouteIntensity);
+  CHECK(down);
+  CHECK_EQ(nsMediaBrightnessKey(brightUp, &down), 1);
+  CHECK_EQ(nsMediaBrightnessKey(brightUp, &down), nsCommandWarmthDirection(2));
+
+  CHECK_EQ(nsMediaBrightnessRoute(brightDownUp, kNSModifierCommand, &down), kNSMediaRouteIntensity);
+  CHECK(!down);
+  CHECK_EQ(nsMediaBrightnessRoute(brightUpUp, kNSModifierCommand, &down), kNSMediaRouteIntensity);
+  CHECK(!down);
+
+  CHECK_EQ(nsMediaBrightnessRoute(brightDown, 0, &down), kNSMediaRouteBrightness);
+  CHECK(down);
+  CHECK_EQ(nsMediaBrightnessRoute(brightUp, 0, &down), kNSMediaRouteBrightness);
+  CHECK_EQ(nsMediaBrightnessRoute(brightDownUp, 0, &down), kNSMediaRouteBrightness);
+  CHECK(!down);
+
+  // Shift, control, option, or function without Command stay on brightness.
+  const uint64_t alone[] = {kNSModifierShift, kNSModifierControl, kNSModifierOption,
+                            kNSModifierFunction, kNSModifierHelp};
+  for (size_t i = 0; i < sizeof(alone) / sizeof(alone[0]); i++) {
+    CHECK_EQ(nsMediaBrightnessRoute(brightDown, alone[i], &down), kNSMediaRouteBrightness);
+    CHECK_EQ(nsMediaBrightnessRoute(brightUp, alone[i], &down), kNSMediaRouteBrightness);
+  }
+
+  const uint64_t extra[] = {kNSModifierShift, kNSModifierControl, kNSModifierOption,
+                            kNSModifierFunction, kNSModifierHelp};
+  for (size_t i = 0; i < sizeof(extra) / sizeof(extra[0]); i++) {
+    uint64_t flags = (uint64_t)kNSModifierCommand | extra[i];
+    CHECK_EQ(nsMediaBrightnessRoute(brightDown, flags, &down), kNSMediaRouteUntouched);
+    CHECK(down);
+    CHECK_EQ(nsMediaBrightnessRoute(brightUp, flags, &down), kNSMediaRouteUntouched);
+    CHECK_EQ(nsMediaBrightnessRoute(mediaData(downKey, release, 0), flags, &down),
+             kNSMediaRouteUntouched);
+    CHECK(!down);
+  }
+  CHECK_EQ(nsMediaBrightnessRoute(brightDown,
+                                 (uint64_t)kNSModifierCommand | kNSModifierShift | kNSModifierOption,
+                                 &down),
+           kNSMediaRouteUntouched);
+
+  // Caps lock, numeric pad, the non-coalesced bit, and which Command key
+  // do not count as another modifier.
+  const uint64_t ignored = (uint64_t)kNSModifierCommand | (1ull << 16) | (1ull << 21) | 0x100ull | 0x8ull;
+  CHECK_EQ(nsMediaBrightnessRoute(brightDown, ignored, &down), kNSMediaRouteIntensity);
+  CHECK_EQ(nsMediaBrightnessRoute(brightUp, ignored, NULL), kNSMediaRouteIntensity);
+  CHECK_EQ(nsMediaBrightnessRoute(brightDown, 0x100ull, &down), kNSMediaRouteBrightness);
+
+  // A repeat is still the same chord. Volume and mute never route here.
+  long repeat = mediaData(downKey, press, 1);
+  CHECK(nsMediaKeyRepeat(repeat));
+  CHECK(nsMediaKeyRepeat(mediaData(upKey, press, 5)));
+  CHECK(!nsMediaKeyRepeat(brightDownUp));
+  CHECK_EQ(nsMediaBrightnessRoute(repeat, kNSModifierCommand, &down), kNSMediaRouteIntensity);
+  CHECK(down);
+  CHECK_EQ(nsMediaBrightnessRoute(repeat, 0, &down), kNSMediaRouteBrightness);
+  for (int code = 0; code <= 7; code++) {
+    if (code == 2 || code == 3) {
+      continue;
+    }
+    long other = mediaData(code, press, 0);
+    CHECK_EQ(nsMediaBrightnessRoute(other, kNSModifierCommand, &down), kNSMediaRouteNone);
+    CHECK_EQ(nsMediaBrightnessRoute(other, 0, &down), kNSMediaRouteNone);
+    CHECK_EQ(nsMediaBrightnessRoute(other, (uint64_t)kNSModifierCommand | kNSModifierShift, &down),
+             kNSMediaRouteNone);
+  }
+
+  // Media down, repeat, and up share the hotkey hold. One begin, one end.
+  // A second down while that direction is held does not begin again, and a
+  // second release does not end again.
+  int held = 0;
+  CHECK_EQ(nsCommandWarmthMediaAction(-1, true, false, held), kNSWarmthMediaBegin);
+  held = -1;
+  CHECK_EQ(nsCommandWarmthMediaAction(-1, true, true, held), kNSWarmthMediaRepeat);
+  CHECK_EQ(nsCommandWarmthMediaAction(-1, true, false, held), kNSWarmthMediaRepeat);
+  CHECK_EQ(nsCommandWarmthMediaAction(-1, false, false, held), kNSWarmthMediaEnd);
+  held = 0;
+  CHECK_EQ(nsCommandWarmthMediaAction(-1, false, false, held), kNSWarmthMediaIgnore);
+  CHECK_EQ(nsCommandWarmthMediaAction(-1, true, true, held), kNSWarmthMediaIgnore);
+
+  // The hotkey press already began. The media down/repeat must not step,
+  // and one of the two releases saves.
+  held = 1;
+  CHECK_EQ(nsCommandWarmthMediaAction(1, true, false, held), kNSWarmthMediaRepeat);
+  CHECK_EQ(nsCommandWarmthMediaAction(1, true, true, held), kNSWarmthMediaRepeat);
+  CHECK_EQ(nsCommandWarmthMediaAction(1, false, false, held), kNSWarmthMediaEnd);
+  CHECK_EQ(nsCommandWarmthMediaAction(1, false, false, 0), kNSWarmthMediaIgnore);
+  CHECK_EQ(nsCommandWarmthMediaAction(-1, false, false, 1), kNSWarmthMediaIgnore);
+  CHECK_EQ(nsCommandWarmthMediaAction(1, true, false, -1), kNSWarmthMediaBegin);
+  CHECK_EQ(nsCommandWarmthMediaAction(1, true, true, -1), kNSWarmthMediaIgnore);
+  CHECK_EQ(nsCommandWarmthMediaAction(0, true, false, 0), kNSWarmthMediaIgnore);
+  CHECK_EQ(nsCommandWarmthMediaAction(2, true, false, 0), kNSWarmthMediaIgnore);
+}
+
 // Disabled key taps: never an immediate re-enable, never once
 // Accessibility is gone, and a give-up after repeated disables.
 static void checkTapRecovery(void) {
@@ -977,6 +1094,7 @@ static void checkProbe(void) {
 int main(void) {
   checkTapRecovery();
   checkMediaKeys();
+  checkBrightnessChord();
   checkRamp();
   checkMatching();
   checkSlots();
