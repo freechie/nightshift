@@ -891,6 +891,7 @@ typedef struct {
   int failFirst;  // the first N reads fail, later ones work
   bool framed;
   bool overran;
+  bool hangAfterWrite;
   int framedCalls;
   int reads;
   int writes;
@@ -963,6 +964,10 @@ static bool probeWrite(void *ctx, int value) {
   }
   if (!panel->sticky && !panel->echoSaved) {
     panel->panel = value;
+  }
+  // The value landed, then the call timed out. Later writes still apply.
+  if (panel->hangAfterWrite && panel->writes == 1) {
+    panel->overran = true;
   }
   return true;
 }
@@ -1518,19 +1523,43 @@ static void checkProbe(void) {
   CHECK_EQ(lateHang.writes, 0);
   CHECK_EQ(io.evidence, kNSDDCEvidenceTimedOut);
 
-  // Nudge went out, confirmation read overran: do not write the original back.
+  // Nudge went out, confirmation read overran: still put 42 back.
   ProbePanel confirmHang = probePanel(42, 100);
   io.ctx = &confirmHang;
   io.read = probeReadConfirmOverrun;
   io.framed = NULL;
   io.budget = probeBudget;
   CHECK_EQ(nsDDCProbeControl(&io, &current, &max), kNSDDCProbeSoftware);
-  CHECK_EQ(confirmHang.writes, 1);
+  CHECK_EQ(confirmHang.writes, 2);
   CHECK_EQ(confirmHang.written[0], 44);
+  CHECK_EQ(confirmHang.written[1], 42);
+  CHECK_EQ(confirmHang.panel, 42);
+  CHECK_EQ(io.evidence, kNSDDCEvidenceTimedOut);
+
+  // No saved scale, so the probe writes full scale. The write lands and the
+  // call then times out. The level from before the probe is written back.
+  ProbePanel fullHang = probePanel(30, 100);
+  fullHang.failRead = true;
+  fullHang.framed = true;
+  fullHang.hangAfterWrite = true;
+  io.ctx = &fullHang;
+  io.read = probeRead;
+  io.write = probeWrite;
+  io.framed = probeFramed;
+  io.budget = probeBudget;
+  io.fallbackCurrent = 30;
+  io.fallbackMax = 0;
+  CHECK_EQ(nsDDCProbeControl(&io, &current, &max), kNSDDCProbeSoftware);
+  CHECK_EQ(fullHang.writes, 2);
+  CHECK_EQ(fullHang.written[0], 100);
+  CHECK_EQ(fullHang.written[1], 30);
+  CHECK_EQ(fullHang.panel, 30);
   CHECK_EQ(io.evidence, kNSDDCEvidenceTimedOut);
   io.budget = NULL;
   io.read = probeRead;
   io.framed = probeFramed;
+  io.fallbackCurrent = 0;
+  io.fallbackMax = 0;
 }
 
 int main(void) {

@@ -237,9 +237,11 @@ int nsDDCNextReadOffset(int tried, int offset0, bool budgetLeft);
 // Controllable when one of those reads is the written value. When every
 // brightness read fails, a framed reply and a write of the kept value are
 // still controllable. A write with no valid reply, or a readback that stays
-// on the first value, is software-only. io->evidence receives the code.
-// When the first read works, *current and *max receive it. Either pointer
-// may be NULL. io may be NULL.
+// on the first value, is software-only. If a test write (the nudge, or full
+// scale when no level was saved) may have reached the panel and the probe
+// then fails or times out, the brightness from before that write is written
+// back. io->evidence receives the code. When the first read works, *current
+// and *max receive it. Either pointer may be NULL. io may be NULL.
 NSDDCProbeVerdict nsDDCProbeControl(NSDDCProbeIO *io, int *current, int *max);
 // "ddc <display> <service> <verdict> <evidence>". Service -1 is no match.
 // Nothing but those codes. False when the buffer cannot hold the line.
