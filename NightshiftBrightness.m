@@ -1199,6 +1199,7 @@ static BOOL displayWasRestored(uint32_t display);
 static bool ddcProbeRead(void *ctx, int *current, int *max);
 static bool ddcProbeWrite(void *ctx, int value);
 static bool ddcProbeFramed(void *ctx);
+static bool ddcProbeBudget(void *ctx);
 
 BOOL setDisplayBrightness(uint32_t display, long percent);
 
