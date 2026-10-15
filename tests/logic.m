@@ -1494,6 +1494,58 @@ static void checkProbe(void) {
 
   CHECK(nsDDCDebugLine(3, 0, kNSDDCProbeSoftware, kNSDDCEvidenceTimedOut, line, sizeof(line)));
   CHECK(strcmp(line, "ddc 3 0 1 8") == 0);
+
+  uint8_t zeros[12];
+  memset(zeros, 0, sizeof(zeros));
+  CHECK(strcmp(nsDDCReplyReason(zeros, 12), "all zeros") == 0);
+  CHECK(strcmp(nsDDCReplyReason(NULL, 0), "all zeros") == 0);
+  uint8_t first[12] = {0x00, 0x88, 0x02, 0x00, 0x10, 0, 0, 100, 0, 42, 0, 0};
+  CHECK(strcmp(nsDDCReplyReason(first, 12), "wrong first byte") == 0);
+  uint8_t badLen[12] = {0x6E, 0x01, 0x02, 0x00, 0x10, 0, 0, 100, 0, 42, 0, 0};
+  CHECK(strcmp(nsDDCReplyReason(badLen, 12), "bad length") == 0);
+  uint8_t summed[12] = {0x6E, 0x88, 0x02, 0x00, 0x10, 0x00, 0x00, 100, 0x00, 42, 0x00, 0};
+  uint8_t replySum = 0x50;
+  for (int i = 0; i < 11; i++) {
+    replySum ^= summed[i];
+  }
+  summed[11] = (uint8_t)(replySum ^ 0xFF);
+  CHECK(strcmp(nsDDCReplyReason(summed, 12), "checksum mismatch") == 0);
+  summed[11] = replySum;
+  summed[2] = 0x00;
+  replySum = 0x50;
+  for (int i = 0; i < 11; i++) {
+    replySum ^= summed[i];
+  }
+  summed[11] = replySum;
+  CHECK(strcmp(nsDDCReplyReason(summed, 12), "wrong opcode or VCP code") == 0);
+  uint8_t echoLen[12] = {0x6E, 0x51, 0x02, 0x00, 0x10, 0x00, 0x00, 100, 0x00, 42, 0x00, 0};
+  replySum = 0x50;
+  for (int i = 0; i < 11; i++) {
+    replySum ^= echoLen[i];
+  }
+  echoLen[11] = replySum;
+  CHECK(strcmp(nsDDCReplyReason(echoLen, 12), "ok") == 0);
+  char replyLine[160];
+  CHECK(nsDDCReplyLine(3, kNSDDCIOCode, 0, kNSDDCIOCode, 0xe00002c7, zeros, 12, replyLine,
+                       sizeof(replyLine)));
+  CHECK(strcmp(replyLine,
+               "ddc reply 3 0x0 0xe00002c7 all zeros 00 00 00 00 00 00 00 00 00 00 00 00") == 0);
+  CHECK(nsDDCReplyLine(2, kNSDDCIOTimeout, 0, kNSDDCIONone, 0, echoLen, 12, replyLine,
+                       sizeof(replyLine)));
+  char expectReply[160];
+  snprintf(expectReply, sizeof(expectReply),
+           "ddc reply 2 timeout none ok 6e 51 02 00 10 00 00 64 00 2a 00 %02x", echoLen[11]);
+  CHECK(strcmp(replyLine, expectReply) == 0);
+  rows[0].haveReply = true;
+  rows[0].writeState = kNSDDCIOCode;
+  rows[0].writeCode = 0;
+  rows[0].readState = kNSDDCIOCode;
+  rows[0].readCode = 0;
+  CHECK_EQ(nsDDCDebugReport(displays, builtin, 3, rows, 1, report, sizeof(report)), 3);
+  CHECK(strcmp(report,
+               "ddc 3 0 1 3\n"
+               "ddc reply 3 0x0 0x0 all zeros 00 00 00 00 00 00 00 00 00 00 00 00\n"
+               "ddc 2 -1 1 6\n") == 0);
   NSDDCProbeFacts timed;
   memset(&timed, 0, sizeof(timed));
   timed.evidence = kNSDDCEvidenceTimedOut;
