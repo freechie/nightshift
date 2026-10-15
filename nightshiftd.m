@@ -6506,6 +6506,12 @@ static const int64_t kKeyReposted = 0x4e53686b;  // "NShk"
 // Tap thread: a brightness press the taps swallowed, so its release is
 // swallowed too. Cleared on main whenever the taps are (re-)created.
 static BOOL gSwallowedPress[2];
+// Command+brightness was swallowed. Its release stays on the intensity path
+// even if Command is up first, and a later event for that key does not also
+// step the lamp. The tap thread sets it and main clears it, so it is atomic.
+static atomic_bool gIntensityArm[2];
+static void commandWarmthFromMedia(int direction, bool down, bool repeat);
+static void endArmedIntensityHold(void);
 // Set by the tap thread when a disabled notice is queued for main.
 static atomic_bool gTapDisabledPending;
 static void handleTapsDisabled(void);
@@ -6583,15 +6589,53 @@ static CGEventRef brightnessKey(CGEventTapProxy proxy, CGEventType type,
     // A brightness key whose press was swallowed has its release swallowed
     // too, so nothing downstream sees a release without a press. Every
     // other key, volume and mute included, goes back untouched.
+    //
+    // Command alone on brightness down/up is the same intensity chord as
+    // the NScm hotkey. fnState off delivers that as this media key, which
+    // RegisterEventHotKey cannot see. The event is consumed here. Command
+    // plus Shift, Control, Option, Help, or Function is left alone. No
+    // Command keeps the brightness path below.
     if (type == (CGEventType)NSEventTypeSystemDefined) {
       NSEvent *key = [NSEvent eventWithCGEvent:event];
       bool down = false;
-      int brightness = key.subtype == 8 ? nsMediaBrightnessKey((long)key.data1, &down) : 0;
-      if (brightness != 0 && !down) {
-        BOOL *pressed = &gSwallowedPress[brightness > 0];
-        BOOL swallow = *pressed;
-        *pressed = NO;
-        return swallow ? NULL : event;
+      long data1 = 0;
+      int brightness = 0;
+      if (key != nil && key.subtype == 8) {
+        data1 = (long)key.data1;
+        brightness = nsMediaBrightnessKey(data1, &down);
+      }
+      if (brightness != 0) {
+        int index = brightness > 0;
+        if (atomic_load(&gIntensityArm[index])) {
+          if (!down) {
+            atomic_store(&gIntensityArm[index], false);
+            gSwallowedPress[index] = NO;
+            commandWarmthFromMedia(brightness, false, false);
+          } else {
+            // A repeat, or a second down beside the hotkey, must not step.
+            commandWarmthFromMedia(brightness, true, true);
+          }
+          return NULL;
+        }
+        NSMediaRoute route =
+            nsMediaBrightnessRoute(data1, (uint64_t)CGEventGetFlags(event), &down);
+        if (!down) {
+          // A press this tap swallowed still hides its release, including
+          // when the modifiers changed before the key came up.
+          BOOL *pressed = &gSwallowedPress[index];
+          BOOL swallow = *pressed;
+          *pressed = NO;
+          return swallow ? NULL : event;
+        }
+        if (route == kNSMediaRouteIntensity) {
+          atomic_store(&gIntensityArm[index], true);
+          gSwallowedPress[index] = YES;
+          commandWarmthFromMedia(brightness, true, nsMediaKeyRepeat(data1));
+          return NULL;
+        }
+        if (route == kNSMediaRouteUntouched) {
+          return event;
+        }
       }
     }
     int direction = tapDirection(type, event);
@@ -6625,7 +6669,16 @@ static void considerBrightnessEvent(IOHIDEventRef event) {
     int64_t usage = IOHIDEventGetIntegerValue(event, (3u << 16) + 1);
     int64_t down = IOHIDEventGetIntegerValue(event, (3u << 16) + 2);
     if (page == 0x0C && down != 0 && (usage == 0x6F || usage == 0x70)) {
-      deliverBrightness(usage == 0x6F ? 1 : -1);
+      // This monitor cannot swallow the key. Command alone is intensity,
+      // owned by the session tap, and Command plus another modifier is left
+      // for macOS. Either one must not also move the lamp from here.
+      bool pressed = false;
+      long data1 = (3L << 16) | (0xAL << 8);
+      CGEventFlags flags = CGEventSourceFlagsState(kCGEventSourceStateCombinedSessionState);
+      NSMediaRoute route = nsMediaBrightnessRoute(data1, (uint64_t)flags, &pressed);
+      if (route == kNSMediaRouteBrightness) {
+        deliverBrightness(usage == 0x6F ? 1 : -1);
+      }
     }
   }
   CFArrayRef children = IOHIDEventGetChildren(event);
@@ -6676,6 +6729,7 @@ static void scheduleTapRetry(double delay) {
 // Main thread. Drops the taps so installBrightnessTap can re-create them,
 // and lets the permission poll do that once Accessibility is back.
 void dropTapsAndRetry(void) {
+  endArmedIntensityHold();
   nsSessionTapRemove();
   atomic_store(&gTapDisabledPending, false);
   if (gMenu != nil) {
@@ -6717,6 +6771,7 @@ bool installBrightnessTap(void) {
   if (nsSessionTapInstalled()) {
     return true;
   }
+  endArmedIntensityHold();
   gSwallowedPress[0] = gSwallowedPress[1] = NO;
   refreshKeyDisplays();
   return nsSessionTapCreate(brightnessKey);
@@ -6765,10 +6820,12 @@ static void registerBrightnessHotKeys(void) {
 // The setting off: F1 and F2 are the brightness keys. Command does not turn
 // them into F1/F2. A built-in keyboard sends a media key
 // (NX_KEYTYPE_BRIGHTNESS_DOWN 3 / UP 2, system-defined subtype 8) with
-// Command set in the event flags. That is not a virtual key code.
-// RegisterEventHotKey cannot bind it, and this does not add an event tap.
-// Those presses stay on the existing brightness-key path. Cmd+Fn+F1/F2 is
-// a real F-key and hits the registration above.
+// Command set in the event flags. That is not a virtual key code, so
+// RegisterEventHotKey cannot bind it. The session tap already receives it
+// and, for Command alone, runs this same hold: one step, preview while
+// held, one save on release. Command plus another modifier is not taken.
+// No second tap and no new permission. Cmd+Fn+F1/F2 is a real F-key and
+// hits the registration above.
 //
 // Carbon reports the chord once on press and once on release, with no
 // repeat. The hold repeats on the main queue and only previews, the way
@@ -6799,6 +6856,28 @@ static void commandWarmthClearHold(void) {
   if (gMenu != nil) {
     gMenu.tracking = NO;
   }
+}
+
+static void commandWarmthTick(BOOL release);
+
+// Main thread. The taps are going away, so the matching key-up will not
+// arrive. Save the preview once. A hotkey hold (no media arm) is left to
+// its own release.
+static void endArmedIntensityHold(void) {
+  if (![NSThread isMainThread]) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+      endArmedIntensityHold();
+    });
+    return;
+  }
+  // Exchange both. || would skip the second clear when the first is set.
+  bool armed = atomic_exchange(&gIntensityArm[0], false);
+  armed = atomic_exchange(&gIntensityArm[1], false) || armed;
+  if (!armed || gCommandHoldDirection == 0) {
+    return;
+  }
+  gCommandHoldGeneration++;
+  commandWarmthTick(YES);
 }
 
 // Main thread. A repeat previews the next Current value. release saves it
@@ -6876,6 +6955,32 @@ static void commandWarmthHotKeyOnMain(UInt32 kind, EventHotKeyID hotKey) {
   int generation = gCommandHoldGeneration;
   commandWarmthTick(NO);
   scheduleCommandWarmthRepeat(generation, YES);
+}
+
+// Tap thread or main. Media Command+brightness joins the hotkey hold.
+// The action is decided on main, beside gCommandHoldDirection, so a media
+// down that arrives after the hotkey press does not step again, and a
+// repeat does not start its own hold.
+static void commandWarmthFromMedia(int direction, bool down, bool repeat) {
+  if (![NSThread isMainThread]) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+      commandWarmthFromMedia(direction, down, repeat);
+    });
+    return;
+  }
+  // A press queued just before the taps were dropped must not start a hold:
+  // its release will not arrive, and the timer would run on.
+  if (down && (direction == 1 || direction == -1) && !atomic_load(&gIntensityArm[direction > 0])) {
+    return;
+  }
+  NSWarmthMediaAction action =
+      nsCommandWarmthMediaAction(direction, down, repeat, gCommandHoldDirection);
+  if (action != kNSWarmthMediaBegin && action != kNSWarmthMediaEnd) {
+    return;
+  }
+  EventHotKeyID hotKey = {'NScm', (UInt32)(direction < 0 ? 1 : 2)};
+  commandWarmthHotKeyOnMain(action == kNSWarmthMediaEnd ? kEventHotKeyReleased : kEventHotKeyPressed,
+                            hotKey);
 }
 
 static OSStatus commandWarmthHotKey(EventHandlerCallRef next, EventRef event, void *user) {
