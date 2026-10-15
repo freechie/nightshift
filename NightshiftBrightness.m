@@ -738,10 +738,10 @@ static void ddcWaitAfterWrite(void) {
   }
 }
 
-static BOOL ddcWriteRead(IOAVServiceRef service, const uint8_t *request, int requestLen,
-                         uint8_t *reply, int replyLen) {
+static BOOL ddcWriteRead(IOAVServiceRef service, uint8_t *request, int requestLen, uint8_t *reply,
+                         int replyLen) {
   ddcWaitAfterWrite();
-  if (IOAVServiceWriteI2C(service, 0x37, 0x51, (void *)request, (uint32_t)requestLen) != 0) {
+  if (IOAVServiceWriteI2C(service, 0x37, 0x51, request, (uint32_t)requestLen) != 0) {
     return NO;
   }
   if (reply == NULL || replyLen <= 0) {
@@ -794,7 +794,7 @@ static BOOL ddcCapabilitiesOnce(IOAVServiceRef service, int withDataAddress) {
   if (!ddcWriteRead(service, request, 5, reply, (int)sizeof(reply))) {
     return NO;
   }
-  return nsDDCFrameValid(reply, (int)sizeof(reply));
+  return nsDDCFrameValid(reply, (int)sizeof(reply)) ? YES : NO;
 }
 
 static BOOL ddcVCPFrameOnce(IOAVServiceRef service) {
@@ -805,7 +805,7 @@ static BOOL ddcVCPFrameOnce(IOAVServiceRef service) {
   if (!ddcWriteRead(service, request, 4, reply, 11)) {
     return NO;
   }
-  return nsDDCFrameValid(reply, 11);
+  return nsDDCFrameValid(reply, 11) ? YES : NO;
 }
 
 // Brightness for a display that waits for the current probe to land
@@ -1238,21 +1238,26 @@ void probeDDC(void) {
   DDCSnapshot seen = ddcSnapshot();
   // Last-known slider percent, captured on the main thread. The probe uses
   // it only when a framed reply proves the link and brightness cannot be read.
+  // A block cannot capture a C array, so the list is a struct the block copies
+  // (the same way it already copies DDCSnapshot).
   typedef struct {
-    uint32_t display;
-    int percent;
-  } DDCFallback;
-  DDCFallback fallbacks[16];
-  int fallbackCount = 0;
+    struct {
+      uint32_t display;
+      int percent;
+    } item[16];
+    int count;
+  } DDCFallbacks;
+  DDCFallbacks saved;
+  memset(&saved, 0, sizeof(saved));
   {
     uint32_t idsNow[16];
     int nowCount = orderedDisplays(idsNow, 16);
-    for (int i = 0; i < nowCount && fallbackCount < 16; i++) {
+    for (int i = 0; i < nowCount && saved.count < 16; i++) {
       long remembered = rememberedBrightness(idsNow[i]);
-      fallbacks[fallbackCount].display = idsNow[i];
-      fallbacks[fallbackCount].percent =
+      saved.item[saved.count].display = idsNow[i];
+      saved.item[saved.count].percent =
           (remembered >= 1 && remembered <= 100) ? (int)remembered : -1;
-      fallbackCount++;
+      saved.count++;
     }
   }
   // On the DDC queue so probe reads can't overlap a lamp write.
@@ -1309,9 +1314,9 @@ void probeDDC(void) {
       // Wake, replug and a screen change all come through here.
       if (service != NULL) {
         int percent = -1;
-        for (int f = 0; f < fallbackCount; f++) {
-          if (fallbacks[f].display == targets[i]) {
-            percent = fallbacks[f].percent;
+        for (int f = 0; f < saved.count; f++) {
+          if (saved.item[f].display == targets[i]) {
+            percent = saved.item[f].percent;
             break;
           }
         }
