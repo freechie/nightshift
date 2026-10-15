@@ -637,6 +637,13 @@ NSDDCProbeVerdict nsDDCProbeControl(NSDDCProbeIO *io, int *currentOut, int *maxO
     if (!ddcBudgetOpen(io)) {
       return ddcBudgetStop(io, currentOut, maxOut, &sent, prior);
     }
+    // A null message (6e 80 be) or an empty buffer, after the retries, means
+    // the Get did not land a value. Do not send a brightness Set.
+    if (io->idle != NULL && io->idle(io->ctx)) {
+      facts.evidence = kNSDDCEvidenceNone;
+      io->evidence = facts.evidence;
+      return nsDDCProbeDecide(&facts, currentOut, maxOut);
+    }
     bool framed = io->framed != NULL && io->framed(io->ctx);
     if (!ddcBudgetOpen(io)) {
       return ddcBudgetStop(io, currentOut, maxOut, &sent, prior);
@@ -737,10 +744,33 @@ NSDDCProbeVerdict nsDDCProbeControl(NSDDCProbeIO *io, int *currentOut, int *maxO
   return nsDDCProbeDecide(&facts, currentOut, maxOut);
 }
 
+bool nsDDCNullMessage(const uint8_t *bytes, int count) {
+  if (bytes == NULL || count < 3) {
+    return false;
+  }
+  if (bytes[0] != 0x6E && bytes[0] != 0x6e) {
+    return false;
+  }
+  if (bytes[1] != 0x80) {
+    return false;
+  }
+  return bytes[2] == (uint8_t)(0x50 ^ bytes[0] ^ bytes[1]);
+}
+
+void nsDDCGetVCPRequest(uint8_t vcp, uint8_t out[4]) {
+  out[0] = 0x82;
+  out[1] = 0x01;
+  out[2] = vcp;
+  out[3] = (uint8_t)(0x6E ^ out[0] ^ out[1] ^ out[2]);
+}
+
 const char *nsDDCReplyReason(const uint8_t *bytes, int count) {
   NSDDCReply reply;
   if (nsDDCDecodeReply(bytes, count, &reply) && reply.brightness) {
     return "ok";
+  }
+  if (nsDDCNullMessage(bytes, count)) {
+    return "null";
   }
   if (bytes == NULL || count <= 0) {
     return "all zeros";
