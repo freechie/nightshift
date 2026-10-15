@@ -32,7 +32,12 @@ all: nightshift nightshiftd $(BUNDLED)
 session-tap-check:
 	python3 scripts/check-session-tap.py
 
-test: socket-main-check session-tap-check secret-scan workspace-open-check nightshift nightshift-tests logic-tests server-test license-server-check
+# The DDC queue, its sleeps, and ddcWriteOnce live in one file. The sleep
+# and write counts stay at the values this tree already uses.
+brightness-owner-check:
+	python3 scripts/check-brightness-owner.py
+
+test: socket-main-check session-tap-check brightness-owner-check secret-scan workspace-open-check nightshift nightshift-tests logic-tests server-test license-server-check
 	./socket-main-check --siblings nightshiftd.m
 	./nightshift-tests
 	./logic-tests
@@ -67,9 +72,10 @@ nightshift: main.m $(SHARED) $(LOGIC) $(LICENSE_STAMP)
 	clang $(CFLAGS) $(SERVER_FLAGS) $(LDLIBS) -o $@ main.m NightShift.m NightshiftLogic.m
 
 SESSION_TAP := NightshiftSessionTap.m NightshiftSessionTap.h
+BRIGHTNESS := NightshiftBrightness.m NightshiftBrightness.h
 
-nightshiftd: nightshiftd.m $(SHARED) $(LOGIC) $(SESSION_TAP) $(LICENSE_STAMP)
-	clang $(CFLAGS) $(SERVER_FLAGS) $(LDLIBS) -framework AppKit -framework Carbon -framework UserNotifications -framework ServiceManagement -framework CoreGraphics -framework IOKit -framework DisplayServices -framework SkyLight -o $@ nightshiftd.m NightShift.m NightshiftLogic.m NightshiftSessionTap.m
+nightshiftd: nightshiftd.m $(SHARED) $(LOGIC) $(SESSION_TAP) $(BRIGHTNESS) $(LICENSE_STAMP)
+	clang $(CFLAGS) $(SERVER_FLAGS) $(LDLIBS) -framework AppKit -framework Carbon -framework UserNotifications -framework ServiceManagement -framework CoreGraphics -framework IOKit -framework DisplayServices -framework SkyLight -o $@ nightshiftd.m NightShift.m NightshiftLogic.m NightshiftSessionTap.m NightshiftBrightness.m
 
 nightshift-tests: tests/check.m $(SHARED) $(LOGIC)
 	clang $(CFLAGS) -I. $(LDLIBS) -o $@ tests/check.m NightShift.m NightshiftLogic.m
@@ -124,4 +130,4 @@ hooks:
 icon-lab:
 	open prototype/icon/index.html
 
-.PHONY: all test server-test session-tap-check install package clean hooks icon-lab secret-scan workspace-open-check
+.PHONY: all test server-test session-tap-check brightness-owner-check install package clean hooks icon-lab secret-scan workspace-open-check
