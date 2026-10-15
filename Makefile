@@ -29,7 +29,10 @@ ZIP := $(DIST)/Nightshift.zip
 
 all: nightshift nightshiftd $(BUNDLED)
 
-test: secret-scan workspace-open-check nightshift nightshift-tests logic-tests server-test license-server-check
+session-tap-check:
+	python3 scripts/check-session-tap.py
+
+test: session-tap-check secret-scan workspace-open-check nightshift nightshift-tests logic-tests server-test license-server-check
 	./nightshift-tests
 	./logic-tests
 	sh tests/cli.sh
@@ -56,8 +59,10 @@ server-test: nightshift-testkey
 nightshift: main.m $(SHARED) $(LOGIC) $(LICENSE_STAMP)
 	clang $(CFLAGS) $(SERVER_FLAGS) $(LDLIBS) -o $@ main.m NightShift.m NightshiftLogic.m
 
-nightshiftd: nightshiftd.m $(SHARED) $(LOGIC) $(LICENSE_STAMP)
-	clang $(CFLAGS) $(SERVER_FLAGS) $(LDLIBS) -framework AppKit -framework Carbon -framework UserNotifications -framework ServiceManagement -framework CoreGraphics -framework IOKit -framework DisplayServices -framework SkyLight -o $@ nightshiftd.m NightShift.m NightshiftLogic.m
+SESSION_TAP := NightshiftSessionTap.m NightshiftSessionTap.h
+
+nightshiftd: nightshiftd.m $(SHARED) $(LOGIC) $(SESSION_TAP) $(LICENSE_STAMP)
+	clang $(CFLAGS) $(SERVER_FLAGS) $(LDLIBS) -framework AppKit -framework Carbon -framework UserNotifications -framework ServiceManagement -framework CoreGraphics -framework IOKit -framework DisplayServices -framework SkyLight -o $@ nightshiftd.m NightShift.m NightshiftLogic.m NightshiftSessionTap.m
 
 nightshift-tests: tests/check.m $(SHARED) $(LOGIC)
 	clang $(CFLAGS) -I. $(LDLIBS) -o $@ tests/check.m NightShift.m NightshiftLogic.m
@@ -112,4 +117,4 @@ hooks:
 icon-lab:
 	open prototype/icon/index.html
 
-.PHONY: all test server-test install package clean hooks icon-lab secret-scan workspace-open-check
+.PHONY: all test server-test session-tap-check install package clean hooks icon-lab secret-scan workspace-open-check

@@ -205,6 +205,12 @@ bool nsWorkspaceOpenAllowed(const char *url, size_t length, bool allowLoopbackHT
 // unchanged. *down is set for a press or repeat.
 int nsMediaBrightnessKey(long data1, bool *down);
 
+// Mask for the one Session tap: event type 14 (system-defined) and nothing
+// else. Bit 10 is key-down and is not set. Volume and mute use this same
+// mask; nsMediaBrightnessKey returns 0 for them, so the tap hands them back.
+uint64_t nsMediaTapMaskBits(void);
+bool nsMediaTapMaskAllowed(uint64_t bits);
+
 // What to do when macOS disables the key taps (timeout or user input).
 // trusted is AXIsProcessTrusted() now; recent counts the disables in the
 // last minute, this one included. Returns the seconds to wait before

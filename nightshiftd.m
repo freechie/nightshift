@@ -15,6 +15,7 @@
 
 #import "NightShift.h"
 #import "NightshiftLogic.h"
+#import "NightshiftSessionTap.h"
 #import <AppKit/AppKit.h>
 #import <ApplicationServices/ApplicationServices.h>
 #import <Carbon/Carbon.h>
@@ -7932,9 +7933,6 @@ static void refreshMenu(void) {
 
 static AppDelegate *gAppDelegate = nil;
 
-static CFMachPortRef gBrightnessTaps[3];
-static CFRunLoopSourceRef gBrightnessTapSources[3];
-static int gBrightnessTapCount = 0;
 static long gBuiltinPercent = -1;
 static CFAbsoluteTime gLastBrightnessKey = 0;
 static BOOL gAskedForAccessibility = NO;
@@ -7942,7 +7940,7 @@ static BOOL gHIDWatching = NO;
 static int gTapTries = 0;
 
 static BOOL brightnessKeysReady(void) {
-  return gBrightnessTapCount > 0;
+  return nsSessionTapInstalled();
 }
 
 typedef struct __IOHIDEvent *IOHIDEventRef;
@@ -8124,11 +8122,8 @@ static void watchCursor(void) {
                         CGEventMaskBit(kCGEventOtherMouseDragged) | CGEventMaskBit(kCGEventLeftMouseDown) |
                         CGEventMaskBit(kCGEventRightMouseDown) | CGEventMaskBit(kCGEventOtherMouseDown) |
                         CGEventMaskBit(kCGEventScrollWheel);
-    CGEventTapLocation places[2] = {kCGHIDEventTap, kCGSessionEventTap};
-    for (int i = 0; i < 2 && gCursorTap == NULL; i++) {
-      gCursorTap = CGEventTapCreate(places[i], kCGHeadInsertEventTap, kCGEventTapOptionListenOnly,
-                                    moved, cursorTapEvent, NULL);
-    }
+    gCursorTap = CGEventTapCreate(kCGHIDEventTap, kCGHeadInsertEventTap, kCGEventTapOptionListenOnly,
+                                  moved, cursorTapEvent, NULL);
     if (gCursorTap != NULL) {
       CFRunLoopSourceRef source =
           CFMachPortCreateRunLoopSource(kCFAllocatorDefault, gCursorTap, 0);
@@ -8299,26 +8294,15 @@ static int brightnessDirection(NSEvent *key) {
     int direction = nsMediaBrightnessKey((long)key.data1, &down);
     return down ? direction : 0;
   }
-  if (key.type == NSEventTypeKeyDown) {
-    if (key.keyCode == 144) {
-      return 1;
-    }
-    if (key.keyCode == 145) {
-      return -1;
-    }
-  }
   return 0;
 }
 
-// Finding 5: the key tap is an active filter on every key-down in the
-// session, so it runs on its own thread and never waits on the main one.
 // Whether to swallow a brightness key is decided from this copy of the
 // displays the main thread can step (readPercent works, or a DDC probe is
 // pending), refreshed on main by refreshKeyDisplays.
 static pthread_mutex_t gKeyLock = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t gKeyDisplays[16];
 static int gKeyDisplayCount = 0;
-static CFRunLoopRef gTapRunLoop = NULL;
 
 static void refreshKeyDisplays(void) {
   uint32_t ids[16];
@@ -8466,34 +8450,6 @@ static CGEventRef brightnessKey(CGEventTapProxy proxy, CGEventType type,
   }
 }
 
-// The run loop the key taps run on, started once.
-static CFRunLoopRef tapRunLoop(void) {
-  static dispatch_once_t once;
-  dispatch_once(&once, ^{
-    dispatch_semaphore_t ready = dispatch_semaphore_create(0);
-    NSThread *thread = [[NSThread alloc] initWithBlock:^{
-      gTapRunLoop = (CFRunLoopRef)CFRetain(CFRunLoopGetCurrent());
-      // Keeps CFRunLoopRun from returning before the first tap is added.
-      CFRunLoopTimerRef keep = CFRunLoopTimerCreateWithHandler(
-          kCFAllocatorDefault, CFAbsoluteTimeGetCurrent() + 1e9, 1e9, 0, 0,
-          ^(CFRunLoopTimerRef timer) {
-            (void)timer;
-          });
-      CFRunLoopAddTimer(gTapRunLoop, keep, kCFRunLoopCommonModes);
-      CFRelease(keep);
-      dispatch_semaphore_signal(ready);
-      while (YES) {
-        CFRunLoopRun();
-      }
-    }];
-    thread.name = @"nightshift.keys";
-    thread.qualityOfService = NSQualityOfServiceUserInteractive;
-    [thread start];
-    dispatch_semaphore_wait(ready, DISPATCH_TIME_FOREVER);
-  });
-  return gTapRunLoop;
-}
-
 static void considerBrightnessEvent(IOHIDEventRef event) {
   if (event == NULL) {
     return;
@@ -8537,25 +8493,6 @@ static void watchHIDBrightness(void) {
 
 static void startBrightnessKeys(void);
 
-// Main thread. Disables, invalidates and releases the key taps, and takes
-// their run loop sources off the tap thread's loop.
-static void removeBrightnessTaps(void) {
-  for (int i = 0; i < gBrightnessTapCount; i++) {
-    if (gBrightnessTaps[i] != NULL) {
-      CGEventTapEnable(gBrightnessTaps[i], false);
-      CFMachPortInvalidate(gBrightnessTaps[i]);
-      CFRelease(gBrightnessTaps[i]);
-      gBrightnessTaps[i] = NULL;
-    }
-    if (gBrightnessTapSources[i] != NULL) {
-      CFRunLoopRemoveSource(tapRunLoop(), gBrightnessTapSources[i], kCFRunLoopCommonModes);
-      CFRelease(gBrightnessTapSources[i]);
-      gBrightnessTapSources[i] = NULL;
-    }
-  }
-  gBrightnessTapCount = 0;
-}
-
 // Main thread. At most one pending retry of startBrightnessKeys.
 static BOOL gTapRetryScheduled = NO;
 static void scheduleTapRetry(double delay) {
@@ -8572,8 +8509,8 @@ static void scheduleTapRetry(double delay) {
 
 // Main thread. Drops the taps so installBrightnessTap can re-create them,
 // and lets the permission poll do that once Accessibility is back.
-static void dropTapsAndRetry(void) {
-  removeBrightnessTaps();
+void dropTapsAndRetry(void) {
+  nsSessionTapRemove();
   atomic_store(&gTapDisabledPending, false);
   if (gMenu != nil) {
     [gMenu refresh];
@@ -8605,42 +8542,18 @@ static void handleTapsDisabled(void) {
                      dropTapsAndRetry();
                      return;
                    }
-                   for (int i = 0; i < gBrightnessTapCount; i++) {
-                     CGEventTapEnable(gBrightnessTaps[i], true);
-                   }
+                   nsSessionTapSetEnabled(true);
                    atomic_store(&gTapDisabledPending, false);
                  });
 }
 
-static BOOL installBrightnessTap(void) {
-  if (gBrightnessTapCount > 0) {
-    return YES;
+bool installBrightnessTap(void) {
+  if (nsSessionTapInstalled()) {
+    return true;
   }
   gSwallowedPress[0] = gSwallowedPress[1] = NO;
-  // System-defined events only. A key-down bit here would make every tap
-  // an active filter on everything typed, passwords included.
-  CGEventMask mask = CGEventMaskBit(NSEventTypeSystemDefined);
-  // One Session tap. An active Annotated Session tap breaks the volume and
-  // mute keys even when it hands their events back untouched, and the HID
-  // tap adds nothing the Session tap misses (measured Oct 14, 2026).
-  CGEventTapLocation places[1] = {kCGSessionEventTap};
   refreshKeyDisplays();
-  CFRunLoopRef loop = tapRunLoop();
-  for (int i = 0; i < 1; i++) {
-    CFMachPortRef tap = CGEventTapCreate(places[i], kCGHeadInsertEventTap,
-                                         kCGEventTapOptionDefault, mask, brightnessKey,
-                                         NULL);
-    if (tap == NULL) {
-      continue;
-    }
-    CFRunLoopSourceRef source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0);
-    gBrightnessTapSources[gBrightnessTapCount] = source;
-    gBrightnessTaps[gBrightnessTapCount++] = tap;
-    CFRunLoopAddSource(loop, source, kCFRunLoopCommonModes);
-    CGEventTapEnable(tap, true);
-  }
-  CFRunLoopWakeUp(loop);
-  return gBrightnessTapCount > 0;
+  return nsSessionTapCreate(brightnessKey);
 }
 
 // Main thread. Key codes 144/145 (brightness on keyboards that send them as
@@ -8701,7 +8614,7 @@ static void startBrightnessKeys(void) {
 
 // Main thread. Shows the Brightness Keys state in the menu and, when open,
 // in Settings.
-static void refreshKeysState(void) {
+void refreshKeysState(void) {
   if (gMenu == nil) {
     return;
   }
@@ -8711,49 +8624,9 @@ static void refreshKeysState(void) {
   }
 }
 
-// Main thread, every second and on Accessibility change notices. Drops the
-// taps the moment Accessibility is revoked, before macOS stalls input
-// waiting on them to time out, and rebuilds them as soon as it is back.
-static void checkAccessibility(void) {
-  switch (nsAccessAction(AXIsProcessTrusted(), gBrightnessTapCount > 0)) {
-  case kNSAccessDrop:
-    dropTapsAndRetry();
-    refreshKeysState();
-    break;
-  case kNSAccessRebuild:
-    if (installBrightnessTap()) {
-      atomic_store(&gTapDisabledPending, false);
-      gTapTries = 0;
-      refreshKeysState();
-    }
-    break;
-  case kNSAccessKeep:
-    break;
-  }
-}
-
-static void watchAccessibility(void) {
-  NSTimer *timer = [NSTimer timerWithTimeInterval:1
-                                          repeats:YES
-                                            block:^(NSTimer *t) {
-                                              (void)t;
-                                              checkAccessibility();
-                                            }];
-  timer.tolerance = 0.1;
-  [NSRunLoop.mainRunLoop addTimer:timer forMode:NSRunLoopCommonModes];
-  // Undocumented and sent before the change lands, so it only shortens the
-  // wait; the timer works alone.
-  [NSDistributedNotificationCenter.defaultCenter
-      addObserverForName:@"com.apple.accessibility.api"
-                  object:nil
-                   queue:NSOperationQueue.mainQueue
-              usingBlock:^(NSNotification *note) {
-                (void)note;
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)),
-                               dispatch_get_main_queue(), ^{
-                                 checkAccessibility();
-                               });
-              }];
+void nsSessionHostNoteRebuilt(void) {
+  atomic_store(&gTapDisabledPending, false);
+  gTapTries = 0;
 }
 
 // Main thread. Re-reads every DDC channel, the confirmed ones included, as
@@ -8801,7 +8674,7 @@ static void installMenu(void) {
   }
   gMenu = [[MenuBar alloc] init];
   startBrightnessKeys();
-  watchAccessibility();
+  nsSessionTapWatch();
   [gMenu refresh];
 }
 
