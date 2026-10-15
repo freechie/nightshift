@@ -892,6 +892,7 @@ typedef struct {
   bool framed;
   bool overran;
   bool hangAfterWrite;
+  bool idleReply;
   int framedCalls;
   int reads;
   int writes;
@@ -932,6 +933,11 @@ static bool probeFramed(void *ctx) {
 static bool probeBudget(void *ctx) {
   ProbePanel *panel = ctx;
   return !panel->overran;
+}
+
+static bool probeIdle(void *ctx) {
+  ProbePanel *panel = ctx;
+  return panel->idleReply;
 }
 
 static bool probeFramedOverrun(void *ctx) {
@@ -1497,6 +1503,21 @@ static void checkProbe(void) {
 
   uint8_t zeros[12];
   memset(zeros, 0, sizeof(zeros));
+  uint8_t nullMsg[12] = {0x6e, 0x80, 0xbe, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+  CHECK(nsDDCNullMessage(nullMsg, 12));
+  CHECK(strcmp(nsDDCReplyReason(nullMsg, 12), "null") == 0);
+  CHECK(strcmp(nsDDCReplyReason(nullMsg, 12), "bad length") != 0);
+  CHECK(!nsDDCFrameValid(nullMsg, 12));
+  nullMsg[2] = 0x00;
+  CHECK(!nsDDCNullMessage(nullMsg, 12));
+  CHECK(strcmp(nsDDCReplyReason(nullMsg, 12), "bad length") == 0);
+  uint8_t getVcp[4];
+  nsDDCGetVCPRequest(0x10, getVcp);
+  CHECK_EQ(getVcp[0], 0x82);
+  CHECK_EQ(getVcp[1], 0x01);
+  CHECK_EQ(getVcp[2], 0x10);
+  CHECK_EQ(getVcp[3], (uint8_t)(0x6E ^ 0x82 ^ 0x01 ^ 0x10));
+  CHECK(getVcp[1] != 0x03);
   CHECK(strcmp(nsDDCReplyReason(zeros, 12), "all zeros") == 0);
   CHECK(strcmp(nsDDCReplyReason(NULL, 0), "all zeros") == 0);
   uint8_t first[12] = {0x00, 0x88, 0x02, 0x00, 0x10, 0, 0, 100, 0, 42, 0, 0};
@@ -1546,6 +1567,26 @@ static void checkProbe(void) {
                "ddc 3 0 1 3\n"
                "ddc reply 3 0x0 0x0 all zeros 00 00 00 00 00 00 00 00 00 00 00 00\n"
                "ddc 2 -1 1 6\n") == 0);
+
+  // Null or empty after the reads: not controllable, and no brightness Set.
+  ProbePanel busy = probePanel(30, 100);
+  busy.failRead = true;
+  busy.framed = true;
+  busy.idleReply = true;
+  io.ctx = &busy;
+  io.read = probeRead;
+  io.write = probeWrite;
+  io.framed = probeFramed;
+  io.idle = probeIdle;
+  io.budget = NULL;
+  io.fallbackCurrent = 0;
+  io.fallbackMax = 0;
+  CHECK_EQ(nsDDCProbeControl(&io, &current, &max), kNSDDCProbeSoftware);
+  CHECK_EQ(busy.writes, 0);
+  CHECK_EQ(busy.framedCalls, 0);
+  CHECK_EQ(current, 0);
+  CHECK_EQ(max, 0);
+  io.idle = NULL;
   NSDDCProbeFacts timed;
   memset(&timed, 0, sizeof(timed));
   timed.evidence = kNSDDCEvidenceTimedOut;
