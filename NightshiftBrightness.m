@@ -657,6 +657,9 @@ static void inheritFramebuffer(io_service_t service, DDCCandidate *candidate) {
   }
 }
 
+// IORegistry path of the DCPAVServiceProxy bound for the display in progress.
+static char gBoundServicePath[512];
+
 // index, when set, receives the candidate ordinal or -1. The service is the
 // one path or identity that is unambiguous. EDID is optional: a framebuffer
 // path is enough, and a failed EDID copy no longer drops the HDMI service.
@@ -672,7 +675,10 @@ static IOAVServiceRef serviceMatching(const DDCTarget *target, int *index) {
   io_service_t service;
   IOAVServiceRef services[8];
   DDCCandidate candidates[8];
+  char servicePaths[8][512];
   int count = 0;
+  memset(servicePaths, 0, sizeof(servicePaths));
+  gBoundServicePath[0] = '\0';
   while ((service = IOIteratorNext(iter))) {
     DDCCandidate c;
     memset(&c, 0, sizeof(c));
@@ -687,6 +693,13 @@ static IOAVServiceRef serviceMatching(const DDCTarget *target, int *index) {
     }
     if (c.external && count < 8) {
       inheritFramebuffer(service, &c);
+    }
+    io_string_t svcPath;
+    svcPath[0] = '\0';
+    if (c.external && count < 8) {
+      if (IORegistryEntryGetPath(service, kIOServicePlane, svcPath) != KERN_SUCCESS) {
+        svcPath[0] = '\0';
+      }
     }
     IOAVServiceRef av = NULL;
     if (c.external && count < 8) {
@@ -712,6 +725,11 @@ static IOAVServiceRef serviceMatching(const DDCTarget *target, int *index) {
       CFRelease(av);
       continue;
     }
+    if (svcPath[0] != '\0') {
+      snprintf(servicePaths[count], sizeof(servicePaths[count]), "%s", svcPath);
+    } else if (c.location[0] != '\0') {
+      snprintf(servicePaths[count], sizeof(servicePaths[count]), "%s", c.location);
+    }
     services[count] = av;
     candidates[count] = c;
     count++;
@@ -725,6 +743,9 @@ static IOAVServiceRef serviceMatching(const DDCTarget *target, int *index) {
   }
   if (pick >= 0 && index != NULL) {
     *index = pick;
+  }
+  if (pick >= 0) {
+    snprintf(gBoundServicePath, sizeof(gBoundServicePath), "%s", servicePaths[pick]);
   }
   return pick >= 0 ? services[pick] : NULL;
 }
@@ -873,6 +894,9 @@ static DDCReplyCapture gBrightnessReply;
 static BOOL gBrightnessReplySet = NO;
 // Last brightness read was a null message or an empty buffer.
 static BOOL gBrightnessReplyIdle = NO;
+// 51 plus the four Get VCP payload bytes, for the diagnostic line.
+static uint8_t gBrightnessOutbound[5];
+static int gBrightnessOutboundCount = 0;
 
 static void ddcRememberBrightnessReply(const DDCReplyCapture *cap) {
   if (cap == NULL) {
@@ -882,17 +906,17 @@ static void ddcRememberBrightnessReply(const DDCReplyCapture *cap) {
   gBrightnessReplySet = YES;
 }
 
-// Chip 0x37, data address 0x51 for the write and the read. Two sends, 10ms
-// apart, then one 12-byte read at that same address. No other offset.
+// Chip 0x37, data address 0x51. m1ddc 1.2.0 performDDCWrite then
+// performDDCRead: sleep 10ms, write, sleep 10ms, write, sleep 10ms, read 12.
 static BOOL ddcWriteRead(IOAVServiceRef service, uint8_t *request, int requestLen, uint8_t *reply,
                          int replyLen, uint64_t deadline, BOOL *timedOut, DDCReplyCapture *cap) {
   ddcWaitAfterWrite();
   if (cap != NULL) {
     memset(cap, 0, sizeof(*cap));
   }
-  int writeCycle = 0;
+  int step = 0;
   BOOL wrote = NO;
-  while (writeCycle < 2) {
+  while (step < 3) {
     if (deadline != 0 && ddcNow() >= deadline) {
       if (timedOut != NULL) {
         *timedOut = YES;
@@ -902,23 +926,25 @@ static BOOL ddcWriteRead(IOAVServiceRef service, uint8_t *request, int requestLe
       }
       return NO;
     }
-    BOOL hung = NO;
-    IOReturn code = 0;
-    if (ddcI2C(service, 0x51, request, (uint32_t)requestLen, YES, deadline, &hung, &code)) {
-      wrote = YES;
-    }
-    if (cap != NULL) {
-      cap->writeState = hung ? kNSDDCIOTimeout : kNSDDCIOCode;
-      cap->writeCode = hung ? 0 : (int)code;
-    }
-    if (hung) {
-      if (timedOut != NULL) {
-        *timedOut = YES;
-      }
-      return NO;
-    }
     usleep(kDDCReadGap);
-    writeCycle++;
+    if (step < 2) {
+      BOOL hung = NO;
+      IOReturn code = 0;
+      if (ddcI2C(service, 0x51, request, (uint32_t)requestLen, YES, deadline, &hung, &code)) {
+        wrote = YES;
+      }
+      if (cap != NULL) {
+        cap->writeState = hung ? kNSDDCIOTimeout : kNSDDCIOCode;
+        cap->writeCode = hung ? 0 : (int)code;
+      }
+      if (hung) {
+        if (timedOut != NULL) {
+          *timedOut = YES;
+        }
+        return NO;
+      }
+    }
+    step++;
   }
   if (!wrote) {
     return NO;
@@ -997,10 +1023,12 @@ static BOOL ddcReadFrame(IOAVServiceRef service, uint8_t *request, int requestLe
 
 static BOOL ddcReadOnce(IOAVServiceRef service, int *current, int *max, uint64_t deadline,
                          BOOL *timedOut) {
-  // Get VCP luminance. With data address 0x51 the message is 51 82 01 10 chk.
-  // Opcode 0x01 is Get, not a brightness Set (0x03).
+  // Get VCP luminance. m1ddc 1.2.0 writes {82 01 10 fd} at offset 0x51.
   uint8_t request[4];
   nsDDCGetVCPRequest(0x10, request);
+  gBrightnessOutbound[0] = 0x51;
+  memcpy(gBrightnessOutbound + 1, request, 4);
+  gBrightnessOutboundCount = 5;
   NSDDCReply decoded;
   if (!ddcReadFrame(service, request, 4, &decoded, YES, deadline, timedOut, YES)) {
     return NO;
@@ -1026,6 +1054,9 @@ static BOOL ddcCapabilitiesOnce(IOAVServiceRef service, int withDataAddress, uin
 static BOOL ddcVCPFrameOnce(IOAVServiceRef service, uint64_t deadline, BOOL *timedOut) {
   uint8_t request[4];
   nsDDCGetVCPRequest(0x10, request);
+  gBrightnessOutbound[0] = 0x51;
+  memcpy(gBrightnessOutbound + 1, request, 4);
+  gBrightnessOutboundCount = 5;
   return ddcReadFrame(service, request, 4, NULL, NO, deadline, timedOut, YES);
 }
 
@@ -1392,6 +1423,9 @@ typedef struct {
   int readState;
   int readCode;
   uint8_t reply[12];
+  char servicePath[512];
+  uint8_t outbound[5];
+  int outboundCount;
 } DDCDebugRow;
 
 static DDCDebugRow gDDCDebug[8];
@@ -1435,7 +1469,8 @@ static void ddcNoteDebug(uint32_t display, int service, int verdict, int evidenc
 }
 
 static void ddcNoteReply(uint32_t display, int writeState, int writeCode, int readState, int readCode,
-                         const uint8_t *bytes) {
+                         const uint8_t *bytes, const char *servicePath, const uint8_t *outbound,
+                         int outboundCount) {
   for (int i = 0; i < gDDCDebugCount; i++) {
     if (gDDCDebug[i].display != display) {
       continue;
@@ -1449,11 +1484,22 @@ static void ddcNoteReply(uint32_t display, int writeState, int writeCode, int re
     if (bytes != NULL) {
       memcpy(gDDCDebug[i].reply, bytes, sizeof(gDDCDebug[i].reply));
     }
+    gDDCDebug[i].servicePath[0] = '\0';
+    if (servicePath != NULL) {
+      snprintf(gDDCDebug[i].servicePath, sizeof(gDDCDebug[i].servicePath), "%s", servicePath);
+    }
+    gDDCDebug[i].outboundCount = 0;
+    if (outbound != NULL && outboundCount > 0) {
+      int n = outboundCount > 5 ? 5 : outboundCount;
+      memcpy(gDDCDebug[i].outbound, outbound, (size_t)n);
+      gDDCDebug[i].outboundCount = n;
+    }
     if (!ddcDebugOn()) {
       return;
     }
-    char line[160];
+    char line[768];
     if (nsDDCReplyLine(display, writeState, writeCode, readState, readCode, gDDCDebug[i].reply, 12,
+                       gDDCDebug[i].servicePath, gDDCDebug[i].outbound, gDDCDebug[i].outboundCount,
                        line, sizeof(line))) {
       fprintf(stderr, "%s\n", line);
     }
@@ -1502,9 +1548,10 @@ int ddcCopyDebug(char *out, int cap) {
       }
       used += wrote;
       if (gDDCDebug[i].haveReply) {
-        char reply[160];
+        char reply[768];
         if (nsDDCReplyLine(gDDCDebug[i].display, gDDCDebug[i].writeState, gDDCDebug[i].writeCode,
                            gDDCDebug[i].readState, gDDCDebug[i].readCode, gDDCDebug[i].reply, 12,
+                           gDDCDebug[i].servicePath, gDDCDebug[i].outbound, gDDCDebug[i].outboundCount,
                            reply, sizeof(reply))) {
           wrote = snprintf(out + used, (size_t)(cap - used), "%s\n", reply);
           if (wrote < 0 || used + wrote >= cap) {
@@ -1533,6 +1580,9 @@ int ddcCopyDebug(char *out, int cap) {
     rows[i].readState = gDDCDebug[i].readState;
     rows[i].readCode = gDDCDebug[i].readCode;
     memcpy(rows[i].reply, gDDCDebug[i].reply, sizeof(rows[i].reply));
+    snprintf(rows[i].servicePath, sizeof(rows[i].servicePath), "%s", gDDCDebug[i].servicePath);
+    rows[i].outboundCount = gDDCDebug[i].outboundCount;
+    memcpy(rows[i].outbound, gDDCDebug[i].outbound, sizeof(rows[i].outbound));
   }
   int lines = nsDDCDebugReport(ids, builtin, count, rows, rowCount, out, (size_t)cap);
   return lines < 0 ? 0 : lines;
@@ -1659,6 +1709,9 @@ void probeDDC(void) {
       int readState;
       int readCode;
       uint8_t reply[12];
+      char servicePath[512];
+      uint8_t outbound[5];
+      int outboundCount;
     } DDCResult;
     DDCResult *results = pending > 0 ? calloc((size_t)pending, sizeof(DDCResult)) : NULL;
     if (results == NULL) {
@@ -1667,12 +1720,15 @@ void probeDDC(void) {
     for (int i = 0; i < pending; i++) {
       gBrightnessReplySet = NO;
       gBrightnessReplyIdle = NO;
+      gBrightnessOutboundCount = 0;
       memset(&gBrightnessReply, 0, sizeof(gBrightnessReply));
+      memset(gBrightnessOutbound, 0, sizeof(gBrightnessOutbound));
       int serviceIndex = -1;
       IOAVServiceRef service = serviceMatching(&wanted[i], &serviceIndex);
       results[i].display = targets[i];
       results[i].service = service;
       results[i].serviceIndex = service == NULL ? -1 : serviceIndex;
+      snprintf(results[i].servicePath, sizeof(results[i].servicePath), "%s", gBoundServicePath);
       results[i].evidence = service == NULL ? kNSDDCEvidenceNoService : kNSDDCEvidenceNone;
       results[i].current = 0;
       results[i].max = -1;
@@ -1719,6 +1775,8 @@ void probeDDC(void) {
         results[i].readState = gBrightnessReply.readState;
         results[i].readCode = gBrightnessReply.readCode;
         memcpy(results[i].reply, gBrightnessReply.bytes, sizeof(results[i].reply));
+        results[i].outboundCount = gBrightnessOutboundCount;
+        memcpy(results[i].outbound, gBrightnessOutbound, sizeof(results[i].outbound));
       }
     }
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -1740,7 +1798,8 @@ void probeDDC(void) {
         ddcNoteDebug(results[i].display, results[i].serviceIndex, verdict, results[i].evidence);
         if (results[i].haveReply) {
           ddcNoteReply(results[i].display, results[i].writeState, results[i].writeCode,
-                       results[i].readState, results[i].readCode, results[i].reply);
+                       results[i].readState, results[i].readCode, results[i].reply,
+                       results[i].servicePath, results[i].outbound, results[i].outboundCount);
         }
         // A write confirmed or moved this channel while the probe was out, so
         // these reads are stale. Publishing them would reset current and

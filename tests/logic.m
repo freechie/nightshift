@@ -1516,7 +1516,10 @@ static void checkProbe(void) {
   CHECK_EQ(getVcp[0], 0x82);
   CHECK_EQ(getVcp[1], 0x01);
   CHECK_EQ(getVcp[2], 0x10);
+  CHECK_EQ(getVcp[3], 0xfd);
   CHECK_EQ(getVcp[3], (uint8_t)(0x6E ^ 0x82 ^ 0x01 ^ 0x10));
+  // 0xac is 0x6E ^ 0x51 ^ 0x82 ^ 0x01 ^ 0x10, m1ddc's Set checksum, not the Get.
+  CHECK(getVcp[3] != 0xac);
   CHECK(getVcp[1] != 0x03);
   CHECK(strcmp(nsDDCReplyReason(zeros, 12), "all zeros") == 0);
   CHECK(strcmp(nsDDCReplyReason(NULL, 0), "all zeros") == 0);
@@ -1547,15 +1550,19 @@ static void checkProbe(void) {
   echoLen[11] = replySum;
   CHECK(strcmp(nsDDCReplyReason(echoLen, 12), "ok") == 0);
   char replyLine[160];
-  CHECK(nsDDCReplyLine(3, kNSDDCIOCode, 0, kNSDDCIOCode, 0xe00002c7, zeros, 12, replyLine,
-                       sizeof(replyLine)));
+  uint8_t outbound[5] = {0x51, 0x82, 0x01, 0x10, 0xfd};
+  CHECK(nsDDCReplyLine(3, kNSDDCIOCode, 0, kNSDDCIOCode, 0xe00002c7, zeros, 12, NULL, NULL, 0,
+                       replyLine, sizeof(replyLine)));
   CHECK(strcmp(replyLine,
-               "ddc reply 3 0x0 0xe00002c7 all zeros 00 00 00 00 00 00 00 00 00 00 00 00") == 0);
-  CHECK(nsDDCReplyLine(2, kNSDDCIOTimeout, 0, kNSDDCIONone, 0, echoLen, 12, replyLine,
-                       sizeof(replyLine)));
-  char expectReply[160];
+               "ddc reply 3 0x0 0xe00002c7 all zeros 00 00 00 00 00 00 00 00 00 00 00 00 path=- out=-") ==
+        0);
+  CHECK(nsDDCReplyLine(2, kNSDDCIOTimeout, 0, kNSDDCIONone, 0, echoLen, 12,
+                       "IOService:/dispext0", outbound, 5, replyLine, sizeof(replyLine)));
+  char expectReply[256];
   snprintf(expectReply, sizeof(expectReply),
-           "ddc reply 2 timeout none ok 6e 51 02 00 10 00 00 64 00 2a 00 %02x", echoLen[11]);
+           "ddc reply 2 timeout none ok 6e 51 02 00 10 00 00 64 00 2a 00 %02x "
+           "path=IOService:/dispext0 out=51 82 01 10 fd",
+           echoLen[11]);
   CHECK(strcmp(replyLine, expectReply) == 0);
   rows[0].haveReply = true;
   rows[0].writeState = kNSDDCIOCode;
@@ -1565,7 +1572,7 @@ static void checkProbe(void) {
   CHECK_EQ(nsDDCDebugReport(displays, builtin, 3, rows, 1, report, sizeof(report)), 3);
   CHECK(strcmp(report,
                "ddc 3 0 1 3\n"
-               "ddc reply 3 0x0 0x0 all zeros 00 00 00 00 00 00 00 00 00 00 00 00\n"
+               "ddc reply 3 0x0 0x0 all zeros 00 00 00 00 00 00 00 00 00 00 00 00 path=- out=-\n"
                "ddc 2 -1 1 6\n") == 0);
 
   // Null or empty after the reads: not controllable, and no brightness Set.
