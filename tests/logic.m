@@ -1345,6 +1345,96 @@ static void checkProbe(void) {
   CHECK(line[0] == '\0');
   CHECK(!nsDDCDebugLine(7, 1, 3, 1, line, sizeof(line)));
   CHECK(!nsDDCDebugLine(7, 1, 0, 9, line, sizeof(line)));
+  CHECK(nsDDCDebugLine(3, -1, kNSDDCProbeSoftware, kNSDDCEvidenceNotProbed, line, sizeof(line)));
+  CHECK(strcmp(line, "ddc 3 -1 1 6") == 0);
+  CHECK(nsDDCDebugLine(2, -1, kNSDDCProbeSoftware, kNSDDCEvidenceInFlight, line, sizeof(line)));
+  CHECK(strcmp(line, "ddc 2 -1 1 7") == 0);
+
+  // The 11-byte frame above is brightness 42 of 100 once the checksum is put
+  // back. Checksum seed is 0x50. A seed of 0x6E must not pass.
+  vcp[10] ^= 0xFF;
+  NSDDCReply decoded;
+  CHECK(nsDDCDecodeReply(vcp, 11, &decoded));
+  CHECK(decoded.brightness);
+  CHECK_EQ(decoded.current, 42);
+  CHECK_EQ(decoded.max, 100);
+  uint8_t wrongSeed[11];
+  memcpy(wrongSeed, vcp, 11);
+  wrongSeed[10] = 0x6E;
+  for (int i = 0; i < 10; i++) {
+    wrongSeed[10] ^= vcp[i];
+  }
+  CHECK(!nsDDCDecodeReply(wrongSeed, 11, &decoded));
+  CHECK(!decoded.valid);
+
+  // Length byte 0x88: the 0x80 flag is masked off (length 8, not 136) and
+  // the address byte is absent, which is what a shifted HDMI read looks like.
+  uint8_t shifted[10] = {0x88, 0x02, 0x00, 0x10, 0x00, 0x00, 100, 0x00, 42, 0};
+  sum = 0x50;
+  for (int i = 0; i < 9; i++) {
+    sum ^= shifted[i];
+  }
+  shifted[9] = sum;
+  CHECK(nsDDCDecodeReply(shifted, 10, &decoded));
+  CHECK(decoded.brightness);
+  CHECK_EQ(decoded.current, 42);
+  CHECK_EQ(decoded.max, 100);
+  CHECK(nsDDCFrameValid(shifted, 10));
+
+  // 0x89 is 0x80|9, so the checksum is inside the length. Masking is required.
+  uint8_t masked[11] = {0x6E, 0x89, 0x02, 0x00, 0x10, 0x00, 0x00, 100, 0x00, 42, 0};
+  sum = 0x50;
+  for (int i = 0; i < 10; i++) {
+    sum ^= masked[i];
+  }
+  masked[10] = sum;
+  CHECK(nsDDCDecodeReply(masked, 11, &decoded));
+  CHECK_EQ(decoded.current, 42);
+  CHECK_EQ(decoded.max, 100);
+
+  // A leading data-address byte is not part of the frame.
+  uint8_t prefixed[12];
+  prefixed[0] = 0x51;
+  memcpy(prefixed + 1, vcp, 11);
+  CHECK(nsDDCDecodeReply(prefixed, 12, &decoded));
+  CHECK(decoded.brightness);
+  CHECK_EQ(decoded.current, 42);
+  prefixed[1] = 0x6F;
+  sum = 0x50;
+  for (int i = 1; i < 11; i++) {
+    sum ^= prefixed[i];
+  }
+  prefixed[11] = sum;
+  CHECK(nsDDCDecodeReply(prefixed, 12, &decoded));
+  CHECK_EQ(decoded.current, 42);
+
+  NSDDCProbeFacts pendingFacts;
+  memset(&pendingFacts, 0, sizeof(pendingFacts));
+  pendingFacts.evidence = kNSDDCEvidenceNotProbed;
+  pendingFacts.writeOk = true;
+  CHECK_EQ(nsDDCProbeDecide(&pendingFacts, &current, &max), kNSDDCProbeSoftware);
+  pendingFacts.evidence = kNSDDCEvidenceInFlight;
+  CHECK_EQ(nsDDCProbeDecide(&pendingFacts, &current, &max), kNSDDCProbeSoftware);
+
+  uint32_t displays[3] = {1, 3, 2};
+  int builtin[3] = {1, 0, 0};
+  NSDDCDebugRow rows[2];
+  memset(rows, 0, sizeof(rows));
+  rows[0].display = 3;
+  rows[0].service = 0;
+  rows[0].verdict = kNSDDCProbeSoftware;
+  rows[0].evidence = kNSDDCEvidenceWriteOnly;
+  rows[1].display = 2;
+  rows[1].service = 1;
+  rows[1].verdict = kNSDDCProbeSoftware;
+  rows[1].evidence = kNSDDCEvidenceInFlight;
+  char report[128];
+  CHECK_EQ(nsDDCDebugReport(displays, builtin, 3, rows, 1, report, sizeof(report)), 2);
+  CHECK(strcmp(report, "ddc 3 0 1 3\nddc 2 -1 1 6\n") == 0);
+  CHECK_EQ(nsDDCDebugReport(displays, builtin, 3, rows, 2, report, sizeof(report)), 2);
+  CHECK(strcmp(report, "ddc 3 0 1 3\nddc 2 1 1 7\n") == 0);
+  CHECK_EQ(nsDDCDebugReport(NULL, NULL, 0, NULL, 0, report, sizeof(report)), 0);
+  CHECK(report[0] == '\0');
 }
 
 int main(void) {

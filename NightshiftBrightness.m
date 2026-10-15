@@ -722,6 +722,9 @@ static IOAVServiceRef serviceMatching(const DDCTarget *target, int *index) {
 // 50 ms before a read, 20 ms between read retries). Worker only.
 static const useconds_t kDDCAfterWrite = 60000;
 static const useconds_t kDDCBetweenReads = 30000;
+// Gap before each copy of a DDC request. Two writes, then the 50ms read
+// wait, matches the Apple Silicon I2C timing that actually returns a frame.
+static const useconds_t kDDCWriteGap = 10000;
 static const useconds_t kDDCRecheck = 100000;
 static uint64_t gDDCWroteAt = 0;
 
@@ -739,44 +742,71 @@ static void ddcWaitAfterWrite(void) {
 }
 
 static BOOL ddcWriteRead(IOAVServiceRef service, uint8_t *request, int requestLen, uint8_t *reply,
-                         int replyLen) {
+                         int replyLen, uint32_t readOffset) {
   ddcWaitAfterWrite();
-  if (IOAVServiceWriteI2C(service, 0x37, 0x51, request, (uint32_t)requestLen) != 0) {
-    return NO;
+  int writeCycle = 0;
+  while (writeCycle < 2) {
+    usleep(kDDCWriteGap);
+    if (IOAVServiceWriteI2C(service, 0x37, 0x51, request, (uint32_t)requestLen) != 0) {
+      return NO;
+    }
+    writeCycle++;
   }
   if (reply == NULL || replyLen <= 0) {
     return YES;
   }
   usleep(50000);
-  return IOAVServiceReadI2C(service, 0x37, 0, reply, (uint32_t)replyLen) == 0;
+  if (IOAVServiceReadI2C(service, 0x37, readOffset, reply, (uint32_t)replyLen) == 0) {
+    return YES;
+  }
+  // Some links reject a read longer than the 11-byte VCP reply.
+  if (replyLen <= 11) {
+    return NO;
+  }
+  memset(reply, 0, (size_t)replyLen);
+  return IOAVServiceReadI2C(service, 0x37, readOffset, reply, 11) == 0;
+}
+
+// Which read subaddress last returned a frame. 0 is the usual offset; HDMI
+// adapters often answer at the data address 0x51, and some at 0x50.
+static int gDDCReadOffsetSlot = 0;
+
+static BOOL ddcReadFrame(IOAVServiceRef service, uint8_t *request, int requestLen, uint8_t *reply,
+                         int replyLen, NSDDCReply *decoded, BOOL brightnessOnly) {
+  static const uint32_t offsets[3] = {0, 0x51, 0x50};
+  for (int n = 0; n < 3; n++) {
+    int slot = (gDDCReadOffsetSlot + n) % 3;
+    memset(reply, 0, (size_t)replyLen);
+    if (!ddcWriteRead(service, request, requestLen, reply, replyLen, offsets[slot])) {
+      continue;
+    }
+    NSDDCReply got;
+    if (!nsDDCDecodeReply(reply, replyLen, &got)) {
+      continue;
+    }
+    if (brightnessOnly && !got.brightness) {
+      continue;
+    }
+    gDDCReadOffsetSlot = slot;
+    if (decoded != NULL) {
+      *decoded = got;
+    }
+    return YES;
+  }
+  return NO;
 }
 
 static BOOL ddcReadOnce(IOAVServiceRef service, int *current, int *max) {
   uint8_t request[4] = {0x82, 0x01, 0x10, 0};
   request[3] = (uint8_t)(0x6E ^ request[0] ^ request[1] ^ request[2]);
-  uint8_t reply[11];
-  memset(reply, 0, sizeof(reply));
-  if (!ddcWriteRead(service, request, 4, reply, 11)) {
+  // 12 bytes so a leading 0x51 plus the 11-byte reply still fits.
+  uint8_t reply[12];
+  NSDDCReply decoded;
+  if (!ddcReadFrame(service, request, 4, reply, (int)sizeof(reply), &decoded, YES)) {
     return NO;
   }
-  if ((reply[0] != 0x6E && reply[0] != 0x6e) || reply[2] != 0x02 || reply[3] != 0x00 ||
-      reply[4] != 0x10) {
-    return NO;
-  }
-  uint8_t sum = 0x50;
-  for (int i = 0; i < 10; i++) {
-    sum ^= reply[i];
-  }
-  if (sum != reply[10]) {
-    return NO;
-  }
-  int maxValue = (reply[6] << 8) | reply[7];
-  int currentValue = (reply[8] << 8) | reply[9];
-  if (maxValue <= 0 || currentValue < 0 || currentValue > maxValue) {
-    return NO;
-  }
-  *current = currentValue;
-  *max = maxValue;
+  *current = decoded.current;
+  *max = decoded.max;
   return YES;
 }
 
@@ -790,22 +820,14 @@ static BOOL ddcCapabilitiesOnce(IOAVServiceRef service, int withDataAddress) {
   }
   request[4] = (uint8_t)(seed ^ request[0] ^ request[1] ^ request[2] ^ request[3]);
   uint8_t reply[64];
-  memset(reply, 0, sizeof(reply));
-  if (!ddcWriteRead(service, request, 5, reply, (int)sizeof(reply))) {
-    return NO;
-  }
-  return nsDDCFrameValid(reply, (int)sizeof(reply)) ? YES : NO;
+  return ddcReadFrame(service, request, 5, reply, (int)sizeof(reply), NULL, NO);
 }
 
 static BOOL ddcVCPFrameOnce(IOAVServiceRef service) {
   uint8_t request[4] = {0x82, 0x01, 0x10, 0};
   request[3] = (uint8_t)(0x6E ^ request[0] ^ request[1] ^ request[2]);
-  uint8_t reply[11];
-  memset(reply, 0, sizeof(reply));
-  if (!ddcWriteRead(service, request, 4, reply, 11)) {
-    return NO;
-  }
-  return nsDDCFrameValid(reply, 11) ? YES : NO;
+  uint8_t reply[12];
+  return ddcReadFrame(service, request, 4, reply, (int)sizeof(reply), NULL, NO);
 }
 
 // Brightness for a display that waits for the current probe to land
@@ -1206,20 +1228,38 @@ int ddcCopyDebug(char *out, int cap) {
     return 0;
   }
   out[0] = '\0';
-  int used = 0;
-  for (int i = 0; i < gDDCDebugCount; i++) {
-    char line[64];
-    if (!nsDDCDebugLine(gDDCDebug[i].display, gDDCDebug[i].service, gDDCDebug[i].verdict,
-                        gDDCDebug[i].evidence, line, sizeof(line))) {
-      continue;
+  uint32_t ids[16];
+  int count = orderedDisplays(ids, 16);
+  if (count <= 0) {
+    int used = 0;
+    for (int i = 0; i < gDDCDebugCount; i++) {
+      char line[64];
+      if (!nsDDCDebugLine(gDDCDebug[i].display, gDDCDebug[i].service, gDDCDebug[i].verdict,
+                          gDDCDebug[i].evidence, line, sizeof(line))) {
+        continue;
+      }
+      int wrote = snprintf(out + used, (size_t)(cap - used), "%s\n", line);
+      if (wrote < 0 || used + wrote >= cap) {
+        break;
+      }
+      used += wrote;
     }
-    int wrote = snprintf(out + used, (size_t)(cap - used), "%s\n", line);
-    if (wrote < 0 || used + wrote >= cap) {
-      break;
-    }
-    used += wrote;
+    return gDDCDebugCount;
   }
-  return gDDCDebugCount;
+  int builtin[16];
+  for (int i = 0; i < count; i++) {
+    builtin[i] = CGDisplayIsBuiltin(ids[i]) ? 1 : 0;
+  }
+  NSDDCDebugRow rows[8];
+  int rowCount = gDDCDebugCount > 8 ? 8 : gDDCDebugCount;
+  for (int i = 0; i < rowCount; i++) {
+    rows[i].display = gDDCDebug[i].display;
+    rows[i].service = gDDCDebug[i].service;
+    rows[i].verdict = gDDCDebug[i].verdict;
+    rows[i].evidence = gDDCDebug[i].evidence;
+  }
+  int lines = nsDDCDebugReport(ids, builtin, count, rows, rowCount, out, (size_t)cap);
+  return lines < 0 ? 0 : lines;
 }
 
 void probeDDC(void) {
@@ -1258,6 +1298,12 @@ void probeDDC(void) {
       saved.item[saved.count].percent =
           (remembered >= 1 && remembered <= 100) ? (int)remembered : -1;
       saved.count++;
+      // Record in-flight before the queue hop, so `nightshift ddc` during
+      // the probe is a line per external instead of an empty reply.
+      if (!CGDisplayIsBuiltin(idsNow[i]) &&
+          (revalidate || !snapshotReady(&seen, idsNow[i]))) {
+        ddcNoteDebug(idsNow[i], -1, kNSDDCProbeSoftware, kNSDDCEvidenceInFlight);
+      }
     }
   }
   // On the DDC queue so probe reads can't overlap a lamp write.
