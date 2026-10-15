@@ -4521,6 +4521,11 @@ static NSStackView *menuSection(NSArray<NSView *> *views, CGFloat spacing) {
 
 static BOOL gSettingsKeepsOpenForOtherApp = NO;
 
+static BOOL openWorkspaceURL(NSString *text) {
+  NSURL *page = rampWorkspaceURL(text);
+  return page != nil && [[NSWorkspace sharedWorkspace] openURL:page];
+}
+
 static void openBrightnessKeyAccess(void) {
   for (NSWindow *window in NSApp.windows) {
     if (window.isVisible && [window.identifier isEqualToString:@"NightshiftSettings"]) {
@@ -4530,11 +4535,8 @@ static void openBrightnessKeyAccess(void) {
   [NSApp activate];
   NSDictionary *options = @{(__bridge id)kAXTrustedCheckOptionPrompt : @YES};
   AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)options);
-  NSURL *url = [NSURL URLWithString:@"x-apple.systempreferences:com.apple.settings."
-                                    @"PrivacySecurity.extension?Privacy_Accessibility"];
-  if (url != nil) {
-    [[NSWorkspace sharedWorkspace] openURL:url];
-  }
+  openWorkspaceURL(@"x-apple.systempreferences:com.apple.settings."
+                   @"PrivacySecurity.extension?Privacy_Accessibility");
   startBrightnessKeys();
 }
 
@@ -6268,11 +6270,8 @@ static void hugControls(NSView *view) {
 - (void)openNightShiftSettings:(id)sender {
   (void)sender;
   gSettingsKeepsOpenForOtherApp = YES;
-  NSURL *url = [NSURL URLWithString:@"x-apple.systempreferences:com.apple.Displays-Settings."
-                                    @"extension?nightShift"];
-  if (url != nil) {
-    [[NSWorkspace sharedWorkspace] openURL:url];
-  }
+  openWorkspaceURL(@"x-apple.systempreferences:com.apple.Displays-Settings."
+                   @"extension?nightShift");
 }
 
 // MARK: Displays
@@ -6627,10 +6626,7 @@ static NSString *licenseDay(NSString *until) {
 }
 
 - (void)openLink:(NSButton *)sender {
-  NSURL *url = [NSURL URLWithString:sender.identifier];
-  if (url != nil) {
-    [[NSWorkspace sharedWorkspace] openURL:url];
-  }
+  openWorkspaceURL(sender.identifier);
 }
 
 // MARK: Window
@@ -7098,9 +7094,7 @@ static NSImage *sidebarTile(NSInteger pane, CGFloat size) {
 - (void)openNotifications:(id)sender {
   (void)sender;
   gSettingsKeepsOpenForOtherApp = YES;
-  NSURL *url = [NSURL URLWithString:
-      @"x-apple.systempreferences:com.apple.Notifications-Settings.extension"];
-  [[NSWorkspace sharedWorkspace] openURL:url];
+  openWorkspaceURL(@"x-apple.systempreferences:com.apple.Notifications-Settings.extension");
 }
 @end
 
@@ -7724,7 +7718,7 @@ static NSImage *sidebarTile(NSInteger pane, CGFloat size) {
       // Review finding 2: Stripe Checkout or the billing portal only, opened
       // as the very NSURL that was checked.
       NSURL *page = rampPurchasePage(url);
-      BOOL opened = page != nil && [[NSWorkspace sharedWorkspace] openURL:page];
+      BOOL opened = page != nil && openWorkspaceURL(page.absoluteString);
       if (!opened) {
         self.buying = NO;
         notifyPlain(@"could not open checkout");

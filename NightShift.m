@@ -964,6 +964,26 @@ NSURL *rampPurchasePage(NSString *url) {
   return unchangedURL(url);
 }
 
+NSURL *rampWorkspaceURL(NSString *text) {
+  NSData *bytes = plainURLBytes(text);
+  if (bytes == nil ||
+      !nsWorkspaceOpenAllowed(bytes.bytes, bytes.length, kLoopbackLicenseServer)) {
+    return nil;
+  }
+  NSURL *url = unchangedURL(text);
+  if (url != nil) {
+    return url;
+  }
+  // A purchase page must print back as the text that was checked. A Settings
+  // or project link is an exact allowlisted string; URLWithString is how
+  // those links were opened, including when a custom scheme does not
+  // round-trip.
+  if (nsPurchaseURLAllowed(bytes.bytes, bytes.length)) {
+    return nil;
+  }
+  return [NSURL URLWithString:text];
+}
+
 BOOL rampPurchaseURLAllowed(NSString *url) {
   return rampPurchasePage(url) != nil;
 }

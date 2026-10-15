@@ -549,6 +549,49 @@ static void checkHosts(void) {
   }
 }
 
+// NSWorkspace opens: purchase pages, exact Settings and project links.
+// A license-server origin is not a page, including loopback http.
+static bool workspaceOK(const char *s, bool loopback) {
+  return nsWorkspaceOpenAllowed(s, lengthOf(s), loopback);
+}
+
+static void checkWorkspaceOpens(void) {
+  CHECK(workspaceOK("https://checkout.stripe.com", false));
+  CHECK(workspaceOK("https://checkout.stripe.com/", false));
+  CHECK(workspaceOK("https://checkout.stripe.com/c/pay/x", false));
+  CHECK(workspaceOK("https://billing.stripe.com/p/session", true));
+  CHECK(workspaceOK("https://Checkout.Stripe.com/c/pay/x", false));
+  CHECK(nsLicenseOriginVerdict("https://license.example.com", 27, false) == kNSLinkOK);
+  CHECK(!workspaceOK("https://license.example.com", false));
+  CHECK(!workspaceOK("https://license.example.com/", true));
+  CHECK(nsLicenseOriginVerdict("http://127.0.0.1:8787", 21, true) == kNSLinkOK);
+  CHECK(!workspaceOK("http://127.0.0.1:8787", true));
+  CHECK(!workspaceOK("http://localhost:8787", true));
+  CHECK(!workspaceOK("http://127.0.0.1:8787", false));
+  CHECK(!workspaceOK("https://checkout.stripe.com.evil.com/", false));
+  CHECK(!workspaceOK("https://evil.com/checkout", false));
+  CHECK(!workspaceOK("http://checkout.stripe.com/c/pay/x", false));
+  CHECK(!workspaceOK("https://user@checkout.stripe.com/pay", false));
+  CHECK(!nsWorkspaceOpenAllowed(NULL, 0, false));
+  CHECK(!nsWorkspaceOpenAllowed(NULL, 0, true));
+  CHECK(!workspaceOK("", false));
+  CHECK(workspaceOK("https://github.com/freechie/nightshift", false));
+  CHECK(workspaceOK("https://github.com/freechie/nightshift/issues", false));
+  CHECK(!workspaceOK("https://github.com/freechie/nightshift/issues/1", false));
+  CHECK(!workspaceOK("https://github.com/freechie/nightshift/", false));
+  CHECK(!workspaceOK("https://GitHub.com/freechie/nightshift", false));
+  CHECK(workspaceOK(
+      "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Accessibility",
+      false));
+  CHECK(workspaceOK("x-apple.systempreferences:com.apple.Displays-Settings.extension?nightShift",
+                    false));
+  CHECK(workspaceOK("x-apple.systempreferences:com.apple.Notifications-Settings.extension", false));
+  CHECK(!workspaceOK(
+      "x-apple.systempreferences:com.apple.Notifications-Settings.extension?extra", false));
+  const char embedded[] = "https://checkout.stripe.com/\0@evil.com/";
+  CHECK(!nsWorkspaceOpenAllowed(embedded, sizeof embedded - 1, false));
+}
+
 // Media keys: only brightness is Nightshift's; volume, mute and the rest
 // must be told apart so the key tap hands them back to macOS.
 static void checkMediaKeys(void) {
@@ -612,6 +655,7 @@ int main(void) {
   checkSplit();
   checkSafety();
   checkHosts();
+  checkWorkspaceOpens();
   if (gFailures != 0) {
     fprintf(stderr, "logic: %d of %d checks failed\n", gFailures, gChecks);
     return 1;

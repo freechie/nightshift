@@ -192,6 +192,11 @@ const char *nsLinkVerdictText(NSLinkVerdict verdict);
 // userinfo, no port, nothing that isn't printable ASCII.
 NSLinkVerdict nsPurchaseURLVerdict(const char *url, size_t length);
 bool nsPurchaseURLAllowed(const char *url, size_t length);
+// Whether NSWorkspace may open url. Every call reads nsPurchaseURLVerdict
+// and nsLicenseOriginVerdict. A purchase page may open. A license-server
+// origin may not: the app talks to it and does not browse it. Settings and
+// the project pages are exact strings.
+bool nsWorkspaceOpenAllowed(const char *url, size_t length, bool allowLoopbackHTTP);
 
 // A media key (NX_SYSDEFINED, subtype 8) from its data1: the key code is
 // bits 16-31, the state bits 8-15 (0xA down, 0xB up). Returns 1 for
