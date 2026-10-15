@@ -400,6 +400,17 @@ static dispatch_queue_t ddcQueue(void) {
   return queue;
 }
 
+// IOAVServiceReadI2C can block forever on a bad subaddress. Calls run here,
+// and ddcQueue waits only until kDDCI2CCallNs.
+static dispatch_queue_t ddcIOQueue(void) {
+  static dispatch_queue_t queue;
+  static dispatch_once_t once;
+  dispatch_once(&once, ^{
+    queue = dispatch_queue_create("nightshift.i2c", DISPATCH_QUEUE_SERIAL);
+  });
+  return queue;
+}
+
 // One lamp target in flight. The job holds its own retain on service so a
 // slot can be cleared or replaced while the worker is still using it.
 typedef struct {
@@ -416,6 +427,7 @@ typedef struct {
   int max;
 } DDCJob;
 static BOOL gDDCBusy = NO;
+static int gDDCEpoch = 0;
 static BOOL gDDCAgain = NO;
 // The next probe reads ready channels too: after wake, a replug or a screen
 // change the service may be dead or the monitor may have reset its lamp.
@@ -718,14 +730,17 @@ static IOAVServiceRef serviceMatching(const DDCTarget *target, int *index) {
 }
 
 // DDC/CI wants a pause after a Set VCP before the monitor will answer the
-// next message with the new value (MonitorControl: 10 ms between writes,
-// 50 ms before a read, 20 ms between read retries). Worker only.
+// next message with the new value. m1ddc sends the request twice, 10ms
+// apart, then waits 10ms and reads. Worker only.
 static const useconds_t kDDCAfterWrite = 60000;
 static const useconds_t kDDCBetweenReads = 30000;
-// Gap before each copy of a DDC request. Two writes, then the 50ms read
-// wait, matches the Apple Silicon I2C timing that actually returns a frame.
-static const useconds_t kDDCWriteGap = 10000;
+// 10ms after each copy of a request. The second gap is the wait before the read.
+static const useconds_t kDDCReadGap = 10000;
 static const useconds_t kDDCRecheck = 100000;
+// One IOAVService call. Longer than a normal reply, short of pinning the queue.
+static const uint64_t kDDCI2CCallNs = 200000000ull;
+// One display's probe. Past this, 0x51 and 0x50 are not tried.
+static const uint64_t kDDCDisplayBudgetNs = 2500000000ull;
 static uint64_t gDDCWroteAt = 0;
 
 static uint64_t ddcNow(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
@@ -741,68 +756,188 @@ static void ddcWaitAfterWrite(void) {
   }
 }
 
-static BOOL ddcWriteRead(IOAVServiceRef service, uint8_t *request, int requestLen, uint8_t *reply,
-                         int replyLen, uint32_t readOffset) {
-  ddcWaitAfterWrite();
-  int writeCycle = 0;
-  while (writeCycle < 2) {
-    usleep(kDDCWriteGap);
-    if (IOAVServiceWriteI2C(service, 0x37, 0x51, request, (uint32_t)requestLen) != 0) {
+// Set while an abandoned IOAVService call is still inside the driver. Further
+// calls return at once so one stuck read cannot queue up behind itself.
+static atomic_int gDDCI2CBusy = 0;
+
+typedef struct {
+  IOAVServiceRef service;
+  uint32_t address;
+  uint8_t *bytes;
+  uint32_t length;
+  BOOL isWrite;
+  IOReturn result;
+  atomic_int state;
+} DDCI2CJob;
+
+static BOOL ddcI2C(IOAVServiceRef service, uint32_t address, uint8_t *data, uint32_t length,
+                   BOOL isWrite, uint64_t deadline, BOOL *timedOut) {
+  if (timedOut != NULL) {
+    *timedOut = NO;
+  }
+  if (service == NULL || data == NULL || length == 0) {
+    return NO;
+  }
+  if (atomic_load(&gDDCI2CBusy) != 0) {
+    if (timedOut != NULL) {
+      *timedOut = YES;
+    }
+    return NO;
+  }
+  uint64_t now = ddcNow();
+  uint64_t slice = kDDCI2CCallNs;
+  if (deadline != 0) {
+    if (now >= deadline) {
+      if (timedOut != NULL) {
+        *timedOut = YES;
+      }
       return NO;
     }
+    if (deadline - now < slice) {
+      slice = deadline - now;
+    }
+  }
+  if (slice < 20000000ull) {
+    if (timedOut != NULL) {
+      *timedOut = YES;
+    }
+    return NO;
+  }
+  DDCI2CJob *job = calloc(1, sizeof(*job));
+  uint8_t *bytes = job != NULL ? malloc(length) : NULL;
+  if (job == NULL || bytes == NULL) {
+    free(job);
+    free(bytes);
+    return NO;
+  }
+  if (isWrite) {
+    memcpy(bytes, data, length);
+  } else {
+    memset(bytes, 0, length);
+  }
+  job->service = (IOAVServiceRef)CFRetain(service);
+  job->address = address;
+  job->bytes = bytes;
+  job->length = length;
+  job->isWrite = isWrite;
+  dispatch_semaphore_t done = dispatch_semaphore_create(0);
+  dispatch_async(ddcIOQueue(), ^{
+    IOReturn result = job->isWrite
+                          ? IOAVServiceWriteI2C(job->service, 0x37, job->address, job->bytes, job->length)
+                          : IOAVServiceReadI2C(job->service, 0x37, job->address, job->bytes, job->length);
+    job->result = result;
+    int expected = 0;
+    if (!atomic_compare_exchange_strong(&job->state, &expected, 1)) {
+      CFRelease(job->service);
+      free(job->bytes);
+      free(job);
+      atomic_store(&gDDCI2CBusy, 0);
+      return;
+    }
+    dispatch_semaphore_signal(done);
+  });
+  if (dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, (int64_t)slice)) != 0) {
+    int expected = 0;
+    if (atomic_compare_exchange_strong(&job->state, &expected, 2)) {
+      atomic_store(&gDDCI2CBusy, 1);
+      if (timedOut != NULL) {
+        *timedOut = YES;
+      }
+      return NO;
+    }
+    // The call already stored its result. Do not wait on it again.
+  }
+  BOOL ok = job->result == 0;
+  if (ok && !isWrite) {
+    memcpy(data, job->bytes, length);
+  }
+  CFRelease(job->service);
+  free(job->bytes);
+  free(job);
+  return ok;
+}
+
+// Chip 0x37, data address 0x51 for the write and the read. Two sends, 10ms
+// apart, then one 12-byte read at that same address. No other offset.
+static BOOL ddcWriteRead(IOAVServiceRef service, uint8_t *request, int requestLen, uint8_t *reply,
+                         int replyLen, uint64_t deadline, BOOL *timedOut) {
+  ddcWaitAfterWrite();
+  int writeCycle = 0;
+  BOOL wrote = NO;
+  while (writeCycle < 2) {
+    if (deadline != 0 && ddcNow() >= deadline) {
+      if (timedOut != NULL) {
+        *timedOut = YES;
+      }
+      return NO;
+    }
+    BOOL hung = NO;
+    if (ddcI2C(service, 0x51, request, (uint32_t)requestLen, YES, deadline, &hung)) {
+      wrote = YES;
+    } else if (hung) {
+      if (timedOut != NULL) {
+        *timedOut = YES;
+      }
+      return NO;
+    }
+    usleep(kDDCReadGap);
     writeCycle++;
+  }
+  if (!wrote) {
+    return NO;
   }
   if (reply == NULL || replyLen <= 0) {
     return YES;
   }
-  usleep(50000);
-  if (IOAVServiceReadI2C(service, 0x37, readOffset, reply, (uint32_t)replyLen) == 0) {
-    return YES;
-  }
-  // Some links reject a read longer than the 11-byte VCP reply.
-  if (replyLen <= 11) {
+  if (deadline != 0 && ddcNow() >= deadline) {
+    if (timedOut != NULL) {
+      *timedOut = YES;
+    }
     return NO;
   }
-  memset(reply, 0, (size_t)replyLen);
-  return IOAVServiceReadI2C(service, 0x37, readOffset, reply, 11) == 0;
-}
-
-// Which read subaddress last returned a frame. 0 is the usual offset; HDMI
-// adapters often answer at the data address 0x51, and some at 0x50.
-static int gDDCReadOffsetSlot = 0;
-
-static BOOL ddcReadFrame(IOAVServiceRef service, uint8_t *request, int requestLen, uint8_t *reply,
-                         int replyLen, NSDDCReply *decoded, BOOL brightnessOnly) {
-  static const uint32_t offsets[3] = {0, 0x51, 0x50};
-  for (int n = 0; n < 3; n++) {
-    int slot = (gDDCReadOffsetSlot + n) % 3;
-    memset(reply, 0, (size_t)replyLen);
-    if (!ddcWriteRead(service, request, requestLen, reply, replyLen, offsets[slot])) {
-      continue;
+  uint8_t buf[12];
+  memset(buf, 0, sizeof(buf));
+  BOOL hung = NO;
+  if (!ddcI2C(service, 0x51, buf, 12, NO, deadline, &hung)) {
+    if (hung && timedOut != NULL) {
+      *timedOut = YES;
     }
-    NSDDCReply got;
-    if (!nsDDCDecodeReply(reply, replyLen, &got)) {
-      continue;
-    }
-    if (brightnessOnly && !got.brightness) {
-      continue;
-    }
-    gDDCReadOffsetSlot = slot;
-    if (decoded != NULL) {
-      *decoded = got;
-    }
-    return YES;
+    return NO;
   }
-  return NO;
+  int n = replyLen < 12 ? replyLen : 12;
+  memcpy(reply, buf, (size_t)n);
+  return YES;
 }
 
-static BOOL ddcReadOnce(IOAVServiceRef service, int *current, int *max) {
+// One transaction at data address 0x51. The caller retries.
+static BOOL ddcReadFrame(IOAVServiceRef service, uint8_t *request, int requestLen,
+                         NSDDCReply *decoded, BOOL brightnessOnly, uint64_t deadline, BOOL *timedOut) {
+  uint8_t reply[12];
+  memset(reply, 0, sizeof(reply));
+  BOOL hung = NO;
+  if (!ddcWriteRead(service, request, requestLen, reply, 12, deadline, &hung)) {
+    if (hung && timedOut != NULL) {
+      *timedOut = YES;
+    }
+    return NO;
+  }
+  NSDDCReply found;
+  memset(&found, 0, sizeof(found));
+  if (!nsDDCDecodeReply(reply, 12, &found) || (brightnessOnly && !found.brightness)) {
+    return NO;
+  }
+  if (decoded != NULL) {
+    *decoded = found;
+  }
+  return YES;
+}
+
+static BOOL ddcReadOnce(IOAVServiceRef service, int *current, int *max, uint64_t deadline,
+                         BOOL *timedOut) {
   uint8_t request[4] = {0x82, 0x01, 0x10, 0};
   request[3] = (uint8_t)(0x6E ^ request[0] ^ request[1] ^ request[2]);
-  // 12 bytes so a leading 0x51 plus the 11-byte reply still fits.
-  uint8_t reply[12];
   NSDDCReply decoded;
-  if (!ddcReadFrame(service, request, 4, reply, (int)sizeof(reply), &decoded, YES)) {
+  if (!ddcReadFrame(service, request, 4, &decoded, YES, deadline, timedOut)) {
     return NO;
   }
   *current = decoded.current;
@@ -812,22 +947,21 @@ static BOOL ddcReadOnce(IOAVServiceRef service, int *current, int *max) {
 
 // Capabilities (0xF3) or any checksum-valid VCP frame. withDataAddress uses
 // the write-style checksum seed (0x6E ^ 0x51); the other uses the read seed.
-static BOOL ddcCapabilitiesOnce(IOAVServiceRef service, int withDataAddress) {
+static BOOL ddcCapabilitiesOnce(IOAVServiceRef service, int withDataAddress, uint64_t deadline,
+                                 BOOL *timedOut) {
   uint8_t request[5] = {0x83, 0xF3, 0x00, 0x00, 0};
   uint8_t seed = 0x6E;
   if (withDataAddress) {
     seed = (uint8_t)(0x6E ^ 0x51);
   }
   request[4] = (uint8_t)(seed ^ request[0] ^ request[1] ^ request[2] ^ request[3]);
-  uint8_t reply[64];
-  return ddcReadFrame(service, request, 5, reply, (int)sizeof(reply), NULL, NO);
+  return ddcReadFrame(service, request, 5, NULL, NO, deadline, timedOut);
 }
 
-static BOOL ddcVCPFrameOnce(IOAVServiceRef service) {
+static BOOL ddcVCPFrameOnce(IOAVServiceRef service, uint64_t deadline, BOOL *timedOut) {
   uint8_t request[4] = {0x82, 0x01, 0x10, 0};
   request[3] = (uint8_t)(0x6E ^ request[0] ^ request[1] ^ request[2]);
-  uint8_t reply[12];
-  return ddcReadFrame(service, request, 4, reply, (int)sizeof(reply), NULL, NO);
+  return ddcReadFrame(service, request, 4, NULL, NO, deadline, timedOut);
 }
 
 // Brightness for a display that waits for the current probe to land
@@ -1065,6 +1199,7 @@ static BOOL displayWasRestored(uint32_t display);
 static bool ddcProbeRead(void *ctx, int *current, int *max);
 static bool ddcProbeWrite(void *ctx, int value);
 static bool ddcProbeFramed(void *ctx);
+static bool ddcProbeBudget(void *ctx);
 
 BOOL setDisplayBrightness(uint32_t display, long percent);
 
@@ -1175,6 +1310,9 @@ typedef struct {
   IOAVServiceRef service;
   int fallbackCurrent;
   int fallbackMax;
+  uint64_t deadline;
+  BOOL timedOut;
+  BOOL readsFinished;
 } DDCProbeCtx;
 
 typedef struct {
@@ -1223,6 +1361,26 @@ static void ddcNoteDebug(uint32_t display, int service, int verdict, int evidenc
   }
 }
 
+// Any external still marked in-flight when the probe leaves has to show a
+// finished code. The queue hop is the normal path; the watchdog uses this too.
+static void ddcSweepInFlight(int evidence) {
+  for (int i = 0; i < gDDCDebugCount; i++) {
+    if (gDDCDebug[i].evidence != kNSDDCEvidenceInFlight) {
+      continue;
+    }
+    gDDCDebug[i].verdict = kNSDDCProbeSoftware;
+    gDDCDebug[i].evidence = evidence;
+    if (!ddcDebugOn()) {
+      continue;
+    }
+    char line[64];
+    if (nsDDCDebugLine(gDDCDebug[i].display, gDDCDebug[i].service, gDDCDebug[i].verdict,
+                       gDDCDebug[i].evidence, line, sizeof(line))) {
+      fprintf(stderr, "%s\n", line);
+    }
+  }
+}
+
 int ddcCopyDebug(char *out, int cap) {
   if (out == NULL || cap <= 0) {
     return 0;
@@ -1267,6 +1425,19 @@ void probeDDC(void) {
     gDDCAgain = YES;
     return;
   }
+  // A read that did not return is still inside the driver. Queueing another
+  // probe would sit behind it and look in-flight forever.
+  if (atomic_load(&gDDCI2CBusy) != 0) {
+    uint32_t ids[16];
+    int count = orderedDisplays(ids, 16);
+    for (int i = 0; i < count; i++) {
+      if (CGDisplayIsBuiltin(ids[i])) {
+        continue;
+      }
+      ddcNoteDebug(ids[i], -1, kNSDDCProbeSoftware, kNSDDCEvidenceTimedOut);
+    }
+    return;
+  }
   if (!gDDCRevalidate && !ddcNeedsProbe() && gDDCLast != 0 &&
       CFAbsoluteTimeGetCurrent() - gDDCLast < 3) {
     return;
@@ -1274,7 +1445,27 @@ void probeDDC(void) {
   BOOL revalidate = gDDCRevalidate;
   gDDCRevalidate = NO;
   gDDCBusy = YES;
+  int epoch = ++gDDCEpoch;
   gDDCLast = CFAbsoluteTimeGetCurrent();
+  // If the worker never reaches its main-queue hop, in-flight cannot stick.
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 12 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+    if (gDDCEpoch != epoch || !gDDCBusy) {
+      return;
+    }
+    ddcSweepInFlight(kNSDDCEvidenceTimedOut);
+    gDDCBusy = NO;
+    gDDCEpoch++;
+    BOOL again = gDDCAgain;
+    gDDCAgain = NO;
+    restoreSavedBrightness();
+    applyDeferredBrightness();
+    applyPendingBrightnessKeys();
+    refreshMenu();
+    refreshKeyDisplays();
+    if (again) {
+      probeDDC();
+    }
+  });
   DDCSnapshot seen = ddcSnapshot();
   // Last-known slider percent, captured on the main thread. The probe uses
   // it only when a framed reply proves the link and brightness cannot be read.
@@ -1308,6 +1499,7 @@ void probeDDC(void) {
   }
   // On the DDC queue so probe reads can't overlap a lamp write.
   dispatch_async(ddcQueue(), ^{
+    int probeEpoch = epoch;
     uint32_t ids[16];
     int count = orderedDisplays(ids, 16);
     uint32_t targets[8];
@@ -1345,6 +1537,9 @@ void probeDDC(void) {
       IOAVServiceRef service;
     } DDCResult;
     DDCResult *results = pending > 0 ? calloc((size_t)pending, sizeof(DDCResult)) : NULL;
+    if (results == NULL) {
+      pending = 0;
+    }
     for (int i = 0; i < pending; i++) {
       int serviceIndex = -1;
       IOAVServiceRef service = serviceMatching(&wanted[i], &serviceIndex);
@@ -1367,9 +1562,11 @@ void probeDDC(void) {
           }
         }
         DDCProbeCtx ctx;
+        memset(&ctx, 0, sizeof(ctx));
         ctx.service = service;
         ctx.fallbackCurrent = percent > 0 ? percent : 0;
         ctx.fallbackMax = percent > 0 ? 100 : 0;
+        ctx.deadline = ddcNow() + kDDCDisplayBudgetNs;
         int current = 0;
         int max = 0;
         NSDDCProbeIO io;
@@ -1377,6 +1574,7 @@ void probeDDC(void) {
         io.read = ddcProbeRead;
         io.write = ddcProbeWrite;
         io.framed = ddcProbeFramed;
+        io.budget = ddcProbeBudget;
         io.ctx = &ctx;
         io.fallbackCurrent = ctx.fallbackCurrent;
         io.fallbackMax = ctx.fallbackMax;
@@ -1388,6 +1586,18 @@ void probeDDC(void) {
       }
     }
     dispatch_async(dispatch_get_main_queue(), ^{
+      if (gDDCEpoch != probeEpoch) {
+        if (results != NULL) {
+          for (int i = 0; i < pending; i++) {
+            if (results[i].service != NULL) {
+              CFRelease(results[i].service);
+            }
+          }
+          free(results);
+        }
+        return;
+      }
+      if (results != NULL) {
       for (int i = 0; i < pending; i++) {
         int verdict =
             results[i].max > 0 ? kNSDDCProbeControllable : kNSDDCProbeSoftware;
@@ -1442,6 +1652,8 @@ void probeDDC(void) {
         }
       }
       free(results);
+      }
+      ddcSweepInFlight(kNSDDCEvidenceTimedOut);
       gDDCBusy = NO;
       BOOL again = gDDCAgain;
       gDDCAgain = NO;
@@ -1484,47 +1696,102 @@ static int ddcValue(long percent, int scale) { return nsDDCValue(percent, scale)
 
 static BOOL ddcNear(int got, int want, int scale) { return nsDDCNear(got, want, scale); }
 
-static BOOL ddcWriteOnce(IOAVServiceRef service, int value) {
+static BOOL ddcWriteOnce(IOAVServiceRef service, int value, uint64_t deadline, BOOL *timedOut) {
   uint8_t request[6] = {0x84, 0x03, 0x10, (uint8_t)((value >> 8) & 0xFF),
                         (uint8_t)(value & 0xFF), 0};
   request[5] = ddcChecksum(request, 5);
   BOOL wrote = NO;
   for (int cycle = 0; cycle < 2; cycle++) {
     usleep(10000);
-    if (IOAVServiceWriteI2C(service, 0x37, 0x51, request, 6) == 0) {
+    BOOL hung = NO;
+    if (ddcI2C(service, 0x51, request, 6, YES, deadline, &hung)) {
       wrote = YES;
+    }
+    if (hung) {
+      if (timedOut != NULL) {
+        *timedOut = YES;
+      }
+      break;
     }
   }
   gDDCWroteAt = ddcNow();
-  return wrote;
+  return wrote && (timedOut == NULL || !*timedOut);
+}
+
+static bool ddcProbeBudget(void *ctx) {
+  DDCProbeCtx *probe = ctx;
+  return probe != NULL && !probe->timedOut;
 }
 
 static bool ddcProbeRead(void *ctx, int *current, int *max) {
   DDCProbeCtx *probe = ctx;
+  if (probe->readsFinished) {
+    return false;
+  }
+  // Up to four tries, and only while this display's deadline has time left.
+  // Each try is one read at data address 0x51. There is no offset search.
   for (int attempt = 0; attempt < 4; attempt++) {
+    if (probe->timedOut || (probe->deadline != 0 && ddcNow() >= probe->deadline)) {
+      probe->timedOut = YES;
+      probe->readsFinished = YES;
+      return false;
+    }
     if (attempt > 0) {
       usleep(kDDCBetweenReads);
     }
-    if (ddcReadOnce(probe->service, current, max)) {
+    BOOL hung = NO;
+    if (ddcReadOnce(probe->service, current, max, probe->deadline, &hung)) {
+      probe->readsFinished = YES;
       return true;
     }
+    if (hung) {
+      probe->timedOut = YES;
+      probe->readsFinished = YES;
+      return false;
+    }
   }
+  probe->readsFinished = YES;
   return false;
 }
 
 static bool ddcProbeWrite(void *ctx, int value) {
   DDCProbeCtx *probe = ctx;
-  return ddcWriteOnce(probe->service, value) ? true : false;
+  if (probe->timedOut || (probe->deadline != 0 && ddcNow() >= probe->deadline)) {
+    probe->timedOut = YES;
+    return false;
+  }
+  BOOL hung = NO;
+  BOOL ok = ddcWriteOnce(probe->service, value, probe->deadline, &hung);
+  if (hung) {
+    probe->timedOut = YES;
+  }
+  return ok && !hung;
 }
 
 static bool ddcProbeFramed(void *ctx) {
   DDCProbeCtx *probe = ctx;
   for (int n = 0; n < 3; n++) {
-    if (ddcCapabilitiesOnce(probe->service, n == 0 ? 1 : 0)) {
+    if (probe->timedOut) {
+      return false;
+    }
+    if (probe->deadline != 0 && ddcNow() >= probe->deadline) {
+      return false;
+    }
+    BOOL hung = NO;
+    if (ddcCapabilitiesOnce(probe->service, n == 0 ? 1 : 0, probe->deadline, &hung)) {
       return true;
     }
-    if (ddcVCPFrameOnce(probe->service)) {
+    if (hung) {
+      probe->timedOut = YES;
+      return false;
+    }
+    hung = NO;
+    if (ddcVCPFrameOnce(probe->service, probe->deadline, &hung)) {
       return true;
+    }
+    if (hung) {
+      probe->timedOut = YES;
+      return false;
     }
   }
   return false;
@@ -1613,17 +1880,21 @@ static void ddcConfirm(DDCJob *job) {
   int max = 0;
   job->read = NO;
   job->stable = NO;
-  if (!ddcReadOnce(job->service, &current, &max) || max <= 0) {
+  uint64_t deadline = ddcNow() + kDDCDisplayBudgetNs;
+  BOOL hung = NO;
+  if (!ddcReadOnce(job->service, &current, &max, deadline, &hung) || max <= 0) {
     return;
   }
   int wanted = ddcValue(job->percent, max);
+  hung = NO;
   if (wanted != job->value && ddcNear(current, job->value, max) &&
-      ddcWriteOnce(job->service, wanted)) {
+      ddcWriteOnce(job->service, wanted, deadline, &hung)) {
     job->value = wanted;
     job->scale = max;
     int corrected = 0;
     int correctedMax = 0;
-    if (!ddcReadOnce(job->service, &corrected, &correctedMax) || correctedMax <= 0) {
+    hung = NO;
+    if (!ddcReadOnce(job->service, &corrected, &correctedMax, deadline, &hung) || correctedMax <= 0) {
       return;
     }
     current = corrected;
@@ -1634,7 +1905,8 @@ static void ddcConfirm(DDCJob *job) {
     usleep(kDDCRecheck);
     int again = 0;
     int againMax = 0;
-    if (ddcReadOnce(job->service, &again, &againMax) && againMax == max) {
+    hung = NO;
+    if (ddcReadOnce(job->service, &again, &againMax, deadline, &hung) && againMax == max) {
       stable = again == current;
       current = again;
     }
@@ -1979,7 +2251,8 @@ static BOOL ddcPost(uint32_t display, DDCSlot *slot, long percent, long floor) {
       CFRelease(work.service);
       return;
     }
-    work.wrote = ddcWriteOnce(work.service, work.value);
+    BOOL hung = NO;
+    work.wrote = ddcWriteOnce(work.service, work.value, ddcNow() + kDDCDisplayBudgetNs, &hung);
     if (!work.wrote) {
       ddcDeliver(work);
       return;
