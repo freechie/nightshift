@@ -123,6 +123,45 @@ NSRevalidateAction nsRevalidateAction(int current, int target, int scale,
 // Splits a brightness percent into a lamp percent (hardware) and an overlay
 // percent (software, 100 = no overlay, 0 = black).
 void nsCombinedLevels(long percent, long floor, long *hardware, long *software);
+
+// MARK: Proving a monitor follows DDC
+
+// read and write talk to the panel (raw VCP 0x10). They must not answer from
+// Nightshift's saved brightness or the number the UI is showing.
+typedef struct {
+  bool (*read)(void *ctx, int *current, int *max);
+  bool (*write)(void *ctx, int value);
+  void *ctx;
+} NSDDCProbeIO;
+
+typedef enum {
+  kNSDDCProbeControllable = 0,  // the panel followed a write
+  kNSDDCProbeSoftware = 1,      // unchanged readback, or a read/write error
+} NSDDCProbeVerdict;
+
+// Raw brightness to write: two steps from current when that stays on the
+// scale, otherwise one. -1 when the scale cannot move. The step is raw, not
+// a percent, so the flash stays small.
+int nsDDCProbeTarget(int current, int max);
+// True only when the second read is the written value and is not the first
+// read. Exact, not nsDDCNear: a one- or two-step nudge sits inside that
+// tolerance, so a cached read of the old value would look close enough.
+bool nsDDCProbeLanded(int before, int written, int after);
+// Read, write nsDDCProbeTarget, read again, then write the original back.
+// The confirmation read is tried up to four times: a slow panel can still
+// answer with the old value once. Controllable only when one of those reads
+// is the written value. A read or write error, or a readback that never
+// leaves the first value, is software-only. When the first read works,
+// *current and *max receive it (the value written back). Either pointer may
+// be NULL.
+NSDDCProbeVerdict nsDDCProbeControl(const NSDDCProbeIO *io, int *current, int *max);
+// Settings label. Controllable is "DDC/CI connected". Software is
+// "Software dimming" and is never the connected label.
+const char *nsDDCControlLabel(NSDDCProbeVerdict verdict);
+// Controllable keeps nsCombinedLevels. Software dims across the whole
+// 0-100 slider and does not write the lamp (*hardware is -1).
+void nsExternalBrightness(NSDDCProbeVerdict verdict, long percent, long floor,
+                          long *hardware, long *software);
 // One brightness-key step on a scale of stops.
 long nsSteppedPercent(long percent, int direction, long stops);
 // The percent a display may actually be set to. 0 (black) is refused for an
