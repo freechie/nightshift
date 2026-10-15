@@ -80,7 +80,9 @@ The app and CLI talk to a license server compiled in as an `https` origin: build
 
 Upgrading the version means re-running the sandbox check: a test-mode checkout paid with test card 4242, a purchase held and refunded, `stripe events resend` of its events, and a lapsed customer buying again. Recapture the fixtures from that run. The server logs `WEBHOOK-VERSION` when an event arrives in another version.
 
-Keep secrets out of commits: `server/.env` is ignored, and `server/.env.example` keeps every key, secret and token empty (`server/test.js` fails otherwise). `make hooks` points this clone's `core.hooksPath` at `scripts/hooks`, whose `pre-commit` refuses a commit when any staged file holds something shaped like a Stripe secret key, restricted key or webhook signing secret (`scripts/secret-patterns.txt`). It checks what is staged, not the files on disk, and names the file, line and key, never the value. If one was ever pushed, rotate it in Stripe; deleting it from the file doesn't retire it.
+The only pages `NSWorkspace` opens go through `rampWorkspaceURL` (`nsWorkspaceOpenAllowed`). That check calls `nsLicenseOriginVerdict` and `nsPurchaseURLVerdict` on every URL. A license-server origin is not opened. Settings and the project links are exact strings.
+
+Keep secrets out of commits: `server/.env` is ignored, and `server/.env.example` keeps every key, secret and token empty (`server/test.js` fails otherwise). `make test` runs `scripts/scan-secrets.sh` on the tracked tree. `make hooks` points this clone's `core.hooksPath` at `scripts/hooks`, whose `pre-commit` runs the same pattern on the index. Both name the file, line, and key, never the value. `server/.env` is not part of either scan. If one was ever pushed, rotate it in Stripe; deleting it from the file doesn't retire it. The deployed `STRIPE_WEBHOOK_SECRET` is the dashboard endpoint secret from `stripe.webhookEndpoints.create` in `server/setup.js`. `stripe listen` in that file is the local http hint.
 
 ## License
 
