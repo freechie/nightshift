@@ -364,6 +364,36 @@ const char *nsDDCControlLabel(NSDDCProbeVerdict verdict) {
   return "Software dimming";
 }
 
+// Software dimming multiplies the display's gamma table. A linear percent
+// leaves the lower half too dark, and the picture keeps brightening past 50.
+// shade = p^(1/k), k = 2.2 (sRGB): higher shade is brighter, 0 stays black,
+// 100 stays undimmed, and the middle lifts (50 -> 73). p^2.2 would darken
+// the middle (50 -> 22), which is the wrong direction. Set the exponent to
+// 1 to restore linear: the function returns the slider percent unchanged.
+const double kNSSoftwareDimExponent = 2.2;
+
+long nsSoftwareDimShade(long percent) {
+  if (percent < 0) {
+    percent = 0;
+  }
+  if (percent > 100) {
+    percent = 100;
+  }
+  if (percent == 0 || percent == 100 || kNSSoftwareDimExponent == 1.0) {
+    return percent;
+  }
+  double unit = (double)percent / 100.0;
+  double shade = pow(unit, 1.0 / kNSSoftwareDimExponent);
+  long result = (long)llround(shade * 100.0);
+  if (result < 1) {
+    return 1;
+  }
+  if (result > 100) {
+    return 100;
+  }
+  return result;
+}
+
 void nsExternalBrightness(NSDDCProbeVerdict verdict, long percent, long floor, long *hardware,
                           long *software) {
   if (percent < 0) {
@@ -377,7 +407,7 @@ void nsExternalBrightness(NSDDCProbeVerdict verdict, long percent, long floor, l
       *hardware = -1;
     }
     if (software != NULL) {
-      *software = percent;
+      *software = nsSoftwareDimShade(percent);
     }
     return;
   }
