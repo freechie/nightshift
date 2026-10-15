@@ -21,6 +21,7 @@
 #import <IOKit/IOKitLib.h>
 #include <stdatomic.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -446,44 +447,51 @@ static int ddcPickCandidate(const DDCCandidate *candidates, int count, const DDC
 
 typedef CFDictionaryRef (*DisplayInfoFn)(CGDirectDisplayID display);
 
-// Checks the framebuffer's DisplayAttributes against CG's vendor and product.
-// Missing attributes are not a disagreement.
-static BOOL framebufferAgrees(io_registry_entry_t framebuffer, uint32_t vendor, uint32_t model) {
-  CFTypeRef attributes =
-      IORegistryEntryCreateCFProperty(framebuffer, CFSTR("DisplayAttributes"), kCFAllocatorDefault, 0);
-  if (attributes == NULL) {
-    return YES;
+static void copyLocation(const char *path, char *out, size_t cap) {
+  out[0] = '\0';
+  if (path == NULL || path[0] == '\0' || cap == 0) {
+    return;
   }
-  BOOL agrees = YES;
-  if (CFGetTypeID(attributes) == CFDictionaryGetTypeID()) {
-    CFTypeRef product = CFDictionaryGetValue(attributes, CFSTR("ProductAttributes"));
-    if (product != NULL && CFGetTypeID(product) == CFDictionaryGetTypeID()) {
-      CFTypeRef legacy = CFDictionaryGetValue(product, CFSTR("LegacyManufacturerID"));
-      CFTypeRef productID = CFDictionaryGetValue(product, CFSTR("ProductID"));
-      int64_t value = 0;
-      if (legacy != NULL && CFGetTypeID(legacy) == CFNumberGetTypeID() &&
-          CFNumberGetValue(legacy, kCFNumberSInt64Type, &value) && vendor != 0 &&
-          vendor != 0xFFFFFFFFu && (uint32_t)value != vendor) {
-        agrees = NO;
-      }
-      if (productID != NULL && CFGetTypeID(productID) == CFNumberGetTypeID() &&
-          CFNumberGetValue(productID, kCFNumberSInt64Type, &value) && (uint32_t)value != model) {
-        agrees = NO;
-      }
-    }
+  size_t length = strlen(path);
+  if (length == 0 || length >= cap) {
+    return;
   }
-  CFRelease(attributes);
-  return agrees;
+  memcpy(out, path, length + 1);
 }
 
-// Finds which display pipe ("dispext0") drives this display, through the private
-// CoreDisplay info dictionary that MonitorControl also relies on. Leaves out empty
-// when anything is missing or doesn't line up, so matching falls back to EDID data.
-static void displayPort(CGDirectDisplayID display, uint32_t vendor, uint32_t model, char *out,
-                        size_t cap) {
+// "dispext0" from ".../dispext0@88000000/AppleCLCD2" or a built-in HDMI pipe
+// whose framebuffer is not the last component.
+static void portFromPath(const char *path, char *out, size_t cap) {
+  out[0] = '\0';
+  if (path == NULL) {
+    return;
+  }
+  const char *cursor = path;
+  while (*cursor != '\0') {
+    if (strncmp(cursor, "disp", 4) == 0) {
+      if (ddcPortName(cursor, '@', out, cap) || ddcPortName(cursor, '/', out, cap) ||
+          ddcPortName(cursor, ':', out, cap)) {
+        return;
+      }
+    }
+    const char *slash = strchr(cursor, '/');
+    if (slash == NULL) {
+      return;
+    }
+    cursor = slash + 1;
+  }
+}
+
+// CoreDisplay's IODisplayLocation is this display's framebuffer path. An
+// adapter can make the vendor and product on that node disagree with
+// CGDisplay, so the path is kept either way. The port name is the dispext
+// segment, including when the framebuffer class is not AppleCLCD2.
+static void displayPipe(CGDirectDisplayID display, char *port, size_t portCap, char *location,
+                        size_t locationCap) {
   static DisplayInfoFn info = NULL;
   static dispatch_once_t once;
-  out[0] = '\0';
+  port[0] = '\0';
+  location[0] = '\0';
   dispatch_once(&once, ^{
     info = (DisplayInfoFn)dlsym(RTLD_DEFAULT, "CoreDisplay_DisplayCreateInfoDictionary");
     if (info == NULL) {
@@ -501,34 +509,149 @@ static void displayPort(CGDirectDisplayID display, uint32_t vendor, uint32_t mod
     return;
   }
   char path[512];
-  CFTypeRef location = CFDictionaryGetValue(dict, CFSTR("IODisplayLocation"));
-  BOOL ok = location != NULL && CFGetTypeID(location) == CFStringGetTypeID() &&
-            CFStringGetCString(location, path, sizeof(path), kCFStringEncodingUTF8);
+  CFTypeRef value = CFDictionaryGetValue(dict, CFSTR("IODisplayLocation"));
+  BOOL ok = value != NULL && CFGetTypeID(value) == CFStringGetTypeID() &&
+            CFStringGetCString(value, path, sizeof(path), kCFStringEncodingUTF8);
   CFRelease(dict);
   if (!ok) {
     return;
   }
-  io_registry_entry_t framebuffer = IORegistryEntryFromPath(kIOMainPortDefault, path);
-  if (framebuffer != MACH_PORT_NULL) {
-    ok = framebufferAgrees(framebuffer, vendor, model);
-    IOObjectRelease(framebuffer);
-    if (!ok) {
-      return;
-    }
-  }
-  // ".../AppleT600xIO/dispext0@88000000/AppleCLCD2" -> "dispext0"
-  char *last = strrchr(path, '/');
-  if (last == NULL || last == path ||
-      (strncmp(last + 1, "AppleCLCD2", 10) != 0 &&
-       strncmp(last + 1, "IOMobileFramebufferShim", 23) != 0)) {
-    return;
-  }
-  *last = '\0';
-  char *pipe = strrchr(path, '/');
-  ddcPortName(pipe != NULL ? pipe + 1 : path, '@', out, cap);
+  copyLocation(path, location, locationCap);
+  portFromPath(path, port, portCap);
 }
 
-static IOAVServiceRef serviceMatching(const DDCTarget *target) {
+static void readProductAttributes(CFTypeRef attributes, DDCCandidate *candidate) {
+  if (attributes == NULL || CFGetTypeID(attributes) != CFDictionaryGetTypeID()) {
+    return;
+  }
+  CFTypeRef product = CFDictionaryGetValue(attributes, CFSTR("ProductAttributes"));
+  if (product == NULL || CFGetTypeID(product) != CFDictionaryGetTypeID()) {
+    return;
+  }
+  int64_t value = 0;
+  CFTypeRef legacy = CFDictionaryGetValue(product, CFSTR("LegacyManufacturerID"));
+  CFTypeRef productID = CFDictionaryGetValue(product, CFSTR("ProductID"));
+  CFTypeRef serial = CFDictionaryGetValue(product, CFSTR("SerialNumber"));
+  if (legacy != NULL && CFGetTypeID(legacy) == CFNumberGetTypeID() &&
+      CFNumberGetValue(legacy, kCFNumberSInt64Type, &value)) {
+    candidate->vendor = (uint32_t)value;
+  }
+  if (productID != NULL && CFGetTypeID(productID) == CFNumberGetTypeID() &&
+      CFNumberGetValue(productID, kCFNumberSInt64Type, &value)) {
+    candidate->product = (uint32_t)value;
+  }
+  if (serial != NULL && CFGetTypeID(serial) == CFNumberGetTypeID() &&
+      CFNumberGetValue(serial, kCFNumberSInt64Type, &value) && value > 0) {
+    candidate->serial = (uint32_t)value;
+  }
+}
+
+// AppleCLCD2, IOMobileFramebuffer (the shim and the built-in HDMI class), or
+// any sibling that publishes DisplayAttributes. Two different paths under one
+// proxy clear the location so the picker cannot bind the wrong display.
+static void considerFramebuffer(io_registry_entry_t entry, DDCCandidate *candidate, BOOL *blocked) {
+  if (blocked == NULL || *blocked || entry == MACH_PORT_NULL) {
+    return;
+  }
+  io_name_t name;
+  name[0] = '\0';
+  IORegistryEntryGetName(entry, name);
+  BOOL named = strstr(name, "AppleCLCD") != NULL || strstr(name, "IOMobileFramebuffer") != NULL;
+  CFTypeRef attributes =
+      IORegistryEntryCreateCFProperty(entry, CFSTR("DisplayAttributes"), kCFAllocatorDefault, 0);
+  if (!named && attributes == NULL) {
+    return;
+  }
+  io_string_t path;
+  path[0] = '\0';
+  if (IORegistryEntryGetPath(entry, kIOServicePlane, path) != KERN_SUCCESS) {
+    if (attributes != NULL) {
+      CFRelease(attributes);
+    }
+    return;
+  }
+  char location[256];
+  copyLocation(path, location, sizeof(location));
+  if (location[0] == '\0') {
+    if (attributes != NULL) {
+      CFRelease(attributes);
+    }
+    return;
+  }
+  if (candidate->location[0] != '\0' && strcmp(candidate->location, location) != 0) {
+    candidate->location[0] = '\0';
+    *blocked = YES;
+    if (attributes != NULL) {
+      CFRelease(attributes);
+    }
+    return;
+  }
+  if (candidate->location[0] == '\0') {
+    copyLocation(location, candidate->location, sizeof(candidate->location));
+  }
+  if (candidate->port[0] == '\0') {
+    portFromPath(path, candidate->port, sizeof(candidate->port));
+  }
+  if (candidate->product == 0) {
+    readProductAttributes(attributes, candidate);
+  }
+  if (attributes != NULL) {
+    CFRelease(attributes);
+  }
+}
+
+// The framebuffer is a sibling of DCPAVServiceProxy, or an ancestor, and on
+// built-in HDMI it is not always the direct parent named dispextN.
+static void inheritFramebuffer(io_service_t service, DDCCandidate *candidate) {
+  BOOL blocked = NO;
+  io_registry_entry_t node = service;
+  BOOL releaseNode = NO;
+  for (int depth = 0; depth < 6 && !blocked && candidate->location[0] == '\0'; depth++) {
+    io_registry_entry_t parent = MACH_PORT_NULL;
+    if (IORegistryEntryGetParentEntry(node, kIOServicePlane, &parent) != KERN_SUCCESS) {
+      break;
+    }
+    io_name_t name;
+    name[0] = '\0';
+    if (IORegistryEntryGetName(parent, name) == KERN_SUCCESS && candidate->port[0] == '\0') {
+      if (!ddcPortName(name, ':', candidate->port, sizeof(candidate->port))) {
+        ddcPortName(name, '@', candidate->port, sizeof(candidate->port));
+      }
+    }
+    considerFramebuffer(parent, candidate, &blocked);
+    io_iterator_t kids = 0;
+    if (!blocked &&
+        IORegistryEntryGetChildIterator(parent, kIOServicePlane, &kids) == KERN_SUCCESS) {
+      io_service_t child;
+      while ((child = IOIteratorNext(kids))) {
+        if (child != node) {
+          considerFramebuffer(child, candidate, &blocked);
+        }
+        IOObjectRelease(child);
+        if (blocked) {
+          break;
+        }
+      }
+      IOObjectRelease(kids);
+    }
+    if (releaseNode) {
+      IOObjectRelease(node);
+    }
+    node = parent;
+    releaseNode = YES;
+  }
+  if (releaseNode && node != MACH_PORT_NULL) {
+    IOObjectRelease(node);
+  }
+}
+
+// index, when set, receives the candidate ordinal or -1. The service is the
+// one path or identity that is unambiguous. EDID is optional: a framebuffer
+// path is enough, and a failed EDID copy no longer drops the HDMI service.
+static IOAVServiceRef serviceMatching(const DDCTarget *target, int *index) {
+  if (index != NULL) {
+    *index = -1;
+  }
   io_iterator_t iter = 0;
   if (IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("DCPAVServiceProxy"),
                                    &iter) != KERN_SUCCESS) {
@@ -550,13 +673,8 @@ static IOAVServiceRef serviceMatching(const DDCTarget *target) {
       }
       CFRelease(location);
     }
-    io_registry_entry_t parent = MACH_PORT_NULL;
-    if (IORegistryEntryGetParentEntry(service, kIOServicePlane, &parent) == KERN_SUCCESS) {
-      io_name_t name;
-      if (IORegistryEntryGetName(parent, name) == KERN_SUCCESS) {
-        ddcPortName(name, ':', c.port, sizeof(c.port));
-      }
-      IOObjectRelease(parent);
+    if (c.external && count < 8) {
+      inheritFramebuffer(service, &c);
     }
     IOAVServiceRef av = NULL;
     if (c.external && count < 8) {
@@ -567,20 +685,21 @@ static IOAVServiceRef serviceMatching(const DDCTarget *target) {
       continue;
     }
     CFDataRef edid = NULL;
-    if (IOAVServiceCopyEDID(av, &edid) != 0 || edid == NULL ||
-        CFDataGetLength(edid) < 16) {
-      if (edid != NULL) {
-        CFRelease(edid);
-      }
+    BOOL haveEdid = IOAVServiceCopyEDID(av, &edid) == 0 && edid != NULL && CFDataGetLength(edid) >= 16;
+    if (haveEdid) {
+      const uint8_t *bytes = CFDataGetBytePtr(edid);
+      c.vendor = (uint32_t)((bytes[8] << 8) | bytes[9]);
+      c.product = (uint32_t)(bytes[10] | (bytes[11] << 8));
+      c.serial = (uint32_t)(bytes[12] | (bytes[13] << 8) | (bytes[14] << 16) |
+                            ((uint32_t)bytes[15] << 24));
+    }
+    if (edid != NULL) {
+      CFRelease(edid);
+    }
+    if (!haveEdid && c.product == 0 && c.location[0] == '\0') {
       CFRelease(av);
       continue;
     }
-    const uint8_t *bytes = CFDataGetBytePtr(edid);
-    c.vendor = (uint32_t)((bytes[8] << 8) | bytes[9]);
-    c.product = (uint32_t)(bytes[10] | (bytes[11] << 8));
-    c.serial = (uint32_t)(bytes[12] | (bytes[13] << 8) | (bytes[14] << 16) |
-                          ((uint32_t)bytes[15] << 24));
-    CFRelease(edid);
     services[count] = av;
     candidates[count] = c;
     count++;
@@ -591,6 +710,9 @@ static IOAVServiceRef serviceMatching(const DDCTarget *target) {
     if (i != pick) {
       CFRelease(services[i]);
     }
+  }
+  if (pick >= 0 && index != NULL) {
+    *index = pick;
   }
   return pick >= 0 ? services[pick] : NULL;
 }
@@ -616,17 +738,25 @@ static void ddcWaitAfterWrite(void) {
   }
 }
 
-static BOOL ddcReadOnce(IOAVServiceRef service, int *current, int *max) {
+static BOOL ddcWriteRead(IOAVServiceRef service, const uint8_t *request, int requestLen,
+                         uint8_t *reply, int replyLen) {
   ddcWaitAfterWrite();
-  uint8_t request[4] = {0x82, 0x01, 0x10, 0};
-  request[3] = (uint8_t)(0x6E ^ request[0] ^ request[1] ^ request[2]);
-  if (IOAVServiceWriteI2C(service, 0x37, 0x51, request, 4) != 0) {
+  if (IOAVServiceWriteI2C(service, 0x37, 0x51, (void *)request, (uint32_t)requestLen) != 0) {
     return NO;
   }
+  if (reply == NULL || replyLen <= 0) {
+    return YES;
+  }
   usleep(50000);
+  return IOAVServiceReadI2C(service, 0x37, 0, reply, (uint32_t)replyLen) == 0;
+}
+
+static BOOL ddcReadOnce(IOAVServiceRef service, int *current, int *max) {
+  uint8_t request[4] = {0x82, 0x01, 0x10, 0};
+  request[3] = (uint8_t)(0x6E ^ request[0] ^ request[1] ^ request[2]);
   uint8_t reply[11];
   memset(reply, 0, sizeof(reply));
-  if (IOAVServiceReadI2C(service, 0x37, 0, reply, 11) != 0) {
+  if (!ddcWriteRead(service, request, 4, reply, 11)) {
     return NO;
   }
   if ((reply[0] != 0x6E && reply[0] != 0x6e) || reply[2] != 0x02 || reply[3] != 0x00 ||
@@ -648,6 +778,34 @@ static BOOL ddcReadOnce(IOAVServiceRef service, int *current, int *max) {
   *current = currentValue;
   *max = maxValue;
   return YES;
+}
+
+// Capabilities (0xF3) or any checksum-valid VCP frame. withDataAddress uses
+// the write-style checksum seed (0x6E ^ 0x51); the other uses the read seed.
+static BOOL ddcCapabilitiesOnce(IOAVServiceRef service, int withDataAddress) {
+  uint8_t request[5] = {0x83, 0xF3, 0x00, 0x00, 0};
+  uint8_t seed = 0x6E;
+  if (withDataAddress) {
+    seed = (uint8_t)(0x6E ^ 0x51);
+  }
+  request[4] = (uint8_t)(seed ^ request[0] ^ request[1] ^ request[2] ^ request[3]);
+  uint8_t reply[64];
+  memset(reply, 0, sizeof(reply));
+  if (!ddcWriteRead(service, request, 5, reply, (int)sizeof(reply))) {
+    return NO;
+  }
+  return nsDDCFrameValid(reply, (int)sizeof(reply));
+}
+
+static BOOL ddcVCPFrameOnce(IOAVServiceRef service) {
+  uint8_t request[4] = {0x82, 0x01, 0x10, 0};
+  request[3] = (uint8_t)(0x6E ^ request[0] ^ request[1] ^ request[2]);
+  uint8_t reply[11];
+  memset(reply, 0, sizeof(reply));
+  if (!ddcWriteRead(service, request, 4, reply, 11)) {
+    return NO;
+  }
+  return nsDDCFrameValid(reply, 11);
 }
 
 // Brightness for a display that waits for the current probe to land
@@ -884,6 +1042,7 @@ static BOOL displayWasRestored(uint32_t display);
 // without the panel moving.
 static bool ddcProbeRead(void *ctx, int *current, int *max);
 static bool ddcProbeWrite(void *ctx, int value);
+static bool ddcProbeFramed(void *ctx);
 
 BOOL setDisplayBrightness(uint32_t display, long percent);
 
@@ -990,6 +1149,79 @@ static void revalidateDDC(uint32_t display, IOAVServiceRef service, int current,
   }
 }
 
+typedef struct {
+  IOAVServiceRef service;
+  int fallbackCurrent;
+  int fallbackMax;
+} DDCProbeCtx;
+
+typedef struct {
+  uint32_t display;
+  int service;
+  int verdict;
+  int evidence;
+} DDCDebugRow;
+
+static DDCDebugRow gDDCDebug[8];
+static int gDDCDebugCount = 0;
+
+static BOOL ddcDebugOn(void) {
+  static int enabled = -1;
+  if (enabled < 0) {
+    const char *flag = getenv("NIGHTSHIFT_DDC_DEBUG");
+    enabled = (flag != NULL && flag[0] != '\0' && strcmp(flag, "0") != 0) ? 1 : 0;
+  }
+  return enabled == 1;
+}
+
+static void ddcNoteDebug(uint32_t display, int service, int verdict, int evidence) {
+  int slot = -1;
+  for (int i = 0; i < gDDCDebugCount; i++) {
+    if (gDDCDebug[i].display == display) {
+      slot = i;
+      break;
+    }
+  }
+  if (slot < 0) {
+    if (gDDCDebugCount >= 8) {
+      return;
+    }
+    slot = gDDCDebugCount++;
+  }
+  gDDCDebug[slot].display = display;
+  gDDCDebug[slot].service = service;
+  gDDCDebug[slot].verdict = verdict;
+  gDDCDebug[slot].evidence = evidence;
+  if (!ddcDebugOn()) {
+    return;
+  }
+  char line[64];
+  if (nsDDCDebugLine(display, service, verdict, evidence, line, sizeof(line))) {
+    fprintf(stderr, "%s\n", line);
+  }
+}
+
+int ddcCopyDebug(char *out, int cap) {
+  if (out == NULL || cap <= 0) {
+    return 0;
+  }
+  out[0] = '\0';
+  int used = 0;
+  for (int i = 0; i < gDDCDebugCount; i++) {
+    char line[64];
+    if (!nsDDCDebugLine(gDDCDebug[i].display, gDDCDebug[i].service, gDDCDebug[i].verdict,
+                        gDDCDebug[i].evidence, line, sizeof(line))) {
+      continue;
+    }
+    int wrote = snprintf(out + used, (size_t)(cap - used), "%s\n", line);
+    if (wrote < 0 || used + wrote >= cap) {
+      break;
+    }
+    used += wrote;
+  }
+  return gDDCDebugCount;
+}
+
 void probeDDC(void) {
   if (gDDCBusy) {
     gDDCAgain = YES;
@@ -1004,6 +1236,25 @@ void probeDDC(void) {
   gDDCBusy = YES;
   gDDCLast = CFAbsoluteTimeGetCurrent();
   DDCSnapshot seen = ddcSnapshot();
+  // Last-known slider percent, captured on the main thread. The probe uses
+  // it only when a framed reply proves the link and brightness cannot be read.
+  typedef struct {
+    uint32_t display;
+    int percent;
+  } DDCFallback;
+  DDCFallback fallbacks[16];
+  int fallbackCount = 0;
+  {
+    uint32_t idsNow[16];
+    int nowCount = orderedDisplays(idsNow, 16);
+    for (int i = 0; i < nowCount && fallbackCount < 16; i++) {
+      long remembered = rememberedBrightness(idsNow[i]);
+      fallbacks[fallbackCount].display = idsNow[i];
+      fallbacks[fallbackCount].percent =
+          (remembered >= 1 && remembered <= 100) ? (int)remembered : -1;
+      fallbackCount++;
+    }
+  }
   // On the DDC queue so probe reads can't overlap a lamp write.
   dispatch_async(ddcQueue(), ^{
     uint32_t ids[16];
@@ -1030,7 +1281,7 @@ void probeDDC(void) {
           t->serialShared = YES;
         }
       }
-      displayPort(ids[i], t->vendor, t->model, t->port, sizeof(t->port));
+      displayPipe(ids[i], t->port, sizeof(t->port), t->location, sizeof(t->location));
       targets[pending] = ids[i];
       pending++;
     }
@@ -1038,31 +1289,58 @@ void probeDDC(void) {
       uint32_t display;
       int current;
       int max;
+      int serviceIndex;
+      int evidence;
       IOAVServiceRef service;
     } DDCResult;
     DDCResult *results = pending > 0 ? calloc((size_t)pending, sizeof(DDCResult)) : NULL;
     for (int i = 0; i < pending; i++) {
-      IOAVServiceRef service = serviceMatching(&wanted[i]);
+      int serviceIndex = -1;
+      IOAVServiceRef service = serviceMatching(&wanted[i], &serviceIndex);
       results[i].display = targets[i];
       results[i].service = service;
+      results[i].serviceIndex = service == NULL ? -1 : serviceIndex;
+      results[i].evidence = service == NULL ? kNSDDCEvidenceNoService : kNSDDCEvidenceNone;
       results[i].current = 0;
       results[i].max = -1;
-      // A readable VCP is not control. Nudge the panel and require the next
-      // raw read to come back as that value. Wake, replug and a screen
-      // change all come through here, so a monitor is not trusted forever
-      // from the first launch.
+      // A readable VCP is not control by itself. A landed readback is. When
+      // brightness reads fail, a checksum-valid capabilities or VCP frame
+      // plus a write of the last-known level is. A write with no frame is not.
+      // Wake, replug and a screen change all come through here.
       if (service != NULL) {
+        int percent = -1;
+        for (int f = 0; f < fallbackCount; f++) {
+          if (fallbacks[f].display == targets[i]) {
+            percent = fallbacks[f].percent;
+            break;
+          }
+        }
+        DDCProbeCtx ctx;
+        ctx.service = service;
+        ctx.fallbackCurrent = percent > 0 ? percent : 0;
+        ctx.fallbackMax = percent > 0 ? 100 : 0;
         int current = 0;
         int max = 0;
-        NSDDCProbeIO io = {ddcProbeRead, ddcProbeWrite, (void *)service};
+        NSDDCProbeIO io;
+        memset(&io, 0, sizeof(io));
+        io.read = ddcProbeRead;
+        io.write = ddcProbeWrite;
+        io.framed = ddcProbeFramed;
+        io.ctx = &ctx;
+        io.fallbackCurrent = ctx.fallbackCurrent;
+        io.fallbackMax = ctx.fallbackMax;
         if (nsDDCProbeControl(&io, &current, &max) == kNSDDCProbeControllable && max > 0) {
           results[i].current = current;
           results[i].max = max;
         }
+        results[i].evidence = io.evidence;
       }
     }
     dispatch_async(dispatch_get_main_queue(), ^{
       for (int i = 0; i < pending; i++) {
+        int verdict =
+            results[i].max > 0 ? kNSDDCProbeControllable : kNSDDCProbeSoftware;
+        ddcNoteDebug(results[i].display, results[i].serviceIndex, verdict, results[i].evidence);
         // A write confirmed or moved this channel while the probe was out, so
         // these reads are stale. Publishing them would reset current and
         // posted and drop queued writes. The result owns its service.
@@ -1099,8 +1377,8 @@ void probeDDC(void) {
           }
           continue;
         }
-        // Unchanged readback, or the read/write failed: software dimming
-        // only. Drop the service so later slider moves do not write DDC.
+        // No proof the panel answers DDC, or the readback did not move.
+        // Drop the service so later slider moves do not write DDC.
         long shown = rememberedBrightness(results[i].display);
         BOOL wasReady = snapshotReady(&seen, results[i].display);
         if (results[i].service != NULL) {
@@ -1171,12 +1449,12 @@ static BOOL ddcWriteOnce(IOAVServiceRef service, int value) {
 }
 
 static bool ddcProbeRead(void *ctx, int *current, int *max) {
-  IOAVServiceRef service = (IOAVServiceRef)ctx;
+  DDCProbeCtx *probe = ctx;
   for (int attempt = 0; attempt < 4; attempt++) {
     if (attempt > 0) {
       usleep(kDDCBetweenReads);
     }
-    if (ddcReadOnce(service, current, max)) {
+    if (ddcReadOnce(probe->service, current, max)) {
       return true;
     }
   }
@@ -1184,7 +1462,21 @@ static bool ddcProbeRead(void *ctx, int *current, int *max) {
 }
 
 static bool ddcProbeWrite(void *ctx, int value) {
-  return ddcWriteOnce((IOAVServiceRef)ctx, value) ? true : false;
+  DDCProbeCtx *probe = ctx;
+  return ddcWriteOnce(probe->service, value) ? true : false;
+}
+
+static bool ddcProbeFramed(void *ctx) {
+  DDCProbeCtx *probe = ctx;
+  for (int n = 0; n < 3; n++) {
+    if (ddcCapabilitiesOnce(probe->service, n == 0 ? 1 : 0)) {
+      return true;
+    }
+    if (ddcVCPFrameOnce(probe->service)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 static BOOL ddcCommit(DDCSlot *slot, int current, int max) {

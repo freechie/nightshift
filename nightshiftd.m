@@ -1507,6 +1507,16 @@ static BOOL handleControl(const char *buf, int fd) {
     dprintf(fd, "%s\n", on ? "on" : "off");
     return YES;
   }
+  if (strcmp(buf, "ddc") == 0) {
+    char text[512];
+    ddcCopyDebug(text, (int)sizeof(text));
+    if (text[0] == '\0') {
+      dprintf(fd, "ddc\n");
+    } else {
+      dprintf(fd, "%s", text);
+    }
+    return YES;
+  }
   if (strcmp(buf, "brightness") == 0) {
     uint32_t ids[16];
     int count = orderedDisplays(ids, 16);
@@ -4413,7 +4423,7 @@ static void displayKind(uint32_t display, NSString **text, NSColor **color) {
     *text = @"Built-in backlight";
     *color = NSColor.secondaryLabelColor;
   } else if (ddcReady(display)) {
-    // Only after the write/readback probe passed. A bare VCP read is not this.
+    // After a landed readback, or a framed DDC reply with a write. Not a bare write.
     *text = [NSString stringWithUTF8String:nsDDCControlLabel(kNSDDCProbeControllable)];
     *color = NSColor.systemGreenColor;
   } else if (ddcPending(display) || ddcUnconfirmed(display)) {
