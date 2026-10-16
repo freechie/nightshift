@@ -1,9 +1,16 @@
 // Unit tests for NightshiftLogic. Plain C so it also builds off macOS:
 //   cc -x c -std=c11 -I. tests/logic.m -x c NightshiftLogic.m -lm
+#if !defined(__APPLE__) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L  // mkdtemp under -std=c11 on glibc
+#endif
+
 #include "NightshiftLogic.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 static int gFailures = 0;
 static int gChecks = 0;
@@ -72,380 +79,6 @@ static void checkRamp(void) {
   CHECK_EQ(nsDefaultFullAt(1260, 1260, -1, 120), -1);
 }
 
-static DDCCandidate candidate(uint32_t vendor, uint32_t product, uint32_t serial, bool external,
-                              const char *port) {
-  DDCCandidate c;
-  memset(&c, 0, sizeof(c));
-  c.vendor = vendor;
-  c.product = product;
-  c.serial = serial;
-  c.external = external;
-  strncpy(c.port, port, sizeof(c.port) - 1);
-  return c;
-}
-
-static DDCTarget target(uint32_t vendor, uint32_t model, uint32_t serial, const char *port,
-                        int twins, bool serialShared) {
-  DDCTarget t;
-  memset(&t, 0, sizeof(t));
-  t.vendor = vendor;
-  t.model = model;
-  t.serial = serial;
-  strncpy(t.port, port, sizeof(t.port) - 1);
-  t.twins = twins;
-  t.serialShared = serialShared;
-  return t;
-}
-
-static void checkMatching(void) {
-  enum { BNQ = 0x09D1, DEL = 0x10AC };
-  char out[32];
-  CHECK(nsDDCPortName("dispext0@88000000", '@', out, sizeof(out)));
-  CHECK(strcmp(out, "dispext0") == 0);
-  CHECK(nsDDCPortName("dispext1:dcpav-service-epic:0", ':', out, sizeof(out)));
-  CHECK(strcmp(out, "dispext1") == 0);
-  CHECK(!nsDDCPortName("dcp@0", '@', out, sizeof(out)));
-  CHECK(out[0] == '\0');
-  CHECK(!nsDDCPortName("", '@', out, sizeof(out)));
-  char tiny[4];
-  CHECK(!nsDDCPortName("dispext0@1", '@', tiny, sizeof(tiny)));
-
-  // One BenQ, one built-in: the only external candidate of that model.
-  DDCCandidate one[] = {candidate(BNQ, 0x8032, 0, true, "dispext0"),
-                        candidate(0x0610, 0xA050, 0, false, "disp0")};
-  DDCTarget benq = target(BNQ, 0x8032, 0, "", 1, false);
-  CHECK_EQ(nsDDCPickCandidate(one, 2, &benq), 0);
-  // Never matches the internal panel or another brand.
-  DDCTarget other = target(DEL, 0x8032, 0, "", 1, false);
-  CHECK_EQ(nsDDCPickCandidate(one, 2, &other), -1);
-  // Unknown vendor still matches by model when that is unique.
-  DDCTarget unknownVendor = target(0xFFFFFFFFu, 0x8032, 0, "", 1, false);
-  CHECK_EQ(nsDDCPickCandidate(one, 2, &unknownVendor), 0);
-
-  // Two identical BenQs: the port decides, and a serial that disagrees with
-  // the port's candidate makes it ambiguous.
-  DDCCandidate twins[] = {candidate(BNQ, 0x8032, 111, true, "dispext0"),
-                          candidate(BNQ, 0x8032, 222, true, "dispext1")};
-  DDCTarget second = target(BNQ, 0x8032, 222, "dispext1", 2, false);
-  CHECK_EQ(nsDDCPickCandidate(twins, 2, &second), 1);
-  DDCTarget crossed = target(BNQ, 0x8032, 111, "dispext1", 2, false);
-  CHECK_EQ(nsDDCPickCandidate(twins, 2, &crossed), -1);
-  // No port: serial decides unless another twin shares it.
-  DDCTarget bySerial = target(BNQ, 0x8032, 111, "", 2, false);
-  CHECK_EQ(nsDDCPickCandidate(twins, 2, &bySerial), 0);
-  DDCTarget sharedSerial = target(BNQ, 0x8032, 111, "", 2, true);
-  CHECK_EQ(nsDDCPickCandidate(twins, 2, &sharedSerial), -1);
-  // No port, no serial, two twins: ambiguous, use the shade.
-  DDCTarget blind = target(BNQ, 0x8032, 0, "", 2, false);
-  CHECK_EQ(nsDDCPickCandidate(twins, 2, &blind), -1);
-  // A model seen once but with a twin online (its service missing) is not
-  // a safe guess either.
-  DDCTarget oneVisible = target(BNQ, 0x8032, 0, "", 2, false);
-  CHECK_EQ(nsDDCPickCandidate(one, 2, &oneVisible), -1);
-  CHECK_EQ(nsDDCPickCandidate(NULL, 0, &benq), -1);
-  CHECK_EQ(nsDDCPickCandidate(one, 2, NULL), -1);
-
-  // Framebuffer paths. A USB-C HDMI adapter can rewrite vendor and product.
-  // The pipe path still names the display, and only a unique path binds.
-  const char *benqPath = "IOService:/arm-io/AppleT600xIO/dispext0@88000000/AppleCLCD2";
-  const char *acerPath = "IOService:/arm-io/AppleT600xIO/dispext1@90000000/AppleCLCD2";
-  const char *benqTail = "dispext0@88000000/AppleCLCD2";
-  CHECK(nsDDCLocationSame(benqPath, benqPath));
-  CHECK(nsDDCLocationSame(benqPath, benqTail));
-  CHECK(nsDDCLocationSame(benqTail, benqPath));
-  CHECK(!nsDDCLocationSame("", benqPath));
-  CHECK(!nsDDCLocationSame("dispext0", "dispext0"));
-  CHECK(!nsDDCLocationSame(benqPath, acerPath));
-
-  DDCCandidate adapted[2];
-  adapted[0] = candidate(0x0AC8, 0x0001, 0, true, "");
-  adapted[1] = candidate(0x0AC8, 0x0001, 0, true, "");
-  strncpy(adapted[0].location, benqPath, sizeof(adapted[0].location) - 1);
-  strncpy(adapted[1].location, acerPath, sizeof(adapted[1].location) - 1);
-  DDCTarget benqPipe = target(BNQ, 0x8032, 0, "", 1, false);
-  strncpy(benqPipe.location, benqTail, sizeof(benqPipe.location) - 1);
-  DDCTarget acerPipe = target(0x04E7, 0x2720, 0, "", 1, false);
-  strncpy(acerPipe.location, acerPath, sizeof(acerPipe.location) - 1);
-  CHECK_EQ(nsDDCPickCandidate(adapted, 2, &benqPipe), 0);
-  CHECK_EQ(nsDDCPickCandidate(adapted, 2, &acerPipe), 1);
-  // The other monitor's path is not a fallback when the product was rewritten.
-  DDCTarget missingPipe = target(BNQ, 0x8032, 0, "", 1, false);
-  strncpy(missingPipe.location, "IOService:/arm-io/dispext2@1/AppleCLCD2",
-          sizeof(missingPipe.location) - 1);
-  CHECK_EQ(nsDDCPickCandidate(adapted, 2, &missingPipe), -1);
-  // The same tail on two services is ambiguous. Do not pick one.
-  DDCCandidate twinsPath[2];
-  twinsPath[0] = candidate(BNQ, 0x8032, 0, true, "dispext0");
-  twinsPath[1] = candidate(BNQ, 0x8032, 0, true, "dispext1");
-  strncpy(twinsPath[0].location, "IOService:/a/dispext0@1/AppleCLCD2",
-          sizeof(twinsPath[0].location) - 1);
-  strncpy(twinsPath[1].location, "IOService:/b/dispext0@1/AppleCLCD2",
-          sizeof(twinsPath[1].location) - 1);
-  DDCTarget sharedTail = target(BNQ, 0x8032, 0, "", 2, false);
-  strncpy(sharedTail.location, benqTail, sizeof(sharedTail.location) - 1);
-  // benqTail is dispext0@..., not dispext0@1. Use the shared tail.
-  strncpy(sharedTail.location, "dispext0@1/AppleCLCD2", sizeof(sharedTail.location) - 1);
-  CHECK_EQ(nsDDCPickCandidate(twinsPath, 2, &sharedTail), -1);
-  // No service recorded a path: product matching still applies.
-  DDCTarget locatedBenq = target(BNQ, 0x8032, 0, "", 1, false);
-  strncpy(locatedBenq.location, benqPath, sizeof(locatedBenq.location) - 1);
-  CHECK_EQ(nsDDCPickCandidate(one, 2, &locatedBenq), 0);
-  // An internal panel that happens to carry the path is not the external link.
-  DDCCandidate internalPipe[1];
-  internalPipe[0] = candidate(BNQ, 0x8032, 0, false, "disp0");
-  strncpy(internalPipe[0].location, benqPath, sizeof(internalPipe[0].location) - 1);
-  CHECK_EQ(nsDDCPickCandidate(internalPipe, 1, &benqPipe), -1);
-}
-
-static int m1ddcProxy(const char **path, const char **name, const char **location, int count,
-                      const char *displayLocation) {
-  NSDDCM1ddcWalk walk;
-  nsDDCM1ddcWalkInit(&walk);
-  for (int i = 0; i < count; i++) {
-    if (nsDDCM1ddcWalkTake(&walk, path[i], name[i], location[i], displayLocation)) {
-      return i;
-    }
-  }
-  return -1;
-}
-
-static void checkM1ddcWalk(void) {
-  // One dcpext, two External proxies attached to the same framebuffer.
-  // The old pick treats every attached proxy as the display and will not
-  // choose. The walk opens only the proxy after IODisplayLocation.
-  const char *fbDual = "IOService:/dcpext0/dispext0/AppleCLCD2";
-  const char *proxyBefore = "IOService:/dcpext0/DCPAVServiceProxy";
-  const char *proxyAfter = "IOService:/dcpext0/dispext0/DCPAVServiceProxy";
-  DDCCandidate attached[2];
-  attached[0] = candidate(0x09D1, 0x8032, 0, true, "dispext0");
-  attached[1] = candidate(0x09D1, 0x8032, 0, true, "dispext0");
-  strncpy(attached[0].location, fbDual, sizeof(attached[0].location) - 1);
-  strncpy(attached[1].location, fbDual, sizeof(attached[1].location) - 1);
-  DDCTarget dual = target(0x09D1, 0x8032, 0, "dispext0", 1, false);
-  strncpy(dual.location, fbDual, sizeof(dual.location) - 1);
-  CHECK_EQ(nsDDCPickCandidate(attached, 2, &dual), -1);
-  const char *dualPath[] = {proxyBefore, fbDual, proxyAfter};
-  const char *dualName[] = {"DCPAVServiceProxy", "AppleCLCD2", "DCPAVServiceProxy"};
-  const char *dualLoc[] = {"External", NULL, "External"};
-  CHECK_EQ(m1ddcProxy(dualPath, dualName, dualLoc, 3, fbDual), 2);
-  CHECK(strcmp(dualPath[2], proxyAfter) == 0);
-
-  const char *fb1 = "IOService:/dcpext1/dispext1/AppleCLCD2";
-  const char *proxy1 = "IOService:/dcpext1/dispext1/DCPAVServiceProxy";
-  const char *path[] = {proxyBefore, fbDual, proxyAfter, fb1, proxy1};
-  const char *name[] = {"DCPAVServiceProxy", "AppleCLCD2", "DCPAVServiceProxy", "AppleCLCD2",
-                        "DCPAVServiceProxy"};
-  const char *location[] = {"External", NULL, "External", NULL, "External"};
-  CHECK_EQ(m1ddcProxy(path, name, location, 5, fb1), 4);
-
-  const char *after[] = {fbDual, "IOService:/dcpext0/p0", "IOService:/dcpext0/p1",
-                         "IOService:/dcpext0/p2", "IOService:/dcpext0/p3"};
-  const char *afterName[] = {"AppleCLCD2", "DCPAVServiceProxy", "DCPAVServiceProxy", "DCPAVServiceProxy",
-                             "DCPAVServiceProxy"};
-  const char *afterLoc[] = {NULL, NULL, "", "Internal", "External"};
-  CHECK_EQ(m1ddcProxy(after, afterName, afterLoc, 5, fbDual), 4);
-  CHECK_EQ(m1ddcProxy(after, afterName, afterLoc, 5, NULL), -1);
-}
-
-static void checkSlots(void) {
-  uint32_t slots[4] = {0, 0, 0, 0};
-  CHECK_EQ(nsDDCSlotFor(slots, 4, 7), 0);
-  slots[0] = 5;
-  slots[1] = 7;
-  CHECK_EQ(nsDDCSlotFor(slots, 4, 7), 1);
-  // Finding 9: slot 0 freed while display 7 still owns slot 1. The probe
-  // must reuse slot 1, not make a second slot for 7 in slot 0.
-  slots[0] = 0;
-  CHECK_EQ(nsDDCSlotFor(slots, 4, 7), 1);
-  CHECK_EQ(nsDDCSlotFor(slots, 4, 9), 0);
-  uint32_t full[2] = {1, 2};
-  CHECK_EQ(nsDDCSlotFor(full, 2, 3), -1);
-  CHECK_EQ(nsDDCSlotFor(full, 2, 2), 1);
-  CHECK_EQ(nsDDCSlotFor(slots, 4, 0), -1);
-}
-
-static void checkReadback(void) {
-  CHECK_EQ(nsDDCValue(50, 100), 50);
-  CHECK_EQ(nsDDCValue(50, 255), 128);
-  CHECK_EQ(nsDDCValue(-5, 100), 0);
-  CHECK_EQ(nsDDCValue(150, 100), 100);
-  CHECK_EQ(nsDDCRawPercent(128, 255), 50);
-  CHECK_EQ(nsDDCRawPercent(10, 0), 0);
-  CHECK_EQ(nsDDCRawPercent(300, 255), 100);
-  CHECK(nsDDCNear(52, 50, 100));
-  CHECK(!nsDDCNear(56, 50, 100));
-  CHECK(nsDDCNear(3, 1, 10));  // tolerance is at least 2
-
-  // Lamp at 70, asked for 0, a settled reading says it stopped at 20: floor.
-  CHECK_EQ(nsDDCLearnFloor(-1, 70, 0, 20, 100, 0, true), 20);
-  // Finding 3: same write, but the reply still shows the old 70 (stale).
-  // That is not a floor.
-  CHECK_EQ(nsDDCLearnFloor(-1, 70, 0, 70, 100, 0, true), -1);
-  // A stale reading that is far above a low target is not learned either.
-  CHECK_EQ(nsDDCLearnFloor(-1, 70, 10, 70, 100, 10, true), -1);
-  // A first reading that the second read didn't confirm is not learned.
-  CHECK_EQ(nsDDCLearnFloor(-1, 70, 0, 20, 100, 0, false), -1);
-  // Asked for 10, the lamp moved down but stopped at 25: floor 25.
-  CHECK_EQ(nsDDCLearnFloor(-1, 80, 10, 25, 100, 10, true), 25);
-  // A higher stop never raises a known floor.
-  CHECK_EQ(nsDDCLearnFloor(20, 80, 0, 30, 100, 0, true), 20);
-  // A lower stop lowers it.
-  CHECK_EQ(nsDDCLearnFloor(20, 80, 0, 15, 100, 0, true), 15);
-  // The lamp reached the target below the old floor: forget the floor, or
-  // record 0 when it went all the way down.
-  CHECK_EQ(nsDDCLearnFloor(20, 50, 10, 10, 100, 10, false), -1);
-  CHECK_EQ(nsDDCLearnFloor(20, 50, 0, 0, 100, 0, false), 0);
-  // Going up never touches the floor.
-  CHECK_EQ(nsDDCLearnFloor(20, 20, 60, 60, 100, 60, true), 20);
-  CHECK_EQ(nsDDCLearnFloor(-1, 20, 60, 80, 100, 60, true), -1);
-}
-
-static void checkSplit(void) {
-  long hw = -1;
-  long sw = -1;
-  nsCombinedLevels(100, 20, &hw, &sw);
-  CHECK_EQ(hw, 100);
-  CHECK_EQ(sw, 100);
-  nsCombinedLevels(50, 20, &hw, &sw);
-  CHECK_EQ(hw, 20);
-  CHECK_EQ(sw, 100);
-  nsCombinedLevels(75, 20, &hw, &sw);
-  CHECK_EQ(hw, 60);
-  CHECK_EQ(sw, 100);
-  nsCombinedLevels(75, -1, &hw, &sw);
-  CHECK_EQ(hw, 50);
-  // Finding 1: below the switch the lamp stays at its floor and the overlay
-  // never goes below kNSShadeFloor until 0.
-  nsCombinedLevels(49, 20, &hw, &sw);
-  CHECK_EQ(hw, 20);
-  CHECK(sw > 90 && sw <= 100);
-  nsCombinedLevels(1, 20, &hw, &sw);
-  CHECK_EQ(hw, 20);
-  CHECK_EQ(sw, kNSShadeFloor + 1);
-  nsCombinedLevels(0, 20, &hw, &sw);
-  CHECK_EQ(hw, 20);
-  CHECK_EQ(sw, 0);
-  long last = -1;
-  for (long p = 1; p <= 100; p++) {
-    nsCombinedLevels(p, 30, &hw, &sw);
-    CHECK(sw >= kNSShadeFloor);
-    CHECK(sw <= 100 && hw >= 30 && hw <= 100);
-    long light = hw * sw;  // rough total light: never goes down as p rises
-    CHECK(light >= last);
-    last = light;
-  }
-  nsCombinedLevels(130, 0, &hw, &sw);
-  CHECK_EQ(hw, 100);
-
-  CHECK_EQ(nsLampToCombined(20, 20), 50);
-  CHECK_EQ(nsLampToCombined(100, 20), 100);
-  CHECK_EQ(nsLampToCombined(5, 20), 50);
-  CHECK_EQ(nsLampToCombined(60, 20), 75);
-  CHECK_EQ(nsLampToCombined(50, 100), 50);
-  // The lamp part of a percent round-trips.
-  for (long p = 50; p <= 100; p++) {
-    nsCombinedLevels(p, 0, &hw, &sw);
-    CHECK_EQ(nsLampToCombined(hw, 0), p);
-  }
-}
-
-static void checkSafety(void) {
-  CHECK_EQ(nsSteppedPercent(50, 1, 16), 56);
-  CHECK_EQ(nsSteppedPercent(50, -1, 16), 44);
-  CHECK_EQ(nsSteppedPercent(6, -1, 16), 0);
-  CHECK_EQ(nsSteppedPercent(0, -1, 16), 0);
-  CHECK_EQ(nsSteppedPercent(100, 1, 16), 100);
-  CHECK_EQ(nsSteppedPercent(1, -1, 16), 0);
-  CHECK_EQ(nsSteppedPercent(99, 1, 16), 100);
-
-  // Finding 1: an external display alone can't go black.
-  CHECK_EQ(nsSafeBrightness(0, false, 0), 1);
-  CHECK_EQ(nsSafeBrightness(-4, false, 0), 1);
-  // With another lit display it can.
-  CHECK_EQ(nsSafeBrightness(0, false, 1), 0);
-  // The built-in panel keeps macOS behaviour.
-  CHECK_EQ(nsSafeBrightness(0, true, 0), 0);
-  CHECK_EQ(nsSafeBrightness(37, false, 0), 37);
-  CHECK_EQ(nsSafeBrightness(140, false, 0), 100);
-
-  // N9: revalidation keeps, reapplies or adopts.
-  CHECK_EQ(nsRevalidateAction(70, 70, 100, -1, 1), kNSRevalidateKeep);
-  CHECK_EQ(nsRevalidateAction(71, 70, 100, -1, 1), kNSRevalidateKeep);
-  CHECK_EQ(nsRevalidateAction(70, 70, 0, -1, 1), kNSRevalidateKeep);
-  // Just woke, far off: the monitor reset itself.
-  CHECK_EQ(nsRevalidateAction(100, 40, 100, 3600, 2), kNSRevalidateReapply);
-  CHECK_EQ(nsRevalidateAction(15, 40, 100, -1, 2), kNSRevalidateReapply);
-  CHECK_EQ(nsRevalidateAction(50, 25, 100, -1, 29), kNSRevalidateReapply);
-  // Just woke, a little off: adopted.
-  CHECK_EQ(nsRevalidateAction(55, 40, 100, 3600, 2), kNSRevalidateAdopt);
-  // A screen change long after wake: the monitor's buttons moved it.
-  CHECK_EQ(nsRevalidateAction(100, 40, 100, 3600, 3600), kNSRevalidateAdopt);
-  CHECK_EQ(nsRevalidateAction(100, 40, 100, 3600, -1), kNSRevalidateAdopt);
-  CHECK_EQ(nsRevalidateAction(100, 40, 100, -1, 30), kNSRevalidateAdopt);
-  // Never right after the user changed it, even just after wake.
-  CHECK_EQ(nsRevalidateAction(100, 40, 100, 0, 2), kNSRevalidateKeep);
-  CHECK_EQ(nsRevalidateAction(100, 40, 100, 9.9, 3600), kNSRevalidateKeep);
-  CHECK_EQ(nsRevalidateAction(100, 40, 100, 10, 3600), kNSRevalidateAdopt);
-  // Raw values on another scale.
-  CHECK_EQ(nsRevalidateAction(255, 64, 255, -1, 1), kNSRevalidateReapply);
-  CHECK_EQ(nsRevalidateAction(80, 64, 255, -1, 1), kNSRevalidateAdopt);
-
-  // N6: what counts as another lit display.
-  {
-    NSOtherDisplay builtinOn = {.builtin = true, .percent = 40};
-    NSOtherDisplay builtinUnread = {.builtin = true, .percent = -1};
-    NSOtherDisplay builtinZero = {.builtin = true, .percent = 0};
-    NSOtherDisplay ddcOn = {.hardware = true, .percent = 30};
-    NSOtherDisplay ddcBlack = {.hardware = true, .percent = 0};
-    NSOtherDisplay hardwareUnread = {.hardware = true, .percent = -1};
-    // A dummy plug, virtual or DisplayLink display: only the shade's value.
-    NSOtherDisplay shadeOnly = {.percent = 100};
-    NSOtherDisplay unreadable = {.percent = -1};
-    NSOtherDisplay asleep = {.hardware = true, .asleep = true, .percent = 80};
-    NSOtherDisplay mirror = {.hardware = true, .mirrored = true, .percent = 80};
-    NSOtherDisplay builtinAsleep = {.builtin = true, .asleep = true, .percent = 80};
-    CHECK(nsCountsAsLit(builtinOn));
-    CHECK(nsCountsAsLit(builtinUnread));
-    CHECK(!nsCountsAsLit(builtinZero));
-    CHECK(nsCountsAsLit(ddcOn));
-    CHECK(!nsCountsAsLit(ddcBlack));
-    CHECK(!nsCountsAsLit(hardwareUnread));
-    CHECK(!nsCountsAsLit(shadeOnly));
-    CHECK(!nsCountsAsLit(unreadable));
-    CHECK(!nsCountsAsLit(asleep));
-    CHECK(!nsCountsAsLit(mirror));
-    CHECK(!nsCountsAsLit(builtinAsleep));
-    NSOtherDisplay dummyPlugSetup[] = {shadeOnly, unreadable};
-    CHECK_EQ(nsLitDisplays(dummyPlugSetup, 2), 0);
-    // So with only a dummy plug beside it, the monitor can't go black.
-    CHECK_EQ(nsSafeBrightness(0, false, nsLitDisplays(dummyPlugSetup, 2)), 1);
-    NSOtherDisplay mixed[] = {shadeOnly, ddcOn, builtinOn, ddcBlack, asleep};
-    CHECK_EQ(nsLitDisplays(mixed, 5), 2);
-    CHECK_EQ(nsSafeBrightness(0, false, nsLitDisplays(mixed, 5)), 0);
-    CHECK_EQ(nsLitDisplays(NULL, 3), 0);
-  }
-
-  CHECK_EQ(nsPersistedBrightness(0), 1);
-  CHECK_EQ(nsPersistedBrightness(1), 1);
-  CHECK_EQ(nsPersistedBrightness(64), 64);
-  CHECK_EQ(nsRestoredBrightness(0), kNSRestoreMinimum);
-  CHECK_EQ(nsRestoredBrightness(1), kNSRestoreMinimum);
-  CHECK_EQ(nsRestoredBrightness(kNSRestoreMinimum), kNSRestoreMinimum);
-  CHECK_EQ(nsRestoredBrightness(64), 64);
-
-  // A key press down from the dimmest visible level on the only display
-  // asks for 0 and gets 1 again: the screen stays visible however often the
-  // key is pressed.
-  long percent = 1;
-  for (int i = 0; i < 5; i++) {
-    percent = nsSafeBrightness(nsSteppedPercent(percent, -1, 16), false, 0);
-    CHECK_EQ(percent, 1);
-  }
-  long hw = 0;
-  long sw = 0;
-  nsCombinedLevels(percent, 25, &hw, &sw);
-  CHECK(sw >= kNSShadeFloor);
-}
 
 // Cmd+F1 / Cmd+F2: the Current slider, five percent at a time, clamped
 // to 0...100. F1 lowers, F2 raises.
@@ -744,8 +377,8 @@ static void checkWorkspaceOpens(void) {
   CHECK(!nsWorkspaceOpenAllowed(embedded, sizeof embedded - 1, false));
 }
 
-// Media keys: only brightness is Nightshift's; volume, mute and the rest
-// must be told apart so the key tap hands them back to macOS.
+// Media keys: the brightness keys carry the Command warmth chord; volume,
+// mute and the rest must be told apart so the key tap hands them back.
 static void checkMediaKeys(void) {
   struct {
     int code;
@@ -781,8 +414,9 @@ static void checkMediaKeys(void) {
 }
 
 // fnState off: Cmd+F1/F2 arrive as brightness media keys. Command alone
-// follows the intensity hotkey. No Command stays brightness. Command plus
-// any other chord modifier is not taken.
+// follows the intensity hotkey. No Command is plain brightness, which the
+// tap hands back to macOS. Command plus any other chord modifier is not
+// taken.
 static long mediaData(int code, int state, int repeat) {
   return ((long)code << 16) | ((long)state << 8) | (long)(repeat & 0xFF);
 }
@@ -926,838 +560,120 @@ static void checkTapRecovery(void) {
 }
 
 // A pretend panel. sticky reads ignore writes (a cached brightness). echo
-// reads return savedPercent and ignore the panel (the UI's saved number).
-typedef struct {
-  int panel;
-  int max;
-  int savedPercent;
-  bool sticky;
-  bool echoSaved;
-  bool failRead;
-  bool failWrite;
-  bool failSecondRead;
-  int confirmLag;  // confirmation reads that still report held
-  int held;
-  int failFirst;  // the first N reads fail, later ones work
-  bool framed;
-  bool overran;
-  bool hangAfterWrite;
-  bool idleReply;
-  int framedCalls;
-  int reads;
-  int writes;
-  int written[4];
-} ProbePanel;
-
-static bool probeRead(void *ctx, int *current, int *max) {
-  ProbePanel *panel = ctx;
-  panel->reads++;
-  if (panel->failRead || panel->reads <= panel->failFirst) {
+static bool writeFile(const char *dir, const char *name, const char *text) {
+  char path[1024];
+  snprintf(path, sizeof(path), "%s/%s", dir, name);
+  FILE *file = fopen(path, "w");
+  if (file == NULL) {
     return false;
   }
-  if (panel->failSecondRead && panel->writes > 0) {
+  bool ok = fputs(text, file) >= 0;
+  return fclose(file) == 0 && ok;
+}
+
+static bool fileIs(const char *dir, const char *name, const char *want) {
+  char path[1024];
+  snprintf(path, sizeof(path), "%s/%s", dir, name);
+  FILE *file = fopen(path, "r");
+  if (file == NULL) {
     return false;
   }
-  if (panel->max <= 0) {
-    return false;
-  }
-  *max = panel->max;
-  // echoSaved is the UI's saved percent, not the panel. sticky leaves the
-  // panel where the first read found it. confirmLag is a slow panel: the
-  // first confirmation reads still show the pre-write value.
-  if (panel->writes > 0 && panel->confirmLag > 0) {
-    panel->confirmLag--;
-    *current = panel->held;
-  } else {
-    *current = panel->echoSaved ? panel->savedPercent : panel->panel;
-  }
-  return *current >= 0 && *current <= *max;
+  char got[256];
+  size_t used = fread(got, 1, sizeof(got) - 1, file);
+  fclose(file);
+  got[used] = '\0';
+  return strcmp(got, want) == 0;
 }
 
-static bool probeFramed(void *ctx) {
-  ProbePanel *panel = ctx;
-  panel->framedCalls++;
-  return panel->framed;
-}
+// A support folder left by a build that still had brightness: per-display
+// brightness in "brightness" and a collapsed "brightness" menu section.
+// Warmth (max, full) must load from it unchanged, the old section name must
+// drop out, and the next save must succeed without touching the old file.
+static void checkOldBrightnessSettings(void) {
+  char dir[] = "/tmp/nightshift-logic-XXXXXX";
+  CHECK(mkdtemp(dir) != NULL);
+  const char *oldBrightness = "1552 41001 0 55\n610 41159 16843009 30 combined\n";
+  CHECK(writeFile(dir, "max", "40\n"));
+  CHECK(writeFile(dir, "full", "1260\n"));
+  CHECK(writeFile(dir, "brightness", oldBrightness));
+  CHECK(writeFile(dir, "sections", "appearance\nbrightness\nramp\n"));
+  char maxPath[1024];
+  char fullPath[1024];
+  char brightPath[1024];
+  snprintf(maxPath, sizeof(maxPath), "%s/max", dir);
+  snprintf(fullPath, sizeof(fullPath), "%s/full", dir);
+  snprintf(brightPath, sizeof(brightPath), "%s/brightness", dir);
 
-static bool probeBudget(void *ctx) {
-  ProbePanel *panel = ctx;
-  return !panel->overran;
-}
+  long max = -1;
+  long full = -1;
+  CHECK(nsReadSavedNumber(maxPath, 1, 100, &max));
+  CHECK_EQ(max, 40);
+  CHECK(nsReadSavedNumber(fullPath, 0, 1439, &full));
+  CHECK_EQ(full, 1260);
+  // The brightness file is not a warmth number and is never taken as one.
+  long stray = -1;
+  CHECK(!nsReadSavedNumber(brightPath, 1, 100, &stray));
+  CHECK_EQ(stray, -1);
 
-static bool probeIdle(void *ctx) {
-  ProbePanel *panel = ctx;
-  return panel->idleReply;
-}
+  CHECK(nsSectionKept("ramp"));
+  CHECK(nsSectionKept("appearance"));
+  CHECK(!nsSectionKept("brightness"));
+  CHECK(!nsSectionKept(""));
+  CHECK(!nsSectionKept(NULL));
 
-static bool probeFramedOverrun(void *ctx) {
-  ProbePanel *panel = ctx;
-  panel->framedCalls++;
-  panel->overran = true;
-  return false;
-}
-
-static bool probeReadConfirmOverrun(void *ctx, int *current, int *max) {
-  ProbePanel *panel = ctx;
-  panel->reads++;
-  if (panel->writes > 0) {
-    panel->overran = true;
-    return false;
-  }
-  *current = panel->panel;
-  *max = panel->max;
-  return true;
-}
-
-static bool probeWrite(void *ctx, int value) {
-  ProbePanel *panel = ctx;
-  if (panel->writes < 4) {
-    panel->written[panel->writes] = value;
-  }
-  panel->writes++;
-  if (panel->failWrite) {
-    return false;
-  }
-  if (!panel->sticky && !panel->echoSaved) {
-    panel->panel = value;
-  }
-  // The value landed, then the call timed out. Later writes still apply.
-  if (panel->hangAfterWrite && panel->writes == 1) {
-    panel->overran = true;
-  }
-  return true;
-}
-
-static ProbePanel probePanel(int panel, int max) {
-  ProbePanel p;
-  memset(&p, 0, sizeof(p));
-  p.panel = panel;
-  p.max = max;
-  return p;
-}
-
-static void checkProbe(void) {
-  // Two raw steps when they fit; one when they don't; none on an empty scale.
-  CHECK_EQ(nsDDCProbeTarget(42, 100), 44);
-  CHECK_EQ(nsDDCProbeTarget(0, 100), 2);
-  CHECK_EQ(nsDDCProbeTarget(100, 100), 98);
-  CHECK_EQ(nsDDCProbeTarget(99, 100), 97);
-  CHECK_EQ(nsDDCProbeTarget(0, 1), 1);
-  CHECK_EQ(nsDDCProbeTarget(1, 1), 0);
-  CHECK_EQ(nsDDCProbeTarget(42, 0), -1);
-  CHECK_EQ(nsDDCProbeTarget(-1, 100), -1);
-
-  // The second read must be the written value. A cached 42 is "near" 44 on
-  // this scale (tolerance 5) and must still fail.
-  CHECK(nsDDCNear(42, 44, 100));
-  CHECK(!nsDDCProbeLanded(42, 44, 42));
-  CHECK(nsDDCProbeLanded(42, 44, 44));
-  CHECK(!nsDDCProbeLanded(42, 44, 43));
-  CHECK(!nsDDCProbeLanded(42, 42, 42));
-  // Minimum tolerance is 2, so a two-step nudge is still "near" the old value.
-  CHECK(nsDDCNear(100, 102, 255));
-  CHECK(!nsDDCProbeLanded(100, 102, 100));
-  CHECK(nsDDCProbeLanded(100, 102, 102));
-
-  ProbePanel live = probePanel(42, 100);
-  int current = -1;
-  int max = -1;
-  NSDDCProbeIO io;
-  memset(&io, 0, sizeof(io));
-  io.read = probeRead;
-  io.write = probeWrite;
-  io.ctx = &live;
-  CHECK_EQ(nsDDCProbeControl(&io, &current, &max), kNSDDCProbeControllable);
-  CHECK_EQ(current, 42);
-  CHECK_EQ(max, 100);
-  CHECK_EQ(live.panel, 42);  // original written back
-  CHECK_EQ(live.writes, 2);
-  CHECK_EQ(live.written[0], 44);
-  CHECK_EQ(live.written[1], 42);
-  CHECK_EQ(live.reads, 2);
-
-  // The first confirmation read is still the old value. A later read shows
-  // the write, so the panel is controllable and the original is restored.
-  ProbePanel slow = probePanel(42, 100);
-  slow.confirmLag = 1;
-  slow.held = 42;
-  io.ctx = &slow;
-  CHECK_EQ(nsDDCProbeControl(&io, &current, &max), kNSDDCProbeControllable);
-  CHECK_EQ(slow.reads, 3);
-  CHECK_EQ(slow.written[0], 44);
-  CHECK_EQ(slow.written[1], 42);
-  CHECK_EQ(slow.panel, 42);
-  CHECK_EQ(slow.confirmLag, 0);
-
-  // Every confirmation read stays at 42. Retrying must not turn that into a pass.
-  ProbePanel stuck = probePanel(42, 100);
-  stuck.sticky = true;
-  stuck.confirmLag = 4;
-  stuck.held = 42;
-  io.ctx = &stuck;
-  CHECK_EQ(nsDDCProbeControl(&io, &current, &max), kNSDDCProbeSoftware);
-  CHECK_EQ(stuck.reads, 5);
-  CHECK_EQ(stuck.panel, 42);
-  CHECK(strcmp(nsDDCControlLabel(kNSDDCProbeControllable), "DDC/CI connected") == 0);
-  long hw = -1;
-  long sw = -1;
-  long combinedHw = 0;
-  long combinedSw = 0;
-  nsExternalBrightness(kNSDDCProbeControllable, 76, 0, &hw, &sw);
-  nsCombinedLevels(76, 0, &combinedHw, &combinedSw);
-  CHECK_EQ(hw, combinedHw);
-  CHECK_EQ(sw, combinedSw);
-  CHECK(hw > 0 && sw == 100);
-  nsExternalBrightness(kNSDDCProbeControllable, 56, 20, &hw, &sw);
-  nsCombinedLevels(56, 20, &combinedHw, &combinedSw);
-  CHECK_EQ(hw, combinedHw);
-  CHECK_EQ(sw, combinedSw);
-  nsExternalBrightness(kNSDDCProbeControllable, 40, 20, &hw, &sw);
-  nsCombinedLevels(40, 20, &combinedHw, &combinedSw);
-  CHECK_EQ(hw, combinedHw);
-  CHECK_EQ(sw, combinedSw);
-  CHECK(sw < 100);
-  // The DDC path is the combined model at every sample, including the
-  // software-dim curve's sample points. A floor still changes the split.
-  const long samples[] = {0, 25, 50, 75, 100};
-  for (int i = 0; i < 5; i++) {
-    long sample = samples[i];
-    nsExternalBrightness(kNSDDCProbeControllable, sample, 0, &hw, &sw);
-    nsCombinedLevels(sample, 0, &combinedHw, &combinedSw);
-    CHECK_EQ(hw, combinedHw);
-    CHECK_EQ(sw, combinedSw);
-    nsExternalBrightness(kNSDDCProbeControllable, sample, 20, &hw, &sw);
-    nsCombinedLevels(sample, 20, &combinedHw, &combinedSw);
-    CHECK_EQ(hw, combinedHw);
-    CHECK_EQ(sw, combinedSw);
-  }
-
-  // Readback stays at 42. nsDDCNear would accept it; the probe must not.
-  ProbePanel cached = probePanel(42, 100);
-  cached.sticky = true;
-  current = 99;
-  max = 99;
-  io.ctx = &cached;
-  CHECK_EQ(nsDDCProbeControl(&io, &current, &max), kNSDDCProbeSoftware);
-  CHECK_EQ(cached.panel, 42);
-  CHECK_EQ(cached.writes, 2);
-  CHECK_EQ(cached.written[0], 44);
-  CHECK_EQ(cached.written[1], 42);
-  CHECK(strcmp(nsDDCControlLabel(kNSDDCProbeSoftware), "Software dimming") == 0);
-  CHECK(strcmp(nsDDCControlLabel(kNSDDCProbeSoftware), "DDC/CI connected") != 0);
-  // p^(1/2.2), rounded. 50 is 73, brighter than a linear 50. Ends stay put.
-  CHECK_EQ(nsSoftwareDimShade(0), 0);
-  CHECK_EQ(nsSoftwareDimShade(25), 53);
-  CHECK_EQ(nsSoftwareDimShade(50), 73);
-  CHECK_EQ(nsSoftwareDimShade(75), 88);
-  CHECK_EQ(nsSoftwareDimShade(100), 100);
-  CHECK(nsSoftwareDimShade(50) > 50);
-  long prevShade = 0;
-  for (long percent = 0; percent <= 100; percent += 1) {
-    long shade = nsSoftwareDimShade(percent);
-    nsExternalBrightness(kNSDDCProbeSoftware, percent, 20, &hw, &sw);
-    CHECK_EQ(hw, -1);
-    CHECK_EQ(sw, shade);
-    CHECK(sw >= prevShade);
-    if (percent > 0 && percent < 100) {
-      CHECK(sw > percent);
-    }
-    // The floor is a backlight idea. Software dimming ignores it.
-    nsExternalBrightness(kNSDDCProbeSoftware, percent, 0, &hw, &sw);
-    CHECK_EQ(hw, -1);
-    CHECK_EQ(sw, shade);
-    prevShade = shade;
-  }
-  nsExternalBrightness(kNSDDCProbeSoftware, -5, 20, &hw, &sw);
-  CHECK_EQ(hw, -1);
-  CHECK_EQ(sw, 0);
-  nsExternalBrightness(kNSDDCProbeSoftware, 130, 20, &hw, &sw);
-  CHECK_EQ(hw, -1);
-  CHECK_EQ(sw, 100);
-  // Above the combined switch is still the curve, not a backlight write.
-  nsExternalBrightness(kNSDDCProbeSoftware, 76, 0, &hw, &sw);
-  CHECK_EQ(hw, -1);
-  CHECK_EQ(sw, 88);
-  CHECK(sw > 76);
-  nsExternalBrightness(kNSDDCProbeSoftware, 56, 0, &hw, &sw);
-  CHECK_EQ(hw, -1);
-  CHECK_EQ(sw, 77);
-  CHECK(sw > 56);
-
-  // The number the UI saved (76) is not a panel read. Writing 78 and reading
-  // 76 again is a miss, even though 76 is what listing displays would show.
-  ProbePanel saved = probePanel(42, 100);
-  saved.echoSaved = true;
-  saved.savedPercent = 76;
-  io.ctx = &saved;
-  CHECK_EQ(nsDDCProbeControl(&io, &current, &max), kNSDDCProbeSoftware);
-  CHECK_EQ(saved.writes, 2);
-  CHECK_EQ(saved.written[0], 78);
-  CHECK_EQ(saved.written[1], 76);
-  CHECK_EQ(saved.panel, 42);
-
-  ProbePanel deadRead = probePanel(42, 100);
-  deadRead.failRead = true;
-  io.ctx = &deadRead;
-  CHECK_EQ(nsDDCProbeControl(&io, &current, &max), kNSDDCProbeSoftware);
-  CHECK_EQ(deadRead.writes, 0);
-  CHECK(strcmp(nsDDCControlLabel(kNSDDCProbeSoftware), "DDC/CI connected") != 0);
-
-  ProbePanel deadWrite = probePanel(42, 100);
-  deadWrite.failWrite = true;
-  io.ctx = &deadWrite;
-  CHECK_EQ(nsDDCProbeControl(&io, &current, &max), kNSDDCProbeSoftware);
-  CHECK_EQ(deadWrite.writes, 1);
-  CHECK_EQ(deadWrite.panel, 42);
-
-  ProbePanel deadSecond = probePanel(50, 100);
-  deadSecond.failSecondRead = true;
-  io.ctx = &deadSecond;
-  CHECK_EQ(nsDDCProbeControl(&io, &current, &max), kNSDDCProbeSoftware);
-  CHECK_EQ(deadSecond.writes, 2);
-  CHECK_EQ(deadSecond.written[1], 50);
-  CHECK_EQ(deadSecond.panel, 50);
-
-  ProbePanel top = probePanel(100, 100);
-  io.ctx = &top;
-  CHECK_EQ(nsDDCProbeControl(&io, &current, &max), kNSDDCProbeControllable);
-  CHECK_EQ(top.written[0], 98);
-  CHECK_EQ(top.written[1], 100);
-  CHECK_EQ(top.panel, 100);
-  CHECK_EQ(current, 100);
-
-  ProbePanel wide = probePanel(100, 255);
-  io.ctx = &wide;
-  CHECK_EQ(nsDDCProbeControl(&io, &current, &max), kNSDDCProbeControllable);
-  CHECK_EQ(wide.written[0], 102);
-  CHECK_EQ(wide.panel, 100);
-  CHECK_EQ(max, 255);
-
-  io.ctx = NULL;
-  io.read = NULL;
-  CHECK_EQ(nsDDCProbeControl(NULL, &current, &max), kNSDDCProbeSoftware);
-  CHECK_EQ(nsDDCProbeControl(&io, NULL, NULL), kNSDDCProbeSoftware);
-  ProbePanel empty = probePanel(0, 0);
-  io.read = probeRead;
-  io.write = probeWrite;
-  io.ctx = &empty;
-  CHECK_EQ(nsDDCProbeControl(&io, &current, &max), kNSDDCProbeSoftware);
-  CHECK_EQ(empty.writes, 0);
-
-  // The first brightness reads fail; a later one is the panel. Still DDC.
-  ProbePanel late = probePanel(42, 100);
-  late.failFirst = 2;
-  io.ctx = &late;
-  io.framed = probeFramed;
-  late.framed = true;
-  CHECK_EQ(nsDDCProbeControl(&io, &current, &max), kNSDDCProbeControllable);
-  CHECK_EQ(late.reads, 4);
-  CHECK_EQ(late.framedCalls, 0);
-  CHECK_EQ(late.written[0], 44);
-  CHECK_EQ(late.written[1], 42);
-  CHECK_EQ(io.evidence, kNSDDCEvidenceRead);
-  CHECK_EQ(current, 42);
-  CHECK_EQ(max, 100);
-
-  // Brightness reads fail, a capabilities/VCP frame is valid, and the write
-  // path accepts the last-known value. That is DDC, not software dimming.
-  ProbePanel linked = probePanel(42, 100);
-  linked.failRead = true;
-  linked.framed = true;
-  io.ctx = &linked;
-  io.framed = probeFramed;
-  io.fallbackCurrent = 40;
-  io.fallbackMax = 100;
-  current = -1;
+  // The next save works, round-trips, is owner-only, and leaves the rest.
+  CHECK(nsWriteSavedNumber(maxPath, 45));
   max = -1;
-  CHECK_EQ(nsDDCProbeControl(&io, &current, &max), kNSDDCProbeControllable);
-  CHECK_EQ(linked.writes, 1);
-  CHECK_EQ(linked.written[0], 40);
-  CHECK_EQ(linked.framedCalls, 1);
-  CHECK_EQ(current, 40);
-  CHECK_EQ(max, 100);
-  CHECK_EQ(io.evidence, kNSDDCEvidenceFramed);
-  nsExternalBrightness(kNSDDCProbeControllable, 40, 0, &hw, &sw);
-  nsCombinedLevels(40, 0, &combinedHw, &combinedSw);
-  CHECK_EQ(hw, combinedHw);
-  CHECK_EQ(sw, combinedSw);
+  CHECK(nsReadSavedNumber(maxPath, 1, 100, &max));
+  CHECK_EQ(max, 45);
+  CHECK(fileIs(dir, "max", "45\n"));
+  struct stat info;
+  CHECK(stat(maxPath, &info) == 0 && (info.st_mode & 0777) == 0600);
+  CHECK(nsWriteSavedNumber(fullPath, 1290));
+  CHECK(nsReadSavedNumber(fullPath, 0, 1439, &full));
+  CHECK_EQ(full, 1290);
+  CHECK(fileIs(dir, "brightness", oldBrightness));
 
-  // No last-known level: keep full scale, not black.
-  ProbePanel linkedFull = probePanel(10, 100);
-  linkedFull.failRead = true;
-  linkedFull.framed = true;
-  io.ctx = &linkedFull;
-  io.fallbackCurrent = 0;
-  io.fallbackMax = 0;
-  CHECK_EQ(nsDDCProbeControl(&io, &current, &max), kNSDDCProbeControllable);
-  CHECK_EQ(current, 100);
-  CHECK_EQ(max, 100);
-  CHECK_EQ(linkedFull.written[0], 100);
-  CHECK_EQ(nsDDCProbeKeep(0, 0, NULL), 100);
-  int keptScale = 0;
-  CHECK_EQ(nsDDCProbeKeep(40, 100, &keptScale), 40);
-  CHECK_EQ(keptScale, 100);
-  CHECK_EQ(nsDDCProbeKeep(0, 100, &keptScale), 100);
+  // Malformed and out-of-range values are refused, never half-read.
+  CHECK(writeFile(dir, "max", "0\n"));
+  CHECK(!nsReadSavedNumber(maxPath, 1, 100, &max));
+  CHECK(writeFile(dir, "max", "40 brightness\n"));
+  CHECK(!nsReadSavedNumber(maxPath, 1, 100, &max));
+  CHECK(!nsReadSavedNumber("/nonexistent/nightshift/max", 1, 100, &max));
+  CHECK(!nsWriteSavedNumber("/nonexistent/nightshift/max", 40));
 
-  // The frame is real but the write is refused. Stay on software dimming.
-  ProbePanel framedDead = probePanel(42, 100);
-  framedDead.failRead = true;
-  framedDead.framed = true;
-  framedDead.failWrite = true;
-  io.ctx = &framedDead;
-  io.fallbackCurrent = 40;
-  io.fallbackMax = 100;
-  CHECK_EQ(nsDDCProbeControl(&io, &current, &max), kNSDDCProbeSoftware);
-  CHECK_EQ(framedDead.writes, 1);
-  CHECK_EQ(io.evidence, kNSDDCEvidenceNone);
-  CHECK_EQ(current, 0);
-  CHECK_EQ(max, 0);
-
-  // Write would return success and brightness reads fail. No framed reply:
-  // that is not evidence, and the lamp is not written.
-  ProbePanel writeOnly = probePanel(42, 100);
-  writeOnly.failRead = true;
-  writeOnly.framed = false;
-  io.ctx = &writeOnly;
-  io.framed = probeFramed;
-  io.fallbackCurrent = 40;
-  io.fallbackMax = 100;
-  CHECK_EQ(nsDDCProbeControl(&io, &current, &max), kNSDDCProbeSoftware);
-  CHECK_EQ(writeOnly.writes, 0);
-  CHECK_EQ(writeOnly.framedCalls, 1);
-  CHECK_EQ(io.evidence, kNSDDCEvidenceWriteOnly);
-  CHECK_EQ(current, 0);
-  nsExternalBrightness(kNSDDCProbeSoftware, 50, 20, &hw, &sw);
-  CHECK_EQ(hw, -1);
-  CHECK_EQ(sw, 73);
-
-  // A stuck readback is negative evidence. A framed callback must not
-  // overturn it, and the software curve stays the one on main.
-  ProbePanel stuckFrame = probePanel(42, 100);
-  stuckFrame.sticky = true;
-  stuckFrame.framed = true;
-  io.ctx = &stuckFrame;
-  io.framed = probeFramed;
-  CHECK_EQ(nsDDCProbeControl(&io, &current, &max), kNSDDCProbeSoftware);
-  CHECK_EQ(stuckFrame.framedCalls, 0);
-  CHECK_EQ(io.evidence, kNSDDCEvidenceUnchanged);
-  CHECK_EQ(stuckFrame.panel, 42);
-  nsExternalBrightness(kNSDDCProbeSoftware, 50, 0, &hw, &sw);
-  CHECK_EQ(hw, -1);
-  CHECK_EQ(sw, nsSoftwareDimShade(50));
-
-  NSDDCProbeFacts readOk;
-  memset(&readOk, 0, sizeof(readOk));
-  readOk.evidence = kNSDDCEvidenceRead;
-  readOk.writeOk = true;
-  readOk.current = 42;
-  readOk.max = 100;
-  CHECK_EQ(nsDDCProbeDecide(&readOk, &current, &max), kNSDDCProbeControllable);
-  CHECK_EQ(current, 42);
-  CHECK_EQ(max, 100);
-
-  NSDDCProbeFacts framedFacts;
-  memset(&framedFacts, 0, sizeof(framedFacts));
-  framedFacts.evidence = kNSDDCEvidenceFramed;
-  framedFacts.writeOk = true;
-  framedFacts.fallbackCurrent = 40;
-  framedFacts.fallbackMax = 100;
-  CHECK_EQ(nsDDCProbeDecide(&framedFacts, &current, &max), kNSDDCProbeControllable);
-  CHECK_EQ(current, 40);
-  CHECK_EQ(max, 100);
-
-  NSDDCProbeFacts writeOnlyFacts;
-  memset(&writeOnlyFacts, 0, sizeof(writeOnlyFacts));
-  writeOnlyFacts.evidence = kNSDDCEvidenceWriteOnly;
-  writeOnlyFacts.writeOk = true;
-  writeOnlyFacts.fallbackCurrent = 40;
-  writeOnlyFacts.fallbackMax = 100;
-  CHECK_EQ(nsDDCProbeDecide(&writeOnlyFacts, &current, &max), kNSDDCProbeSoftware);
-  CHECK_EQ(current, 0);
-  CHECK_EQ(max, 0);
-  nsExternalBrightness(kNSDDCProbeSoftware, 25, 0, &hw, &sw);
-  CHECK_EQ(hw, -1);
-  CHECK_EQ(sw, nsSoftwareDimShade(25));
-
-  NSDDCProbeFacts nothing;
-  memset(&nothing, 0, sizeof(nothing));
-  nothing.evidence = kNSDDCEvidenceNone;
-  CHECK_EQ(nsDDCProbeDecide(&nothing, &current, &max), kNSDDCProbeSoftware);
-  NSDDCProbeFacts noService;
-  memset(&noService, 0, sizeof(noService));
-  noService.evidence = kNSDDCEvidenceNoService;
-  noService.writeOk = true;
-  CHECK_EQ(nsDDCProbeDecide(&noService, &current, &max), kNSDDCProbeSoftware);
-  NSDDCProbeFacts unchanged;
-  memset(&unchanged, 0, sizeof(unchanged));
-  unchanged.evidence = kNSDDCEvidenceUnchanged;
-  unchanged.writeOk = true;
-  unchanged.current = 42;
-  unchanged.max = 100;
-  CHECK_EQ(nsDDCProbeDecide(&unchanged, &current, &max), kNSDDCProbeSoftware);
-  framedFacts.writeOk = false;
-  CHECK_EQ(nsDDCProbeDecide(&framedFacts, &current, &max), kNSDDCProbeSoftware);
-  CHECK_EQ(nsDDCProbeDecide(NULL, &current, &max), kNSDDCProbeSoftware);
-
-  uint8_t vcp[11] = {0x6E, 0x88, 0x02, 0x00, 0x10, 0x00, 0x00, 100, 0x00, 42, 0};
-  uint8_t sum = 0x50;
-  for (int i = 0; i < 10; i++) {
-    sum ^= vcp[i];
+  const char *names[] = {"max", "full", "brightness", "sections"};
+  for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/%s", dir, names[i]);
+    unlink(path);
   }
-  vcp[10] = sum;
-  CHECK(nsDDCFrameValid(vcp, 11));
-  vcp[10] ^= 0xFF;
-  CHECK(!nsDDCFrameValid(vcp, 11));
-  uint8_t caps[8] = {0x6E, 0x86, 0xE3, 0x00, 0x00, '(', 'p', 0};
-  sum = 0x50;
-  for (int i = 0; i < 7; i++) {
-    sum ^= caps[i];
+  CHECK(rmdir(dir) == 0);
+}
+
+// The socket's commands after brightness came out. The removed brightness
+// commands, and anything unknown, get the clean "failed" reply.
+static void checkDaemonCommands(void) {
+  const char *gone[] = {"ddc", "brightness", "brightness 3 40", "brightness 3", "keys",
+                        "keys on", "", "bright", "statusx", "status ", "max", "ramp",
+                        "maxx 3", "schedulex", "dark-on", "DDC", "Brightness 1 2", "\x01"};
+  for (size_t i = 0; i < sizeof(gone) / sizeof(gone[0]); i++) {
+    CHECK_EQ(nsDaemonCommand(gone[i]), kNSCommandUnknown);
   }
-  caps[7] = sum;
-  CHECK(nsDDCFrameValid(caps, 8));
-  caps[2] = 0x00;
-  CHECK(!nsDDCFrameValid(caps, 8));
-  uint8_t garbage[11];
-  memset(garbage, 0, sizeof(garbage));
-  CHECK(!nsDDCFrameValid(garbage, 11));
-  CHECK(!nsDDCFrameValid(NULL, 11));
-
-  char line[64];
-  CHECK(nsDDCDebugLine(7, 1, kNSDDCProbeControllable, kNSDDCEvidenceRead, line, sizeof(line)));
-  CHECK(strcmp(line, "ddc 7 1 0 1") == 0);
-  CHECK(nsDDCDebugLine(9, -1, kNSDDCProbeSoftware, kNSDDCEvidenceNoService, line, sizeof(line)));
-  CHECK(strcmp(line, "ddc 9 -1 1 4") == 0);
-  CHECK(!nsDDCDebugLine(7, 1, 0, 1, line, 4));
-  CHECK(line[0] == '\0');
-  CHECK(!nsDDCDebugLine(7, 1, 3, 1, line, sizeof(line)));
-  CHECK(!nsDDCDebugLine(7, 1, 0, 9, line, sizeof(line)));
-  CHECK(nsDDCDebugLine(3, -1, kNSDDCProbeSoftware, kNSDDCEvidenceNotProbed, line, sizeof(line)));
-  CHECK(strcmp(line, "ddc 3 -1 1 6") == 0);
-  CHECK(nsDDCDebugLine(2, -1, kNSDDCProbeSoftware, kNSDDCEvidenceInFlight, line, sizeof(line)));
-  CHECK(strcmp(line, "ddc 2 -1 1 7") == 0);
-
-  // The 11-byte frame above is brightness 42 of 100 once the checksum is put
-  // back. Checksum seed is 0x50. A seed of 0x6E must not pass.
-  vcp[10] ^= 0xFF;
-  NSDDCReply decoded;
-  CHECK(nsDDCDecodeReply(vcp, 11, &decoded));
-  CHECK(decoded.brightness);
-  CHECK_EQ(decoded.current, 42);
-  CHECK_EQ(decoded.max, 100);
-  uint8_t wrongSeed[11];
-  memcpy(wrongSeed, vcp, 11);
-  wrongSeed[10] = 0x6E;
-  for (int i = 0; i < 10; i++) {
-    wrongSeed[10] ^= vcp[i];
-  }
-  CHECK(!nsDDCDecodeReply(wrongSeed, 11, &decoded));
-  CHECK(!decoded.valid);
-
-  // Length byte 0x88: the 0x80 flag is masked off (length 8, not 136) and
-  // the address byte is absent, which is what a shifted HDMI read looks like.
-  uint8_t shifted[10] = {0x88, 0x02, 0x00, 0x10, 0x00, 0x00, 100, 0x00, 42, 0};
-  sum = 0x50;
-  for (int i = 0; i < 9; i++) {
-    sum ^= shifted[i];
-  }
-  shifted[9] = sum;
-  CHECK(nsDDCDecodeReply(shifted, 10, &decoded));
-  CHECK(decoded.brightness);
-  CHECK_EQ(decoded.current, 42);
-  CHECK_EQ(decoded.max, 100);
-  CHECK(nsDDCFrameValid(shifted, 10));
-
-  // 0x89 is 0x80|9, so the checksum is inside the length. Masking is required.
-  uint8_t masked[11] = {0x6E, 0x89, 0x02, 0x00, 0x10, 0x00, 0x00, 100, 0x00, 42, 0};
-  sum = 0x50;
-  for (int i = 0; i < 10; i++) {
-    sum ^= masked[i];
-  }
-  masked[10] = sum;
-  CHECK(nsDDCDecodeReply(masked, 11, &decoded));
-  CHECK_EQ(decoded.current, 42);
-  CHECK_EQ(decoded.max, 100);
-
-  // A 12-byte read at data address 0x51 can echo 0x51 in the length byte.
-  // The checksum is 0x50 XOR every byte except the last.
-  uint8_t echoed[12] = {0x6E, 0x51, 0x02, 0x00, 0x10, 0x00, 0x00, 100, 0x00, 42, 0x00, 0};
-  sum = 0x50;
-  for (int i = 0; i < 11; i++) {
-    sum ^= echoed[i];
-  }
-  echoed[11] = sum;
-  CHECK(nsDDCDecodeReply(echoed, 12, &decoded));
-  CHECK(decoded.brightness);
-  CHECK_EQ(decoded.current, 42);
-  CHECK_EQ(decoded.max, 100);
-  echoed[11] ^= 0xFF;
-  CHECK(!nsDDCDecodeReply(echoed, 12, &decoded));
-
-  // A leading data-address byte is not part of the frame.
-  uint8_t prefixed[12];
-  prefixed[0] = 0x51;
-  memcpy(prefixed + 1, vcp, 11);
-  CHECK(nsDDCDecodeReply(prefixed, 12, &decoded));
-  CHECK(decoded.brightness);
-  CHECK_EQ(decoded.current, 42);
-  prefixed[1] = 0x6F;
-  sum = 0x50;
-  for (int i = 1; i < 11; i++) {
-    sum ^= prefixed[i];
-  }
-  prefixed[11] = sum;
-  CHECK(nsDDCDecodeReply(prefixed, 12, &decoded));
-  CHECK_EQ(decoded.current, 42);
-
-  NSDDCProbeFacts pendingFacts;
-  memset(&pendingFacts, 0, sizeof(pendingFacts));
-  pendingFacts.evidence = kNSDDCEvidenceNotProbed;
-  pendingFacts.writeOk = true;
-  CHECK_EQ(nsDDCProbeDecide(&pendingFacts, &current, &max), kNSDDCProbeSoftware);
-  pendingFacts.evidence = kNSDDCEvidenceInFlight;
-  CHECK_EQ(nsDDCProbeDecide(&pendingFacts, &current, &max), kNSDDCProbeSoftware);
-
-  uint32_t displays[3] = {1, 3, 2};
-  int builtin[3] = {1, 0, 0};
-  NSDDCDebugRow rows[2];
-  memset(rows, 0, sizeof(rows));
-  rows[0].display = 3;
-  rows[0].service = 0;
-  rows[0].verdict = kNSDDCProbeSoftware;
-  rows[0].evidence = kNSDDCEvidenceWriteOnly;
-  rows[1].display = 2;
-  rows[1].service = 1;
-  rows[1].verdict = kNSDDCProbeSoftware;
-  rows[1].evidence = kNSDDCEvidenceInFlight;
-  char report[128];
-  CHECK_EQ(nsDDCDebugReport(displays, builtin, 3, rows, 1, report, sizeof(report)), 2);
-  CHECK(strcmp(report, "ddc 3 0 1 3\nddc 2 -1 1 6\n") == 0);
-  CHECK_EQ(nsDDCDebugReport(displays, builtin, 3, rows, 2, report, sizeof(report)), 2);
-  CHECK(strcmp(report, "ddc 3 0 1 3\nddc 2 1 1 7\n") == 0);
-  CHECK_EQ(nsDDCDebugReport(NULL, NULL, 0, NULL, 0, report, sizeof(report)), 0);
-  CHECK(report[0] == '\0');
-
-  // Offset 0 first. 0x51 and 0x50 only after an empty offset-0 reply, and
-  // only while the display deadline still has time left.
-  CHECK_EQ(nsDDCNextReadOffset(0, kNSDDCOffsetEmpty, true), 0);
-  CHECK_EQ(nsDDCNextReadOffset(0, kNSDDCOffsetEmpty, false), -1);
-  CHECK_EQ(nsDDCNextReadOffset(1, kNSDDCOffsetEmpty, true), 0x51);
-  CHECK_EQ(nsDDCNextReadOffset(2, kNSDDCOffsetEmpty, true), 0x50);
-  CHECK_EQ(nsDDCNextReadOffset(3, kNSDDCOffsetEmpty, true), -1);
-  CHECK_EQ(nsDDCNextReadOffset(1, kNSDDCOffsetEmpty, false), -1);
-  CHECK_EQ(nsDDCNextReadOffset(1, kNSDDCOffsetTimedOut, true), -1);
-  CHECK_EQ(nsDDCNextReadOffset(1, kNSDDCOffsetFrame, true), -1);
-
-  CHECK(nsDDCDebugLine(3, 0, kNSDDCProbeSoftware, kNSDDCEvidenceTimedOut, line, sizeof(line)));
-  CHECK(strcmp(line, "ddc 3 0 1 8") == 0);
-
-  uint8_t zeros[12];
-  memset(zeros, 0, sizeof(zeros));
-  uint8_t nullMsg[12] = {0x6e, 0x80, 0xbe, 0, 0, 0, 0, 0, 0, 0, 0, 0};
-  CHECK(nsDDCNullMessage(nullMsg, 12));
-  CHECK(strcmp(nsDDCReplyReason(nullMsg, 12), "null") == 0);
-  CHECK(strcmp(nsDDCReplyReason(nullMsg, 12), "bad length") != 0);
-  CHECK(!nsDDCFrameValid(nullMsg, 12));
-  nullMsg[2] = 0x00;
-  CHECK(!nsDDCNullMessage(nullMsg, 12));
-  CHECK(strcmp(nsDDCReplyReason(nullMsg, 12), "bad length") == 0);
-  uint8_t getVcp[4];
-  nsDDCGetVCPRequest(0x10, getVcp);
-  CHECK_EQ(getVcp[0], 0x82);
-  CHECK_EQ(getVcp[1], 0x01);
-  CHECK_EQ(getVcp[2], 0x10);
-  CHECK_EQ(getVcp[3], 0xfd);
-  CHECK_EQ(getVcp[3], (uint8_t)(0x6E ^ 0x82 ^ 0x01 ^ 0x10));
-  // 0xac is 0x6E ^ 0x51 ^ 0x82 ^ 0x01 ^ 0x10, m1ddc's Set checksum, not the Get.
-  CHECK(getVcp[3] != 0xac);
-  CHECK(getVcp[1] != 0x03);
-  CHECK(strcmp(nsDDCReplyReason(zeros, 12), "all zeros") == 0);
-  CHECK(strcmp(nsDDCReplyReason(NULL, 0), "all zeros") == 0);
-  uint8_t first[12] = {0x00, 0x88, 0x02, 0x00, 0x10, 0, 0, 100, 0, 42, 0, 0};
-  CHECK(strcmp(nsDDCReplyReason(first, 12), "wrong first byte") == 0);
-  uint8_t badLen[12] = {0x6E, 0x01, 0x02, 0x00, 0x10, 0, 0, 100, 0, 42, 0, 0};
-  CHECK(strcmp(nsDDCReplyReason(badLen, 12), "bad length") == 0);
-  uint8_t summed[12] = {0x6E, 0x88, 0x02, 0x00, 0x10, 0x00, 0x00, 100, 0x00, 42, 0x00, 0};
-  uint8_t replySum = 0x50;
-  for (int i = 0; i < 11; i++) {
-    replySum ^= summed[i];
-  }
-  summed[11] = (uint8_t)(replySum ^ 0xFF);
-  CHECK(strcmp(nsDDCReplyReason(summed, 12), "checksum mismatch") == 0);
-  summed[11] = replySum;
-  summed[2] = 0x00;
-  replySum = 0x50;
-  for (int i = 0; i < 11; i++) {
-    replySum ^= summed[i];
-  }
-  summed[11] = replySum;
-  CHECK(strcmp(nsDDCReplyReason(summed, 12), "wrong opcode or VCP code") == 0);
-  uint8_t echoLen[12] = {0x6E, 0x51, 0x02, 0x00, 0x10, 0x00, 0x00, 100, 0x00, 42, 0x00, 0};
-  replySum = 0x50;
-  for (int i = 0; i < 11; i++) {
-    replySum ^= echoLen[i];
-  }
-  echoLen[11] = replySum;
-  CHECK(strcmp(nsDDCReplyReason(echoLen, 12), "ok") == 0);
-  char replyLine[160];
-  uint8_t outbound[5] = {0x51, 0x82, 0x01, 0x10, 0xfd};
-  CHECK(nsDDCReplyLine(3, kNSDDCIOCode, 0, kNSDDCIOCode, 0xe00002c7, zeros, 12, NULL, NULL, 0,
-                       replyLine, sizeof(replyLine)));
-  CHECK(strcmp(replyLine,
-               "ddc reply 3 0x0 0xe00002c7 all zeros 00 00 00 00 00 00 00 00 00 00 00 00 path=- out=-") ==
-        0);
-  CHECK(nsDDCReplyLine(2, kNSDDCIOTimeout, 0, kNSDDCIONone, 0, echoLen, 12,
-                       "IOService:/dispext0", outbound, 5, replyLine, sizeof(replyLine)));
-  char expectReply[256];
-  snprintf(expectReply, sizeof(expectReply),
-           "ddc reply 2 timeout none ok 6e 51 02 00 10 00 00 64 00 2a 00 %02x "
-           "path=IOService:/dispext0 out=51 82 01 10 fd",
-           echoLen[11]);
-  CHECK(strcmp(replyLine, expectReply) == 0);
-  rows[0].haveReply = true;
-  rows[0].writeState = kNSDDCIOCode;
-  rows[0].writeCode = 0;
-  rows[0].readState = kNSDDCIOCode;
-  rows[0].readCode = 0;
-  CHECK_EQ(nsDDCDebugReport(displays, builtin, 3, rows, 1, report, sizeof(report)), 3);
-  CHECK(strcmp(report,
-               "ddc 3 0 1 3\n"
-               "ddc reply 3 0x0 0x0 all zeros 00 00 00 00 00 00 00 00 00 00 00 00 path=- out=-\n"
-               "ddc 2 -1 1 6\n") == 0);
-
-  // Null or empty after the reads: not controllable, and no brightness Set.
-  ProbePanel busy = probePanel(30, 100);
-  busy.failRead = true;
-  busy.framed = true;
-  busy.idleReply = true;
-  io.ctx = &busy;
-  io.read = probeRead;
-  io.write = probeWrite;
-  io.framed = probeFramed;
-  io.idle = probeIdle;
-  io.budget = NULL;
-  io.fallbackCurrent = 0;
-  io.fallbackMax = 0;
-  CHECK_EQ(nsDDCProbeControl(&io, &current, &max), kNSDDCProbeSoftware);
-  CHECK_EQ(busy.writes, 0);
-  CHECK_EQ(busy.framedCalls, 0);
-  CHECK_EQ(current, 0);
-  CHECK_EQ(max, 0);
-  io.idle = NULL;
-
-  // A long service path makes two reply lines longer than 512 bytes. The
-  // report keeps both when the buffer can hold them.
-  {
-    char longPath[181];
-    memset(longPath, 'p', 180);
-    longPath[180] = '\0';
-    NSDDCDebugRow wide[2];
-    memset(wide, 0, sizeof(wide));
-    wide[0].display = 3;
-    wide[0].service = 0;
-    wide[0].verdict = kNSDDCProbeSoftware;
-    wide[0].evidence = kNSDDCEvidenceNone;
-    wide[0].haveReply = true;
-    wide[0].writeState = kNSDDCIOCode;
-    wide[0].readState = kNSDDCIOCode;
-    snprintf(wide[0].servicePath, sizeof(wide[0].servicePath), "IOService:/%s", longPath);
-    wide[1].display = 2;
-    wide[1].service = 1;
-    wide[1].verdict = kNSDDCProbeSoftware;
-    wide[1].evidence = kNSDDCEvidenceNone;
-    wide[1].haveReply = true;
-    wide[1].writeState = kNSDDCIOCode;
-    wide[1].readState = kNSDDCIOCode;
-    snprintf(wide[1].servicePath, sizeof(wide[1].servicePath), "IOService:/%s", longPath);
-    char big[4096];
-    char small[512];
-    CHECK(nsDDCDebugReport(displays, builtin, 3, wide, 2, big, sizeof(big)) == 4);
-    CHECK(strstr(big, "ddc reply 3 ") != NULL);
-    CHECK(strstr(big, "ddc reply 2 ") != NULL);
-    CHECK(nsDDCDebugReport(displays, builtin, 3, wide, 2, small, sizeof(small)) == -1);
-    CHECK(strstr(small, "ddc reply 2 ") == NULL);
-  }
-  NSDDCProbeFacts timed;
-  memset(&timed, 0, sizeof(timed));
-  timed.evidence = kNSDDCEvidenceTimedOut;
-  timed.writeOk = true;
-  timed.fallbackCurrent = 40;
-  timed.fallbackMax = 100;
-  CHECK_EQ(nsDDCProbeDecide(&timed, &current, &max), kNSDDCProbeSoftware);
-  CHECK_EQ(current, 0);
-  CHECK_EQ(max, 0);
-
-  // A read that does not return must not fall through into the full-scale
-  // keep write, even when a framed reply would otherwise allow it.
-  ProbePanel stalled = probePanel(42, 100);
-  io.ctx = &stalled;
-  io.read = probeRead;
-  io.write = probeWrite;
-  io.framed = probeFramed;
-  io.budget = probeBudget;
-  stalled.failRead = true;
-  stalled.framed = true;
-  stalled.overran = true;
-  io.fallbackCurrent = 0;
-  io.fallbackMax = 0;
-  current = 99;
-  max = 99;
-  CHECK_EQ(nsDDCProbeControl(&io, &current, &max), kNSDDCProbeSoftware);
-  CHECK_EQ(stalled.writes, 0);
-  CHECK_EQ(stalled.framedCalls, 0);
-  CHECK_EQ(io.evidence, kNSDDCEvidenceTimedOut);
-  CHECK_EQ(current, 0);
-  CHECK_EQ(max, 0);
-
-  // The read returned nothing, then the capabilities read overran. Still no
-  // brightness write, and the code is the timeout, not write-only.
-  ProbePanel lateHang = probePanel(42, 100);
-  lateHang.failRead = true;
-  io.ctx = &lateHang;
-  io.framed = probeFramedOverrun;
-  io.budget = probeBudget;
-  CHECK_EQ(nsDDCProbeControl(&io, &current, &max), kNSDDCProbeSoftware);
-  CHECK_EQ(lateHang.framedCalls, 1);
-  CHECK_EQ(lateHang.writes, 0);
-  CHECK_EQ(io.evidence, kNSDDCEvidenceTimedOut);
-
-  // Nudge went out, confirmation read overran: still put 42 back.
-  ProbePanel confirmHang = probePanel(42, 100);
-  io.ctx = &confirmHang;
-  io.read = probeReadConfirmOverrun;
-  io.framed = NULL;
-  io.budget = probeBudget;
-  CHECK_EQ(nsDDCProbeControl(&io, &current, &max), kNSDDCProbeSoftware);
-  CHECK_EQ(confirmHang.writes, 2);
-  CHECK_EQ(confirmHang.written[0], 44);
-  CHECK_EQ(confirmHang.written[1], 42);
-  CHECK_EQ(confirmHang.panel, 42);
-  CHECK_EQ(io.evidence, kNSDDCEvidenceTimedOut);
-
-  // No saved scale, so the probe writes full scale. The write lands and the
-  // call then times out. The level from before the probe is written back.
-  ProbePanel fullHang = probePanel(30, 100);
-  fullHang.failRead = true;
-  fullHang.framed = true;
-  fullHang.hangAfterWrite = true;
-  io.ctx = &fullHang;
-  io.read = probeRead;
-  io.write = probeWrite;
-  io.framed = probeFramed;
-  io.budget = probeBudget;
-  io.fallbackCurrent = 30;
-  io.fallbackMax = 0;
-  CHECK_EQ(nsDDCProbeControl(&io, &current, &max), kNSDDCProbeSoftware);
-  CHECK_EQ(fullHang.writes, 2);
-  CHECK_EQ(fullHang.written[0], 100);
-  CHECK_EQ(fullHang.written[1], 30);
-  CHECK_EQ(fullHang.panel, 30);
-  CHECK_EQ(io.evidence, kNSDDCEvidenceTimedOut);
-  io.budget = NULL;
-  io.read = probeRead;
-  io.framed = probeFramed;
-  io.fallbackCurrent = 0;
-  io.fallbackMax = 0;
+  CHECK_EQ(nsDaemonCommand(NULL), kNSCommandUnknown);
+  CHECK_EQ(nsDaemonCommand("status"), kNSCommandStatus);
+  CHECK_EQ(nsDaemonCommand("max 60"), kNSCommandMax);
+  CHECK_EQ(nsDaemonCommand("ramp 1230"), kNSCommandRamp);
+  CHECK_EQ(nsDaemonCommand("schedule"), kNSCommandSchedule);
+  CHECK_EQ(nsDaemonCommand("schedule custom"), kNSCommandSchedule);
+  CHECK_EQ(nsDaemonCommand("clock"), kNSCommandClock);
+  CHECK_EQ(nsDaemonCommand("clock 24"), kNSCommandClock);
+  CHECK_EQ(nsDaemonCommand("login on"), kNSCommandLogin);
+  CHECK_EQ(nsDaemonCommand("dark"), kNSCommandDark);
+  CHECK_EQ(nsDaemonCommand("tone off"), kNSCommandTone);
+  CHECK_EQ(nsDaemonCommand("40"), kNSCommandWarmth);
+  CHECK_EQ(nsDaemonCommand("0"), kNSCommandWarmth);
+  CHECK_EQ(nsDaemonCommand("-1"), kNSCommandWarmth);
 }
 
 int main(void) {
@@ -1765,14 +681,9 @@ int main(void) {
   checkMediaKeys();
   checkBrightnessChord();
   checkRamp();
-  checkMatching();
-  checkM1ddcWalk();
-  checkSlots();
-  checkReadback();
-  checkSplit();
-  checkSafety();
   checkCommandWarmth();
-  checkProbe();
+  checkOldBrightnessSettings();
+  checkDaemonCommands();
   checkHosts();
   checkWorkspaceOpens();
   if (gFailures != 0) {

@@ -94,7 +94,12 @@ reject "clock 13" "use 12 or 24" clock 13
 reject "login maybe" "use on or off" login maybe
 reject "dark maybe" "use on or off" dark maybe
 reject "tone maybe" "use on or off" tone maybe
-reject "brightness 3" "usage: nightshift" brightness 3
+# Brightness control was removed: these are unknown commands now, refused
+# with usage before anything reaches the daemon.
+reject "brightness" "usage: nightshift" brightness
+reject "brightness 3 40" "usage: nightshift" brightness 3 40
+reject "keys" "usage: nightshift" keys
+reject "ddc" "usage: nightshift" ddc
 
 # The install secret is read from stdin, never taken as an argument; these
 # are refused before anything is read or saved.
