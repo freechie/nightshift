@@ -15,9 +15,7 @@
 
 #import "NightShift.h"
 #import "NightshiftLogic.h"
-#import "NightshiftSessionTap.h"
 #import <AppKit/AppKit.h>
-#import <ApplicationServices/ApplicationServices.h>
 #import <Carbon/Carbon.h>
 #import <dlfcn.h>
 #include <stdatomic.h>
@@ -2059,20 +2057,6 @@ static BOOL openWorkspaceURL(NSString *text) {
   return page != nil && [[NSWorkspace sharedWorkspace] openURL:page];
 }
 
-static void openWarmthKeyAccess(void) {
-  for (NSWindow *window in NSApp.windows) {
-    if (window.isVisible && [window.identifier isEqualToString:@"NightshiftSettings"]) {
-      gSettingsKeepsOpenForOtherApp = YES;
-    }
-  }
-  [NSApp activate];
-  NSDictionary *options = @{(__bridge id)kAXTrustedCheckOptionPrompt : @YES};
-  AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)options);
-  openWorkspaceURL(@"x-apple.systempreferences:com.apple.settings."
-                   @"PrivacySecurity.extension?Privacy_Accessibility");
-  startWarmthKeys();
-}
-
 @implementation StatusPanel
 - (NSTextField *)valueLabel {
   NSTextField *value = [NSTextField labelWithString:@"0%"];
@@ -3017,7 +3001,6 @@ static const CGFloat kIconTileImage = 60;
 // Keyboard
 @property(nonatomic, strong) DotView *keysDot;
 @property(nonatomic, strong) NSTextField *keysStatus;
-@property(nonatomic, strong) NSButton *keysButton;
 // License
 @property(nonatomic, strong) DotView *licenseDot;
 @property(nonatomic, strong) NSTextField *licenseStatus;
@@ -3659,29 +3642,19 @@ static void hugControls(NSView *view) {
   [self addWords:@"Keyboard"];
   [self addWords:@"Warmth keys"];
 
-  self.keysButton = [NSButton buttonWithTitle:@"Open Accessibility Settings…"
-                                       target:nil
-                                       action:NULL];
-  self.keysButton.bezelStyle = NSBezelStyleRounded;
   DotView *dot = nil;
   NSTextField *status = nil;
   NSStackView *keysState = [self dot:&dot label:&status];
   self.keysDot = dot;
   self.keysStatus = status;
-  // The status and its button share the row, stacked at the trailing edge.
-  NSStackView *keysControl = [NSStackView stackViewWithViews:@[ keysState, self.keysButton ]];
-  keysControl.orientation = NSUserInterfaceLayoutOrientationVertical;
-  keysControl.alignment = NSLayoutAttributeTrailing;
-  keysControl.spacing = 6;
   FormRow *keysRow = [self row:@"Warmth Keys"
-                       caption:@"Command-F1 and Command-F2 lower and raise Night Shift intensity. "
-                               @"With the brightness keys as media keys, they need "
-                               @"Accessibility access."
-                       control:keysControl];
+                       caption:@"⌃⌥⌘− lowers and ⌃⌥⌘= raises Night Shift intensity. "
+                               @"Hold to keep stepping."
+                       control:keysState];
   NSView *keys = [self section:@"Keyboard"
                      accessory:nil
                           rows:@[ keysRow ]
-                        footer:@"Brightness keys without Command are left to macOS."];
+                        footer:nil];
   return [self pageWithSections:@[ keys ] stack:NULL];
 }
 
@@ -3689,7 +3662,7 @@ static void hugControls(NSView *view) {
   BOOL keys = warmthKeysReady();
   self.keysDot.color = keys ? NSColor.systemGreenColor : NSColor.systemOrangeColor;
   self.keysDot.needsDisplay = YES;
-  self.keysStatus.stringValue = keys ? @"Allowed" : @"Not allowed";
+  self.keysStatus.stringValue = keys ? @"⌃⌥⌘− / ⌃⌥⌘=" : @"In use by another app";
 }
 
 // MARK: License
@@ -4663,8 +4636,6 @@ static NSImage *sidebarTile(NSInteger pane, CGFloat size) {
     settings.cycleSwitch.action = @selector(toggleCycle:);
     settings.warmthSwitch.target = self;
     settings.warmthSwitch.action = @selector(settingsWarmthToggled:);
-    settings.keysButton.target = self;
-    settings.keysButton.action = @selector(allowKeys:);
     settings.buyButton.target = self;
     settings.buyButton.action = @selector(buyRamp:);
     settings.schedulePopup.target = self;
@@ -5036,12 +5007,6 @@ static NSImage *sidebarTile(NSInteger pane, CGFloat size) {
   [self refresh];
 }
 
-- (void)allowKeys:(id)sender {
-  (void)sender;
-  openWarmthKeyAccess();
-  [self syncLoginItem];
-}
-
 @end
 
 static MenuBar *gMenu = nil;
@@ -5092,185 +5057,25 @@ void refreshMenu(void) {
 
 static AppDelegate *gAppDelegate = nil;
 
-static BOOL gAskedForAccessibility = NO;
 static BOOL gWarmthKeysStarted = NO;
-static int gTapTries = 0;
 
-static BOOL warmthKeysReady(void) {
-  return nsSessionTapInstalled();
-}
-
-// Tap thread: a Command+brightness press the tap swallowed, so its release
-// is swallowed too. Cleared on main whenever the tap is (re-)created.
-static BOOL gSwallowedPress[2];
-// Command+brightness was swallowed. Its release stays on the intensity path
-// even if Command is up first. The tap thread sets it and main clears it,
-// so it is atomic.
-static atomic_bool gIntensityArm[2];
-static void commandWarmthFromMedia(int direction, bool down, bool repeat);
-static void endArmedIntensityHold(void);
-// Set by the tap thread when a disabled notice is queued for main.
-static atomic_bool gTapDisabledPending;
-static void handleTapsDisabled(void);
-
-// Tap thread. The tap exists only for the Cmd+F1 / Cmd+F2 warmth chord when
-// "Use F1, F2, etc. keys as standard function keys" is off: F1 and F2 are
-// then the brightness media keys, and Command alone on them steps Night
-// Shift intensity. Nightshift does not control brightness, so every other
-// event, a brightness key without Command included, goes back to macOS
-// untouched.
-static CGEventRef warmthKeyTap(CGEventTapProxy proxy, CGEventType type,
-                               CGEventRef event, void *user) {
-  (void)proxy;
-  (void)user;
-  if (type == kCGEventTapDisabledByTimeout ||
-      type == kCGEventTapDisabledByUserInput) {
-    // Never re-enabled here: when Accessibility is revoked, macOS disables
-    // the taps and an immediate re-enable loops with it. The main thread
-    // decides, once for all taps, with backoff.
-    if (!atomic_exchange(&gTapDisabledPending, true)) {
-      dispatch_async(dispatch_get_main_queue(), ^{
-        handleTapsDisabled();
-      });
-    }
-    return event;
-  }
-  if (type != (CGEventType)NSEventTypeSystemDefined) {
-    return event;
-  }
-  @autoreleasepool {
-    NSEvent *key = [NSEvent eventWithCGEvent:event];
-    if (key == nil || key.subtype != 8) {
-      return event;
-    }
-    bool down = false;
-    long data1 = (long)key.data1;
-    int direction = nsMediaBrightnessKey(data1, &down);
-    if (direction == 0) {
-      // Volume, mute, play and the rest.
-      return event;
-    }
-    int index = direction > 0;
-    if (atomic_load(&gIntensityArm[index])) {
-      if (!down) {
-        atomic_store(&gIntensityArm[index], false);
-        gSwallowedPress[index] = NO;
-        commandWarmthFromMedia(direction, false, false);
-      } else {
-        // A repeat, or a second down beside the hotkey, must not step.
-        commandWarmthFromMedia(direction, true, true);
-      }
-      return NULL;
-    }
-    NSMediaRoute route =
-        nsMediaBrightnessRoute(data1, (uint64_t)CGEventGetFlags(event), &down);
-    if (!down) {
-      // A press this tap swallowed still hides its release, including when
-      // the modifiers changed before the key came up.
-      BOOL swallow = gSwallowedPress[index];
-      gSwallowedPress[index] = NO;
-      return swallow ? NULL : event;
-    }
-    if (route == kNSMediaRouteIntensity) {
-      atomic_store(&gIntensityArm[index], true);
-      gSwallowedPress[index] = YES;
-      commandWarmthFromMedia(direction, true, nsMediaKeyRepeat(data1));
-      return NULL;
-    }
-    // kNSMediaRouteBrightness (no Command) and kNSMediaRouteUntouched
-    // (Command plus another modifier): macOS handles them.
-    return event;
-  }
-}
-
-static void startWarmthKeys(void);
-
-// Main thread. At most one pending retry of startWarmthKeys.
-static BOOL gTapRetryScheduled = NO;
-static void scheduleTapRetry(double delay) {
-  if (gTapRetryScheduled) {
-    return;
-  }
-  gTapRetryScheduled = YES;
-  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
-                 dispatch_get_main_queue(), ^{
-                   gTapRetryScheduled = NO;
-                   startWarmthKeys();
-                 });
-}
-
-// Main thread. Drops the taps so installWarmthKeyTap can re-create them,
-// and lets the permission poll do that once Accessibility is back.
-void dropTapsAndRetry(void) {
-  endArmedIntensityHold();
-  nsSessionTapRemove();
-  atomic_store(&gTapDisabledPending, false);
-  if (gMenu != nil) {
-    [gMenu refresh];
-  }
-  gTapTries = 0;
-  scheduleTapRetry(nsTapRetryDelay(0));
-}
-
-// Main thread, once per burst of disabled notices.
-static void handleTapsDisabled(void) {
-  static CFAbsoluteTime windowStart = 0;
-  static int recent = 0;
-  CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-  if (now - windowStart > 60) {
-    windowStart = now;
-    recent = 0;
-  }
-  recent++;
-  double delay = nsTapRecoveryDelay(AXIsProcessTrusted(), recent);
-  if (delay < 0) {
-    dropTapsAndRetry();
-    return;
-  }
-  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
-                 dispatch_get_main_queue(), ^{
-                   if (!AXIsProcessTrusted()) {
-                     // Revoked during the wait: disabled taps left in place
-                     // would block installWarmthKeyTap for good.
-                     dropTapsAndRetry();
-                     return;
-                   }
-                   nsSessionTapSetEnabled(true);
-                   atomic_store(&gTapDisabledPending, false);
-                 });
-}
-
-bool installWarmthKeyTap(void) {
-  if (nsSessionTapInstalled()) {
-    return true;
-  }
-  endArmedIntensityHold();
-  gSwallowedPress[0] = gSwallowedPress[1] = NO;
-  return nsSessionTapCreate(warmthKeyTap);
-}
-
-// Cmd+F1 lowers Night Shift intensity, Cmd+F2 raises it. The value is the
+// ⌃⌥⌘− lowers Night Shift intensity, ⌃⌥⌘= raises it. The value is the
 // menu's Current slider. Nothing here changes display brightness.
 //
-// "Use F1, F2, etc. keys as standard function keys" on: the keyboard reports
-// F1 and F2, so Command arrives as kVK_F1 (122) / kVK_F2 (120) with cmdKey.
-// RegisterEventHotKey sees that. macOS may already own Cmd+F1 (mirroring)
-// or Cmd+F2; a failed registration is logged as its error code and skipped.
-//
-// The setting off: F1 and F2 are the brightness keys. Command does not turn
-// them into F1/F2. A built-in keyboard sends a media key
-// (NX_KEYTYPE_BRIGHTNESS_DOWN 3 / UP 2, system-defined subtype 8) with
-// Command set in the event flags. That is not a virtual key code, so
-// RegisterEventHotKey cannot bind it. The session tap already receives it
-// and, for Command alone, runs this same hold: one step, preview while
-// held, one save on release. Command plus another modifier is not taken.
-// No second tap and no new permission. Cmd+Fn+F1/F2 is a real F-key and
-// hits the registration above.
+// Both are Carbon RegisterEventHotKey hotkeys: no event tap, so no
+// Accessibility permission, and a rebuild or re-sign cannot silently turn
+// them off. A combo another app already owns fails to register; that is
+// shown with notifyPlain and in Settings, and the other key still works.
 //
 // Carbon reports the chord once on press and once on release, with no
 // repeat. The hold repeats on the main queue and only previews, the way
 // the Current slider moves before mouse-up. Release calls
 // commitCurrentIntensity, which is that slider's save.
+_Static_assert(kNSHotKeyCommand == cmdKey, "Carbon cmdKey");
+_Static_assert(kNSHotKeyOption == optionKey, "Carbon optionKey");
+_Static_assert(kNSHotKeyControl == controlKey, "Carbon controlKey");
+_Static_assert(kNSKeyCodeMinus == kVK_ANSI_Minus, "kVK_ANSI_Minus");
+_Static_assert(kNSKeyCodeEqual == kVK_ANSI_Equal, "kVK_ANSI_Equal");
 static EventHotKeyRef gCommandHotKeys[2];
 static EventHandlerRef gCommandHotKeyHandler = NULL;
 static int gCommandHoldGeneration = 0;
@@ -5299,26 +5104,6 @@ static void commandWarmthClearHold(void) {
 }
 
 static void commandWarmthTick(BOOL release);
-
-// Main thread. The taps are going away, so the matching key-up will not
-// arrive. Save the preview once. A hotkey hold (no media arm) is left to
-// its own release.
-static void endArmedIntensityHold(void) {
-  if (![NSThread isMainThread]) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-      endArmedIntensityHold();
-    });
-    return;
-  }
-  // Exchange both. || would skip the second clear when the first is set.
-  bool armed = atomic_exchange(&gIntensityArm[0], false);
-  armed = atomic_exchange(&gIntensityArm[1], false) || armed;
-  if (!armed || gCommandHoldDirection == 0) {
-    return;
-  }
-  gCommandHoldGeneration++;
-  commandWarmthTick(YES);
-}
 
 // Main thread. A repeat previews the next Current value. release saves it
 // once, through the slider's mouse-up path, and does not take another step.
@@ -5397,32 +5182,6 @@ static void commandWarmthHotKeyOnMain(UInt32 kind, EventHotKeyID hotKey) {
   scheduleCommandWarmthRepeat(generation, YES);
 }
 
-// Tap thread or main. Media Command+brightness joins the hotkey hold.
-// The action is decided on main, beside gCommandHoldDirection, so a media
-// down that arrives after the hotkey press does not step again, and a
-// repeat does not start its own hold.
-static void commandWarmthFromMedia(int direction, bool down, bool repeat) {
-  if (![NSThread isMainThread]) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-      commandWarmthFromMedia(direction, down, repeat);
-    });
-    return;
-  }
-  // A press queued just before the taps were dropped must not start a hold:
-  // its release will not arrive, and the timer would run on.
-  if (down && (direction == 1 || direction == -1) && !atomic_load(&gIntensityArm[direction > 0])) {
-    return;
-  }
-  NSWarmthMediaAction action =
-      nsCommandWarmthMediaAction(direction, down, repeat, gCommandHoldDirection);
-  if (action != kNSWarmthMediaBegin && action != kNSWarmthMediaEnd) {
-    return;
-  }
-  EventHotKeyID hotKey = {'NScm', (UInt32)(direction < 0 ? 1 : 2)};
-  commandWarmthHotKeyOnMain(action == kNSWarmthMediaEnd ? kEventHotKeyReleased : kEventHotKeyPressed,
-                            hotKey);
-}
-
 static OSStatus commandWarmthHotKey(EventHandlerCallRef next, EventRef event, void *user) {
   (void)next;
   (void)user;
@@ -5460,18 +5219,26 @@ static void registerCommandWarmthHotKeys(void) {
     return;
   }
   gCommandHotKeyHandler = handler;
-  const UInt32 codes[2] = {kVK_F1, kVK_F2};
-  const UInt32 ids[2] = {1, 2};
   for (UInt32 i = 0; i < 2; i++) {
-    EventHotKeyID hotKey = {'NScm', ids[i]};
+    UInt32 id = i + 1;
+    NSWarmthShortcut shortcut = nsWarmthShortcut(id);
+    EventHotKeyID hotKey = {'NScm', id};
     EventHotKeyRef ref = NULL;
-    err = RegisterEventHotKey(codes[i], cmdKey, hotKey, GetApplicationEventTarget(), 0, &ref);
+    err = RegisterEventHotKey(shortcut.keyCode, shortcut.modifiers, hotKey,
+                              GetApplicationEventTarget(), 0, &ref);
     if (err != noErr) {
-      NSLog(@"%d", (int)err);
+      char message[128];
+      nsWarmthShortcutFailure(id, message, sizeof message);
+      NSLog(@"%s (%d)", message, (int)err);
+      notifyPlain([NSString stringWithUTF8String:message]);
       continue;
     }
     gCommandHotKeys[i] = ref;
   }
+}
+
+static BOOL warmthKeysReady(void) {
+  return gCommandHotKeys[0] != NULL && gCommandHotKeys[1] != NULL;
 }
 
 static void unregisterCommandWarmthHotKeys(void) {
@@ -5492,46 +5259,14 @@ static void unregisterCommandWarmthHotKeys(void) {
 }
 
 static void startWarmthKeys(void) {
-  if (!gWarmthKeysStarted) {
-    gWarmthKeysStarted = YES;
-    registerCommandWarmthHotKeys();
-  }
-  if (installWarmthKeyTap()) {
-    if (gMenu != nil) {
-      [gMenu refresh];
-    }
+  if (gWarmthKeysStarted) {
     return;
   }
-  if (!gAskedForAccessibility) {
-    gAskedForAccessibility = YES;
-    [NSApp activate];
-    NSDictionary *options = @{(__bridge id)kAXTrustedCheckOptionPrompt : @YES};
-    AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)options);
-    notifyPlain(@"Allow Nightshift in Accessibility to use Command-F1 and Command-F2 for warmth");
+  gWarmthKeysStarted = YES;
+  registerCommandWarmthHotKeys();
+  if (gMenu != nil) {
+    [gMenu refresh];
   }
-  // Never gives up: 2 s for about a minute, then every 30 s.
-  double retry = nsTapRetryDelay(gTapTries);
-  if (gTapTries < 30) {
-    gTapTries++;
-  }
-  scheduleTapRetry(retry);
-}
-
-// Main thread. Shows the Warmth Keys state in the menu and, when open,
-// in Settings.
-void refreshKeysState(void) {
-  if (gMenu == nil) {
-    return;
-  }
-  [gMenu refresh];
-  if (gMenu.settings.window.isVisible) {
-    [gMenu.settings syncDisplays];
-  }
-}
-
-void nsSessionHostNoteRebuilt(void) {
-  atomic_store(&gTapDisabledPending, false);
-  gTapTries = 0;
 }
 
 static void installMenu(void) {
@@ -5541,7 +5276,6 @@ static void installMenu(void) {
   NSApp.delegate = gAppDelegate;
   gMenu = [[MenuBar alloc] init];
   startWarmthKeys();
-  nsSessionTapWatch();
   [gMenu refresh];
 }
 

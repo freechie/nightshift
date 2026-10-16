@@ -83,7 +83,7 @@ BEGIN {
       page_url[pages] = literal
     }
   }
-  if (pages != 5) fail("expected 5 built-in pages, found " pages)
+  if (pages != 4) fail("expected 4 built-in pages, found " pages)
 
   daemon = ""
   while ((getline line < "nightshiftd.m") > 0) daemon = daemon line "\n"
