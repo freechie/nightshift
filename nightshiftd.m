@@ -4952,13 +4952,13 @@ static NSImage *sidebarTile(NSInteger pane, CGFloat size) {
   self.window = [[NSWindow alloc]
       initWithContentRect:NSMakeRect(0, 0, kSettingsWidth, kSettingsHeight)
                 styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
-                          NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskFullSizeContentView
+                          NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable |
+                          NSWindowStyleMaskFullSizeContentView
                   backing:NSBackingStoreBuffered
                     defer:NO];
   self.window.contentViewController = split;
   [self.window setContentSize:NSMakeSize(kSettingsWidth, kSettingsHeight)];
   self.window.contentMinSize = NSMakeSize(kSettingsWidth, kSettingsHeight);
-  self.window.contentMaxSize = NSMakeSize(kSettingsWidth, kSettingsHeight);
   self.window.identifier = kSettingsWindowID;
   self.window.title = @"Nightshift Settings";
   self.window.titlebarAppearsTransparent = NO;
