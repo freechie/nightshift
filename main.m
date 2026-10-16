@@ -83,11 +83,7 @@ static BOOL startDaemon(void) {
   return rc == 0;
 }
 
-// The daemon answers a brightness change once the monitor has taken it, at
-// the latest after 8 s (kBrightnessReplyWait in nightshiftd.m).
 static const int kReplyTimeout = 2;
-static const int kBrightnessTimeout = 10;
-static int gReplyTimeout = kReplyTimeout;
 
 static int talk(const char *line, char *reply, size_t cap, BOOL whole) {
   NSString *sock = [[NSHomeDirectory()
@@ -110,7 +106,7 @@ static int talk(const char *line, char *reply, size_t cap, BOOL whole) {
   int one = 1;
   setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
   struct timeval tv = {.tv_sec = 2, .tv_usec = 0};
-  struct timeval replyTv = {.tv_sec = gReplyTimeout, .tv_usec = 0};
+  struct timeval replyTv = {.tv_sec = kReplyTimeout, .tv_usec = 0};
   setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &replyTv, sizeof(replyTv));
   setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
@@ -185,10 +181,6 @@ static int ask(const char *line, char *reply, size_t cap) {
   return askMode(line, reply, cap, NO);
 }
 
-static int askAll(const char *line, char *reply, size_t cap) {
-  return askMode(line, reply, cap, YES);
-}
-
 static void printReply(const char *reply) {
   size_t len = strlen(reply);
   if (len > 0 && reply[len - 1] == '\n') {
@@ -252,7 +244,7 @@ static BOOL paidReply(const char *reply) {
 static void usage(void) {
   fprintf(stderr,
           "usage: nightshift [0-100 | max 1-100 | ramp 8:30pm | schedule | "
-          "clock | login | dark | tone | brightness | keys | notifications | "
+          "clock | login | dark | tone | notifications | "
           "license | buy | -h]\n");
 }
 
@@ -284,11 +276,6 @@ static void help(void) {
       "  nightshift dark on     Turn Dark mode on\n"
       "  nightshift tone        Show True Tone, or unsupported\n"
       "  nightshift tone off    Turn True Tone off\n"
-      "  nightshift brightness  List each display's id, name, percent, and\n"
-      "                         backlight or picture\n"
-      "  nightshift brightness 3 40\n"
-      "                         Set display 3 to 40%%\n"
-      "  nightshift keys        Show whether the brightness keys are allowed\n"
       "  nightshift notifications\n"
       "                         Open Notification settings\n"
       "  nightshift -h          Show this help\n"
@@ -318,9 +305,10 @@ static void help(void) {
       "  Nightshift.app keeps an icon in the menu bar. Release Current or Max to\n"
       "  set warmth or the max. Type the Full at time, hour then minute.\n"
       "  24-hour hides AM/PM. The menu also has Dark mode, True Tone,\n"
-      "  display brightness, Night Shift Off, Custom, or Sunset, and Quit.\n"
-      "  Settings opens General, Displays, and Nightshift Pro. The same\n"
-      "  controls are available from the nightshift command.\n"
+      "  Night Shift Off, Custom, or Sunset, and Quit. Settings opens\n"
+      "  General, Night Shift, Keyboard, and Nightshift Pro. Command-F1 and\n"
+      "  Command-F2 lower and raise warmth. The same controls are available\n"
+      "  from the nightshift command.\n"
       "\n"
       "Notifications:\n"
       "  Every command goes through Nightshift.app, which starts on its own\n"
@@ -684,45 +672,6 @@ int main(int argc, const char *argv[]) {
                argc == 2 ? "" : argv[2]);
       return finishReply(ask(line, reply, sizeof(reply)), reply,
                          "failed to set True Tone", argc == 3);
-    }
-
-    if (argc == 2 && strcmp(argv[1], "ddc") == 0) {
-      char reply[512];
-      return finishReply(askAll("ddc\n", reply, sizeof(reply)), reply, "failed to read ddc", NO);
-    }
-
-    if (argc == 2 && strcmp(argv[1], "brightness") == 0) {
-      char reply[2048];
-      return finishReply(askAll("brightness\n", reply, sizeof(reply)), reply,
-                         "failed to list displays", NO);
-    }
-
-    if (argc == 4 && strcmp(argv[1], "brightness") == 0) {
-      unsigned display = 0;
-      long percent = 0;
-      char extra = 0;
-      if (sscanf(argv[2], "%u%c", &display, &extra) != 1 ||
-          !parseValue(argv[3], 0, 100, &percent)) {
-        usage();
-        return 1;
-      }
-      char line[64];
-      char reply[64];
-      snprintf(line, sizeof(line), "brightness %u %ld\n", display, percent);
-      gReplyTimeout = kBrightnessTimeout;
-      return finishReply(ask(line, reply, sizeof(reply)), reply,
-                         "failed to set brightness", YES);
-    }
-
-    if (argc == 2 && strcmp(argv[1], "keys") == 0) {
-      char reply[16];
-      int sent = ask("keys\n", reply, sizeof(reply));
-      int code = finishReply(sent, reply, "failed to read the brightness keys", NO);
-      if (code == 0 && strcmp(reply, "off") == 0) {
-        openSettings("x-apple.systempreferences:com.apple.settings."
-                     "PrivacySecurity.extension?Privacy_Accessibility");
-      }
-      return code;
     }
 
     if (argc != 2) {

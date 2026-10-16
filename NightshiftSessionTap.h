@@ -14,8 +14,8 @@
 // limitations under the License.
 
 // The one active Session event tap, and the Accessibility poll that drops
-// it on revoke and rebuilds it on regrant. nightshiftd.m owns brightness,
-// hotkeys, and the Settings row this poll refreshes.
+// it on revoke and rebuilds it on regrant. nightshiftd.m owns the warmth
+// hotkeys (Cmd+F1 / Cmd+F2) and the Settings row this poll refreshes.
 
 #ifndef NIGHTSHIFT_SESSION_TAP_H
 #define NIGHTSHIFT_SESSION_TAP_H
@@ -32,7 +32,7 @@ void nsSessionTapSetEnabled(bool enabled);
 // Implemented in nightshiftd.m. The poll calls them in the same order the
 // revoke path used before this file existed.
 void dropTapsAndRetry(void);
-bool installBrightnessTap(void);
+bool installWarmthKeyTap(void);
 void refreshKeysState(void);
 void nsSessionHostNoteRebuilt(void);
 

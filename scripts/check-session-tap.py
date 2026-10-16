@@ -345,12 +345,6 @@ def main():
         if session and ("NSEventTypeKeyDown" in body or "kCGEventKeyDown" in body):
             reasons.append("%s callback %s reads key-down" % (rel, name))
 
-    for path, text in blobs.items():
-        rel = os.path.relpath(path, root)
-        body = body_of(text, "brightnessDirection")
-        if body and ("NSEventTypeKeyDown" in body or "kCGEventKeyDown" in body):
-            reasons.append("%s brightnessDirection reads key-down" % rel)
-
     if reasons:
         for reason in reasons:
             print(reason)
