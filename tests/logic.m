@@ -197,6 +197,56 @@ static void checkMatching(void) {
   CHECK_EQ(nsDDCPickCandidate(internalPipe, 1, &benqPipe), -1);
 }
 
+static int m1ddcProxy(const char **path, const char **name, const char **location, int count,
+                      const char *displayLocation) {
+  NSDDCM1ddcWalk walk;
+  nsDDCM1ddcWalkInit(&walk);
+  for (int i = 0; i < count; i++) {
+    if (nsDDCM1ddcWalkTake(&walk, path[i], name[i], location[i], displayLocation)) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+static void checkM1ddcWalk(void) {
+  // One dcpext, two External proxies attached to the same framebuffer.
+  // The old pick treats every attached proxy as the display and will not
+  // choose. The walk opens only the proxy after IODisplayLocation.
+  const char *fbDual = "IOService:/dcpext0/dispext0/AppleCLCD2";
+  const char *proxyBefore = "IOService:/dcpext0/DCPAVServiceProxy";
+  const char *proxyAfter = "IOService:/dcpext0/dispext0/DCPAVServiceProxy";
+  DDCCandidate attached[2];
+  attached[0] = candidate(0x09D1, 0x8032, 0, true, "dispext0");
+  attached[1] = candidate(0x09D1, 0x8032, 0, true, "dispext0");
+  strncpy(attached[0].location, fbDual, sizeof(attached[0].location) - 1);
+  strncpy(attached[1].location, fbDual, sizeof(attached[1].location) - 1);
+  DDCTarget dual = target(0x09D1, 0x8032, 0, "dispext0", 1, false);
+  strncpy(dual.location, fbDual, sizeof(dual.location) - 1);
+  CHECK_EQ(nsDDCPickCandidate(attached, 2, &dual), -1);
+  const char *dualPath[] = {proxyBefore, fbDual, proxyAfter};
+  const char *dualName[] = {"DCPAVServiceProxy", "AppleCLCD2", "DCPAVServiceProxy"};
+  const char *dualLoc[] = {"External", NULL, "External"};
+  CHECK_EQ(m1ddcProxy(dualPath, dualName, dualLoc, 3, fbDual), 2);
+  CHECK(strcmp(dualPath[2], proxyAfter) == 0);
+
+  const char *fb1 = "IOService:/dcpext1/dispext1/AppleCLCD2";
+  const char *proxy1 = "IOService:/dcpext1/dispext1/DCPAVServiceProxy";
+  const char *path[] = {proxyBefore, fbDual, proxyAfter, fb1, proxy1};
+  const char *name[] = {"DCPAVServiceProxy", "AppleCLCD2", "DCPAVServiceProxy", "AppleCLCD2",
+                        "DCPAVServiceProxy"};
+  const char *location[] = {"External", NULL, "External", NULL, "External"};
+  CHECK_EQ(m1ddcProxy(path, name, location, 5, fb1), 4);
+
+  const char *after[] = {fbDual, "IOService:/dcpext0/p0", "IOService:/dcpext0/p1",
+                         "IOService:/dcpext0/p2", "IOService:/dcpext0/p3"};
+  const char *afterName[] = {"AppleCLCD2", "DCPAVServiceProxy", "DCPAVServiceProxy", "DCPAVServiceProxy",
+                             "DCPAVServiceProxy"};
+  const char *afterLoc[] = {NULL, NULL, "", "Internal", "External"};
+  CHECK_EQ(m1ddcProxy(after, afterName, afterLoc, 5, fbDual), 4);
+  CHECK_EQ(m1ddcProxy(after, afterName, afterLoc, 5, NULL), -1);
+}
+
 static void checkSlots(void) {
   uint32_t slots[4] = {0, 0, 0, 0};
   CHECK_EQ(nsDDCSlotFor(slots, 4, 7), 0);
@@ -1716,6 +1766,7 @@ int main(void) {
   checkBrightnessChord();
   checkRamp();
   checkMatching();
+  checkM1ddcWalk();
   checkSlots();
   checkReadback();
   checkSplit();

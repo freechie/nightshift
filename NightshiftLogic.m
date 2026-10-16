@@ -198,6 +198,33 @@ int nsDDCPickCandidate(const DDCCandidate *candidates, int count, const DDCTarge
   return -1;
 }
 
+void nsDDCM1ddcWalkInit(NSDDCM1ddcWalk *walk) {
+  if (walk != NULL) {
+    walk->phase = 0;
+  }
+}
+
+bool nsDDCM1ddcWalkTake(NSDDCM1ddcWalk *walk, const char *path, const char *name,
+                        const char *location, const char *displayLocation) {
+  if (walk == NULL || walk->phase < 0) {
+    return false;
+  }
+  if (walk->phase == 0) {
+    if (displayLocation != NULL && displayLocation[0] != '\0' && path != NULL &&
+        strcmp(path, displayLocation) == 0) {
+      walk->phase = 1;
+    }
+    return false;
+  }
+  if (name == NULL || strcmp(name, "DCPAVServiceProxy") != 0) {
+    return false;
+  }
+  if (location == NULL || strcmp(location, "External") != 0) {
+    return false;
+  }
+  return true;
+}
+
 // MARK: DDC slots and readback
 
 int nsDDCSlotFor(const uint32_t *displays, int count, uint32_t display) {
