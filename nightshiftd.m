@@ -16,7 +16,6 @@
 #import "NightShift.h"
 #import "NightshiftLogic.h"
 #import "NightshiftSessionTap.h"
-#import "NightshiftBrightness.h"
 #import <AppKit/AppKit.h>
 #import <ApplicationServices/ApplicationServices.h>
 #import <Carbon/Carbon.h>
@@ -26,17 +25,11 @@
 #import <UserNotifications/UserNotifications.h>
 #import <objc/runtime.h>
 
-extern int DisplayServicesGetBrightness(uint32_t display, float *brightness);
-extern int DisplayServicesSetBrightness(uint32_t display, float brightness);
-extern int DisplayServicesCanChangeBrightness(uint32_t display);
-
-static BOOL brightnessKeysReady(void);
-long readPercent(uint32_t display);
-void refreshKeyDisplays(void);
-void noteCursorBrightness(uint32_t display, long percent);
-void noteCursorDisplaysOffline(void);
+static BOOL warmthKeysReady(void);
 static void teardownDaemon(void);
-static void startBrightnessKeys(void);
+static void startWarmthKeys(void);
+void notifyPlain(NSString *body);
+BOOL selectorMatches(id object, SEL sel, const char *expected);
 static BOOL handleControl(const char *buf, int fd);
 extern int SLSGetAppearanceThemeLegacy(void);
 extern void SLSSetAppearanceThemeLegacy(int theme);
@@ -123,40 +116,11 @@ static int minutesNow(void) {
 }
 
 static BOOL readMax(long *value) {
-  NSString *text = [NSString stringWithContentsOfFile:gMaxPath
-                                              encoding:NSUTF8StringEncoding
-                                                 error:NULL];
-  if (text == nil) {
-    return NO;
-  }
-  const char *s = text.UTF8String;
-  if (s == NULL) {
-    return NO;
-  }
-  char *end = NULL;
-  long parsed = strtol(s, &end, 10);
-  if (end == s) {
-    return NO;
-  }
-  while (*end == ' ' || *end == '\n' || *end == '\r') {
-    end++;
-  }
-  if (*end != '\0' || parsed < 1 || parsed > 100) {
-    return NO;
-  }
-  *value = parsed;
-  return YES;
+  return nsReadSavedNumber(gMaxPath.fileSystemRepresentation, 1, 100, value);
 }
 
 static BOOL writeMax(long value) {
-  NSString *text = [NSString stringWithFormat:@"%ld\n", value];
-  if (![text writeToFile:gMaxPath
-               atomically:YES
-                 encoding:NSUTF8StringEncoding
-                    error:NULL]) {
-    return NO;
-  }
-  return chmod(gMaxPath.fileSystemRepresentation, S_IRUSR | S_IWUSR) == 0;
+  return nsWriteSavedNumber(gMaxPath.fileSystemRepresentation, value);
 }
 
 static BOOL rememberMax(long value) {
@@ -170,28 +134,11 @@ static BOOL rememberMax(long value) {
 }
 
 static BOOL readRampClock(int *minute) {
-  NSString *text = [NSString stringWithContentsOfFile:gRampPath
-                                              encoding:NSUTF8StringEncoding
-                                                 error:NULL];
-  if (text == nil) {
+  long saved = 0;
+  if (!nsReadSavedNumber(gRampPath.fileSystemRepresentation, 0, 1439, &saved)) {
     return NO;
   }
-  const char *s = text.UTF8String;
-  if (s == NULL) {
-    return NO;
-  }
-  char *end = NULL;
-  long parsed = strtol(s, &end, 10);
-  if (end == s) {
-    return NO;
-  }
-  while (*end == ' ' || *end == '\n' || *end == '\r') {
-    end++;
-  }
-  if (*end != '\0' || parsed < 0 || parsed >= 1440) {
-    return NO;
-  }
-  *minute = (int)parsed;
+  *minute = (int)saved;
   return YES;
 }
 
@@ -199,12 +146,7 @@ static BOOL rememberRampClock(int minute) {
   if (minute < 0 || minute >= 1440) {
     return NO;
   }
-  NSString *text = [NSString stringWithFormat:@"%d\n", minute];
-  if (![text writeToFile:gRampPath
-               atomically:YES
-                 encoding:NSUTF8StringEncoding
-                    error:NULL] ||
-      chmod(gRampPath.fileSystemRepresentation, S_IRUSR | S_IWUSR) != 0) {
+  if (!nsWriteSavedNumber(gRampPath.fileSystemRepresentation, minute)) {
     fprintf(stderr, "failed to save full at\n");
     return NO;
   }
@@ -737,6 +679,12 @@ static BOOL setRampClock(int minute) {
 }
 
 static void handleLine(const char *buf, int fd) {
+  // Unknown lines, the removed brightness, ddc and keys commands included,
+  // get the same clean reply as a bad value.
+  if (nsDaemonCommand(buf) == kNSCommandUnknown) {
+    dprintf(fd, "failed\n");
+    return;
+  }
   if (strcmp(buf, "status") == 0) {
     writeStatus(fd);
     return;
@@ -898,8 +846,6 @@ static BOOL loginItemOn(void) {
   return [SMAppService mainAppService].status == SMAppServiceStatusEnabled;
 }
 
-static const CGFloat kBrightnessHUDWidth = 312;
-static const CGFloat kBrightnessHUDHeight = 80;
 
 // Text drawn on an accent fill: white, or near-black when the user's accent
 // is light (yellow, light graphite) so it stays readable. Call while drawing,
@@ -924,394 +870,7 @@ static void tintSlider(NSSlider *slider) {
   slider.needsDisplay = YES;
 }
 
-@interface BrightnessMeter : NSView
-@property(nonatomic) long percent;
-@property(nonatomic, copy) NSString *displayName;
-@property(nonatomic, copy) void (^onScrub)(long percent);
-@property(nonatomic, copy) void (^onScrubBegan)(void);
-@property(nonatomic, copy) void (^onScrubEnd)(void);
-@end
-
-@implementation BrightnessMeter
-
-- (BOOL)isOpaque {
-  return NO;
-}
-
-- (void)viewDidChangeEffectiveAppearance {
-  [super viewDidChangeEffectiveAppearance];
-  [self setNeedsDisplay:YES];
-}
-
-- (void)drawSymbol:(NSString *)name inRect:(NSRect)rect pointSize:(CGFloat)size
-             color:(NSColor *)color {
-  NSImage *image = [NSImage imageWithSystemSymbolName:name accessibilityDescription:nil];
-  if (image == nil) {
-    return;
-  }
-  NSImageSymbolConfiguration *config =
-      [NSImageSymbolConfiguration configurationWithPointSize:size
-                                                      weight:NSFontWeightMedium];
-  image = [image imageWithSymbolConfiguration:config];
-  NSImage *tinted = [image copy];
-  [tinted lockFocus];
-  [color set];
-  NSRectFillUsingOperation(NSMakeRect(0, 0, tinted.size.width, tinted.size.height),
-                           NSCompositingOperationSourceAtop);
-  [tinted unlockFocus];
-  [tinted drawInRect:rect fromRect:NSZeroRect operation:NSCompositingOperationSourceOver
-            fraction:1];
-}
-
-- (void)drawRect:(NSRect)dirty {
-  (void)dirty;
-  NSRect bounds = self.bounds;
-  NSColor *label = NSColor.labelColor;
-  NSString *name = self.displayName.length > 0 ? self.displayName : @"Display";
-  NSFont *nameFont = [NSFont systemFontOfSize:13 weight:NSFontWeightSemibold];
-  NSString *percentText = [NSString stringWithFormat:@"%ld%%", self.percent];
-  NSFont *percentFont = [NSFont monospacedDigitSystemFontOfSize:13
-                                                         weight:NSFontWeightSemibold];
-  NSDictionary *percentAttrs = @{
-    NSFontAttributeName : percentFont,
-    NSForegroundColorAttributeName : label
-  };
-  NSSize percentSize = [percentText sizeWithAttributes:percentAttrs];
-  CGFloat pad = 22;
-  NSSize nameSize = [name sizeWithAttributes:@{NSFontAttributeName : nameFont}];
-  CGFloat titleY = bounds.size.height - 16 - nameSize.height;
-  CGFloat titleMax = bounds.size.width - pad * 2 - percentSize.width - 12;
-  if (titleMax < 40) {
-    titleMax = 40;
-  }
-  NSMutableParagraphStyle *titleStyle = [[NSMutableParagraphStyle alloc] init];
-  titleStyle.lineBreakMode = NSLineBreakByTruncatingTail;
-  [name drawInRect:NSMakeRect(pad, titleY, titleMax, nameSize.height)
-      withAttributes:@{
-        NSFontAttributeName : nameFont,
-        NSForegroundColorAttributeName : label,
-        NSParagraphStyleAttributeName : titleStyle
-      }];
-  [percentText drawAtPoint:NSMakePoint(bounds.size.width - pad - percentSize.width,
-                                       titleY + (nameSize.height - percentSize.height) / 2.0)
-            withAttributes:percentAttrs];
-
-  NSRect track = [self trackRect];
-  CGFloat sliderY = NSMidY(track);
-  CGFloat leftSun = 14;
-  CGFloat rightSun = 17;
-  NSRect leftRect = NSMakeRect(pad, sliderY - leftSun / 2.0, leftSun, leftSun);
-  NSRect rightRect =
-      NSMakeRect(bounds.size.width - pad - rightSun, sliderY - rightSun / 2.0, rightSun, rightSun);
-  [self drawSymbol:@"sun.min" inRect:leftRect pointSize:12 color:label];
-  [self drawSymbol:@"sun.max" inRect:rightRect pointSize:15 color:label];
-
-  CGFloat fillX = track.origin.x + track.size.width * ((CGFloat)self.percent / 100.0);
-  CGFloat knobSize = 16;
-  // The empty part of the bar, under the fill, as in the menu's sliders.
-  NSRect empty = NSMakeRect(track.origin.x, sliderY - 2.5, track.size.width, 5);
-  [[label colorWithAlphaComponent:0.25] setFill];
-  [[NSBezierPath bezierPathWithRoundedRect:empty xRadius:2.5 yRadius:2.5] fill];
-  CGFloat fillWidth = fillX - track.origin.x;
-  if (fillWidth < knobSize / 2.0) {
-    fillWidth = knobSize / 2.0;
-  }
-  NSRect fill = NSMakeRect(track.origin.x, sliderY - 2.5, fillWidth, 5);
-  [NSColor.controlAccentColor setFill];
-  [[NSBezierPath bezierPathWithRoundedRect:fill xRadius:2.5 yRadius:2.5] fill];
-
-  NSRect knobRect = NSMakeRect(fillX - knobSize / 2.0, sliderY - knobSize / 2.0, knobSize, knobSize);
-  NSBezierPath *knob = [NSBezierPath bezierPathWithOvalInRect:knobRect];
-  [[NSColor.whiteColor colorWithAlphaComponent:0.96] setFill];
-  [knob fill];
-}
-
-- (NSRect)trackRect {
-  NSRect bounds = self.bounds;
-  CGFloat pad = 22;
-  CGFloat leftSun = 14;
-  CGFloat rightSun = 17;
-  CGFloat trackLeft = pad + leftSun + 12;
-  CGFloat trackRight = bounds.size.width - pad - rightSun - 12;
-  return NSMakeRect(trackLeft, 10, MAX(1, trackRight - trackLeft), 34);
-}
-
-- (long)percentForX:(CGFloat)x {
-  NSRect track = [self trackRect];
-  CGFloat span = track.size.width;
-  CGFloat t = span <= 0 ? 0 : (x - track.origin.x) / span;
-  if (t < 0) {
-    t = 0;
-  }
-  if (t > 1) {
-    t = 1;
-  }
-  return (long)llround(t * 100.0);
-}
-
-- (void)scrubToPoint:(NSPoint)point {
-  long next = [self percentForX:point.x];
-  if (next == self.percent) {
-    return;
-  }
-  self.percent = next;
-  [self setNeedsDisplay:YES];
-  if (self.onScrub != nil) {
-    self.onScrub(next);
-  }
-}
-
-- (void)mouseDown:(NSEvent *)event {
-  NSPoint point = [self convertPoint:event.locationInWindow fromView:nil];
-  if (point.y > NSMaxY([self trackRect])) {
-    return;
-  }
-  if (self.onScrubBegan != nil) {
-    self.onScrubBegan();
-  }
-  [[NSCursor resizeLeftRightCursor] push];
-  [self scrubToPoint:point];
-  while (YES) {
-    NSEvent *next = [self.window
-        nextEventMatchingMask:NSEventMaskLeftMouseDragged | NSEventMaskLeftMouseUp];
-    if (next == nil || next.type == NSEventTypeLeftMouseUp) {
-      break;
-    }
-    [self scrubToPoint:[self convertPoint:next.locationInWindow fromView:nil]];
-  }
-  [NSCursor pop];
-  if (self.onScrubEnd != nil) {
-    self.onScrubEnd();
-  }
-}
-
-- (BOOL)acceptsFirstMouse:(NSEvent *)event {
-  (void)event;
-  return YES;
-}
-
-- (void)resetCursorRects {
-  [super resetCursorRects];
-  [self addCursorRect:[self trackRect] cursor:[NSCursor resizeLeftRightCursor]];
-}
-
-- (BOOL)isAccessibilityElement {
-  return YES;
-}
-
-- (NSString *)accessibilityLabel {
-  return [NSString stringWithFormat:@"%@ brightness %ld percent", self.displayName,
-                                    self.percent];
-}
-@end
-
-@interface BrightnessPanel : NSPanel
-@end
-
-@implementation BrightnessPanel
-- (BOOL)canBecomeKeyWindow {
-  return NO;
-}
-- (BOOL)canBecomeMainWindow {
-  return NO;
-}
-- (BOOL)acceptsFirstMouse:(NSEvent *)event {
-  (void)event;
-  return YES;
-}
-@end
-
-@interface BrightnessGlass : NSGlassEffectView
-@end
-
-@implementation BrightnessGlass
-- (NSView *)hitTest:(NSPoint)point {
-  NSView *hit = [super hitTest:point];
-  if (hit == self && self.contentView != nil) {
-    return self.contentView;
-  }
-  return hit;
-}
-@end
-
 void refreshMenu(void);
-static void hideBrightnessHUD(void);
-static NSRect menuBarIconFrame(void);
-
-static BrightnessPanel *gBrightnessPanel = nil;
-static BrightnessMeter *gBrightnessMeter = nil;
-static NSGlassEffectView *gBrightnessGlass = nil;
-static NSTimer *gBrightnessHide = nil;
-static int gBrightnessHUDGeneration = 0;
-static uint32_t gBrightnessDisplay = 0;
-static uint32_t gBrightnessScrubDisplay = 0;
-static long gBrightnessScrubPending = -1;
-static uint32_t gBrightnessAnchor = 0;
-
-void liftBrightnessHUD(void) {
-  if (gBrightnessPanel == nil) {
-    return;
-  }
-  gBrightnessPanel.level = NSStatusWindowLevel + 2;
-}
-
-static void scheduleBrightnessHide(void) {
-  [gBrightnessHide invalidate];
-  gBrightnessHide = [NSTimer scheduledTimerWithTimeInterval:2
-                                                    repeats:NO
-                                                      block:^(NSTimer *timer) {
-                                                        (void)timer;
-                                                        hideBrightnessHUD();
-                                                      }];
-}
-
-static void hideBrightnessHUD(void) {
-  [gBrightnessHide invalidate];
-  gBrightnessHide = nil;
-  BrightnessPanel *panel = gBrightnessPanel;
-  if (panel == nil || !panel.isVisible) {
-    return;
-  }
-  int generation = ++gBrightnessHUDGeneration;
-  [NSAnimationContext runAnimationGroup:^(NSAnimationContext *context) {
-    context.duration = 0.18;
-    panel.animator.alphaValue = 0;
-  }
-      completionHandler:^{
-        if (generation != gBrightnessHUDGeneration || panel.alphaValue > 0.05) {
-          return;
-        }
-        [panel orderOut:nil];
-      }];
-}
-
-static void showBrightnessHUD(uint32_t display, long percent) {
-  NSScreen *screen = screenForDisplay(display);
-  if (screen == nil) {
-    return;
-  }
-  if (percent < 0) {
-    percent = 0;
-  }
-  if (percent > 100) {
-    percent = 100;
-  }
-  gBrightnessHUDGeneration++;
-  if (gBrightnessPanel == nil) {
-    NSRect content = NSMakeRect(0, 0, kBrightnessHUDWidth, kBrightnessHUDHeight);
-    gBrightnessMeter = [[BrightnessMeter alloc] initWithFrame:content];
-    gBrightnessMeter.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-    gBrightnessGlass = [[BrightnessGlass alloc] initWithFrame:content];
-    gBrightnessGlass.style = NSGlassEffectViewStyleRegular;
-    gBrightnessGlass.tintColor = nil;
-    gBrightnessGlass.cornerRadius = kBrightnessHUDHeight / 2.0;
-    if (@available(macOS 27.0, *)) {
-      gBrightnessGlass.effectIsInteractive = YES;
-    }
-    gBrightnessGlass.contentView = gBrightnessMeter;
-    gBrightnessMeter.onScrubBegan = ^{
-      gBrightnessScrubDisplay = gBrightnessDisplay;
-      gBrightnessScrubPending = -1;
-      gBrightnessHUDGeneration++;
-      if (gBrightnessPanel != nil) {
-        gBrightnessPanel.alphaValue = 1;
-      }
-      [gBrightnessHide invalidate];
-      gBrightnessHide = nil;
-    };
-    // The scrub loop runs on the main thread. The built-in and a confirmed
-    // DDC external are live because the lamp write goes to the DDC worker,
-    // which keeps only the newest value. Ticks are held, not saved; release
-    // sets the last value again (a no-op if queued) and saves it once.
-    // Any other external still sets once on release, since its write blocks.
-    gBrightnessMeter.onScrub = ^(long value) {
-      uint32_t display = gBrightnessScrubDisplay;
-      if (display == 0) {
-        return;
-      }
-      gBrightnessScrubPending = value;
-      // Software-only dimming is a local gamma change, so the drag follows
-      // the knob. A display still being probed waits until release.
-      if (!CGDisplayIsBuiltin(display) && !ddcReady(display) && !ddcFailed(display)) {
-        return;
-      }
-      holdBrightnessTick(display, value);
-      refreshMenu();
-    };
-    gBrightnessMeter.onScrubEnd = ^{
-      uint32_t display = gBrightnessScrubDisplay;
-      long pending = gBrightnessScrubPending;
-      gBrightnessScrubDisplay = 0;
-      gBrightnessScrubPending = -1;
-      if (display != 0 && pending >= 0) {
-        endBrightnessDrag(display, pending);
-        refreshMenu();
-      }
-      scheduleBrightnessHide();
-    };
-    gBrightnessPanel = [[BrightnessPanel alloc]
-        initWithContentRect:content
-                  styleMask:NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel
-                    backing:NSBackingStoreBuffered
-                      defer:NO];
-    gBrightnessPanel.opaque = NO;
-    gBrightnessPanel.backgroundColor = NSColor.clearColor;
-    gBrightnessPanel.hasShadow = NO;
-    gBrightnessPanel.level = NSStatusWindowLevel + 2;
-    gBrightnessPanel.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces |
-                                          NSWindowCollectionBehaviorStationary |
-                                          NSWindowCollectionBehaviorFullScreenAuxiliary |
-                                          NSWindowCollectionBehaviorIgnoresCycle;
-    gBrightnessPanel.hidesOnDeactivate = NO;
-    gBrightnessPanel.releasedWhenClosed = NO;
-    gBrightnessPanel.contentView = gBrightnessGlass;
-  }
-  NSRect icon = menuBarIconFrame();
-  NSScreen *anchor = screen;
-  if (icon.size.width > 1) {
-    NSPoint iconCenter = NSMakePoint(NSMidX(icon), NSMidY(icon));
-    for (NSScreen *candidate in [NSScreen screens]) {
-      if (NSPointInRect(iconCenter, candidate.frame)) {
-        anchor = candidate;
-        break;
-      }
-    }
-  }
-  NSNumber *anchorID = anchor.deviceDescription[@"NSScreenNumber"];
-  gBrightnessAnchor = anchorID.unsignedIntValue;
-  NSRect visible = anchor.visibleFrame;
-  CGFloat width = MIN(kBrightnessHUDWidth, visible.size.width - 16);
-  CGFloat height = MIN(kBrightnessHUDHeight, visible.size.height - 16);
-  NSSize size = NSMakeSize(width, height);
-  [gBrightnessGlass setFrameSize:size];
-  gBrightnessGlass.cornerRadius = height / 2.0;
-  gBrightnessDisplay = display;
-  gBrightnessMeter.displayName = displayTitle(display);
-  gBrightnessMeter.percent = percent;
-  [gBrightnessMeter setNeedsDisplay:YES];
-  CGFloat gap = 4;
-  CGFloat x = icon.size.width > 1 ? NSMidX(icon) - size.width / 2.0
-                                  : NSMaxX(visible) - 8 - size.width;
-  CGFloat y = icon.size.height > 1 ? NSMinY(icon) - gap - size.height
-                                  : NSMaxY(visible) - gap - size.height;
-  CGFloat minX = NSMinX(visible) + 8;
-  CGFloat maxX = NSMaxX(visible) - 8 - size.width;
-  if (x < minX) {
-    x = minX;
-  }
-  if (x > maxX) {
-    x = maxX;
-  }
-  if (y < NSMinY(visible) + 8) {
-    y = NSMinY(visible) + 8;
-  }
-  NSRect frame = NSMakeRect(x, y, size.width, size.height);
-  [gBrightnessPanel setFrame:frame display:YES];
-  gBrightnessPanel.alphaValue = 1;
-  [gBrightnessPanel orderFrontRegardless];
-  liftBrightnessHUD();
-  scheduleBrightnessHide();
-}
 
 static const char *scheduleName(int mode) {
   if (mode == 0) {
@@ -1349,58 +908,6 @@ static int parsedOnOff(const char *name) {
   return -1;
 }
 
-static BOOL writeBrightnessLine(int fd, uint32_t display) {
-  float level = 0;
-  BOOL writable = NO;
-  if (!readDisplayBrightness(display, &level, &writable)) {
-    return NO;
-  }
-  long percent = (long)llround(level * 100.0);
-  if (percent < 0) {
-    percent = 0;
-  }
-  if (percent > 100) {
-    percent = 100;
-  }
-  char name[128];
-  const char *raw = displayTitle(display).UTF8String;
-  size_t used = 0;
-  if (raw != NULL) {
-    for (size_t i = 0; raw[i] != '\0' && used + 1 < sizeof(name); i++) {
-      unsigned char c = (unsigned char)raw[i];
-      name[used++] = c < 32 ? ' ' : (char)c;
-    }
-  }
-  name[used] = '\0';
-  if (used == 0) {
-    snprintf(name, sizeof(name), "Display %u", display);
-  }
-  float ignored = 0;
-  const char *kind = "picture";
-  if (DisplayServicesCanChangeBrightness(display) ||
-      readCoreBrightness(display, &ignored) || ddcReady(display)) {
-    kind = "backlight";
-  }
-  dprintf(fd, "%u %s %ld %s\n", display, name, percent, kind);
-  return YES;
-}
-
-static BOOL knownDisplay(uint32_t display) {
-  uint32_t ids[16];
-  int count = orderedDisplays(ids, 16);
-  for (int i = 0; i < count; i++) {
-    if (ids[i] == display) {
-      return YES;
-    }
-  }
-  return NO;
-}
-
-// Set by a handler that keeps the connection to answer it later.
-static BOOL gKeepConnection = NO;
-// How long a CLI brightness reply waits for the lamp. Below main.m's
-// kBrightnessTimeout, so the CLI hears an answer.
-static const int64_t kBrightnessReplyWait = (int64_t)(8 * NSEC_PER_SEC);
 
 static BOOL handleControl(const char *buf, int fd) {
   if (strcmp(buf, "schedule") == 0) {
@@ -1505,86 +1012,6 @@ static BOOL handleControl(const char *buf, int fd) {
       return YES;
     }
     dprintf(fd, "%s\n", on ? "on" : "off");
-    return YES;
-  }
-  if (strcmp(buf, "ddc") == 0) {
-    // One reply line carries a full IORegistry path. 512 bytes fits the first
-    // display and drops the next display's reply.
-    char text[4096];
-    ddcCopyDebug(text, (int)sizeof(text));
-    if (text[0] == '\0') {
-      dprintf(fd, "ddc\n");
-    } else {
-      dprintf(fd, "%s", text);
-    }
-    return YES;
-  }
-  if (strcmp(buf, "brightness") == 0) {
-    uint32_t ids[16];
-    int count = orderedDisplays(ids, 16);
-    int written = 0;
-    for (int i = 0; i < count; i++) {
-      if (writeBrightnessLine(fd, ids[i])) {
-        written++;
-      }
-    }
-    if (written == 0) {
-      dprintf(fd, "failed\n");
-    }
-    return YES;
-  }
-  if (strncmp(buf, "brightness ", 11) == 0) {
-    unsigned display = 0;
-    long percent = 0;
-    int consumed = 0;
-    if (sscanf(buf + 11, "%u %ld%n", &display, &percent, &consumed) != 2 ||
-        buf[11 + consumed] != '\0' || percent < 0 || percent > 100 || !knownDisplay(display)) {
-      dprintf(fd, "failed\n");
-      return YES;
-    }
-    // Finding 5: the reply waits for the lamp write without blocking the
-    // main thread. The connection is ours now and is closed by answer, at
-    // the latest after kBrightnessReplyWait.
-    int reply = fd;
-    __block BOOL answered = NO;
-    void (^answer)(BOOL) = ^(BOOL ok) {
-      if (answered) {
-        return;
-      }
-      answered = YES;
-      long shown = readPercent(display);
-      if (shown < 0) {
-        shown = softwareDimPercent(display, percent);
-      }
-      if (ok) {
-        showBrightnessHUD(display, shown);
-        dprintf(reply, "%u %ld\n", display, shown);
-      } else {
-        dprintf(reply, "failed\n");
-      }
-      close(reply);
-    };
-    gKeepConnection = YES;
-    if (!setDisplayBrightnessThen(display, percent, ^(BOOL ok) {
-          answer(ok);
-        })) {
-      gKeepConnection = NO;
-      answered = YES;
-      dprintf(fd, "failed\n");
-      return YES;
-    }
-    // Still in flight: report the value it is heading for.
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, kBrightnessReplyWait),
-                   dispatch_get_main_queue(), ^{
-                     answer(YES);
-                   });
-    return YES;
-  }
-  if (strcmp(buf, "keys") == 0) {
-    if (!brightnessKeysReady()) {
-      startBrightnessKeys();
-    }
-    dprintf(fd, "%s\n", brightnessKeysReady() ? "on" : "off");
     return YES;
   }
   return NO;
@@ -2321,22 +1748,14 @@ static BOOL handleControl(const char *buf, int fd) {
 }
 @end
 
-@interface DisplayRow : NSObject
-@property(nonatomic) uint32_t display;
-@property(nonatomic, strong) NSSlider *slider;
-@property(nonatomic, strong) NSTextField *valueLabel;
-@end
-
-@implementation DisplayRow
-@end
-
 // Status menu layout, modelled on the stock Sound menu.
 static const CGFloat kMenuWidth = 300;
 static const CGFloat kMenuMargin = 14;
 static const CGFloat kMenuContentWidth = 272;  // kMenuWidth - 2 * kMenuMargin
 
 // Which menu sections are collapsed, one name per line, kept in the support
-// folder next to max, full and brightness.
+// folder next to max and full. A name for a section that no longer exists
+// (the old "brightness") is dropped here and so gone after the next save.
 static NSString *sectionsPath(void) {
   return [[NSHomeDirectory()
       stringByAppendingPathComponent:@"Library/Application Support/nightshift"]
@@ -2351,7 +1770,7 @@ static NSMutableSet<NSString *> *readCollapsedSections(void) {
   for (NSString *line in [text componentsSeparatedByString:@"\n"]) {
     NSString *name =
         [line stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-    if (name.length > 0) {
+    if (name.length > 0 && nsSectionKept(name.UTF8String)) {
       [names addObject:name];
     }
   }
@@ -2614,10 +2033,6 @@ static NSStackView *menuSection(NSArray<NSView *> *views, CGFloat spacing) {
 @property(nonatomic) BOOL fullCollapsed;
 // Called after any section opens or closes, so the menu can resize.
 @property(nonatomic, copy) void (^sectionToggled)(void);
-@property(nonatomic, strong) SectionHeader *brightHeader;
-@property(nonatomic, strong) NSStackView *brightBody;
-@property(nonatomic, strong) NSView *brightSection;
-@property(nonatomic, strong) NSView *brightDivider;
 @property(nonatomic, strong) SectionHeader *appearanceHeader;
 @property(nonatomic, strong) NSStackView *appearanceBody;
 @property(nonatomic, strong) NSMutableSet<NSString *> *collapsedSections;
@@ -2627,11 +2042,6 @@ static NSStackView *menuSection(NSArray<NSView *> *views, CGFloat spacing) {
 @property(nonatomic, strong) NSSegmentedControl *scheduleControl;
 @property(nonatomic, strong) NSButton *darkSwitch;
 @property(nonatomic, strong) NSButton *toneSwitch;
-@property(nonatomic, strong) NSStackView *brightRows;
-@property(nonatomic, strong) NSTextField *ddcNote;
-@property(nonatomic, strong) NSButton *keyButton;
-@property(nonatomic, strong) NSMutableArray<DisplayRow *> *displayRows;
-@property(nonatomic) uint32_t trackingDisplay;
 - (void)syncSliders;
 - (void)syncClock;
 - (void)syncDisplay;
@@ -2649,7 +2059,7 @@ static BOOL openWorkspaceURL(NSString *text) {
   return page != nil && [[NSWorkspace sharedWorkspace] openURL:page];
 }
 
-static void openBrightnessKeyAccess(void) {
+static void openWarmthKeyAccess(void) {
   for (NSWindow *window in NSApp.windows) {
     if (window.isVisible && [window.identifier isEqualToString:@"NightshiftSettings"]) {
       gSettingsKeepsOpenForOtherApp = YES;
@@ -2660,7 +2070,7 @@ static void openBrightnessKeyAccess(void) {
   AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)options);
   openWorkspaceURL(@"x-apple.systempreferences:com.apple.settings."
                    @"PrivacySecurity.extension?Privacy_Accessibility");
-  startBrightnessKeys();
+  startWarmthKeys();
 }
 
 @implementation StatusPanel
@@ -2820,29 +2230,6 @@ static void openBrightnessKeyAccess(void) {
 
   self.darkSwitch = [self appearanceButton];
   self.toneSwitch = [self appearanceButton];
-  NSStackView *brightRows = [[NSStackView alloc] initWithFrame:NSZeroRect];
-  brightRows.orientation = NSUserInterfaceLayoutOrientationVertical;
-  brightRows.alignment = NSLayoutAttributeLeading;
-  brightRows.spacing = 12;
-  [brightRows.widthAnchor constraintEqualToConstant:kMenuContentWidth].active = YES;
-  self.brightRows = brightRows;
-  self.displayRows = [NSMutableArray array];
-  NSTextField *ddcNote = [NSTextField
-      wrappingLabelWithString:@"Software dimming. This display's backlight is not controllable over DDC."];
-  ddcNote.font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize];
-  ddcNote.textColor = NSColor.secondaryLabelColor;
-  ddcNote.preferredMaxLayoutWidth = kMenuContentWidth;
-  [ddcNote.widthAnchor constraintEqualToConstant:kMenuContentWidth].active = YES;
-  ddcNote.hidden = YES;
-  self.ddcNote = ddcNote;
-  NSButton *keyButton = [NSButton buttonWithTitle:@"Allow brightness keys"
-                                           target:self
-                                           action:@selector(allowKeys:)];
-  keyButton.bezelStyle = NSBezelStyleRounded;
-  keyButton.controlSize = NSControlSizeSmall;
-  keyButton.font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize];
-  keyButton.hidden = brightnessKeysReady();
-  self.keyButton = keyButton;
 
   // Spacing: 10 between rows and under each title, 12 above and below each
   // divider, 14 side margins, as in the stock Sound menu.
@@ -2852,7 +2239,7 @@ static void openBrightnessKeyAccess(void) {
 
   // Max and Full at are the Pro ramp, so they share one section with one
   // PRO badge. Without Pro they show grayed out and the badge opens Pro.
-  // The section collapses like Brightness and Appearance. Full at keeps its
+  // The section collapses like Appearance. Full at keeps its
   // own disclosure while Ramp is open.
   PillView *rampPro = [[PillView alloc] initWithText:@"PRO"
                                               color:NSColor.controlAccentColor
@@ -2883,19 +2270,6 @@ static void openBrightnessKeyAccess(void) {
   [rampHeader setCollapsed:rampClosed animated:NO];
   rampBody.hidden = rampClosed;
 
-  SectionHeader *brightHeader =
-      [[SectionHeader alloc] initWithTitle:[self sectionLabel:@"Brightness"]
-                                 accessory:nil
-                            chevronLeading:NO];
-  brightHeader.toggled = ^(SectionHeader *header) {
-    [panel sectionHeaderToggled:header];
-  };
-  self.brightHeader = brightHeader;
-  NSStackView *brightBody = menuSection(@[ brightRows, ddcNote, keyButton ], 10);
-  self.brightBody = brightBody;
-  NSStackView *brightSection = menuSection(@[ brightHeader, brightBody ], 10);
-  self.brightSection = brightSection;
-
   SectionHeader *appearanceHeader =
       [[SectionHeader alloc] initWithTitle:[self sectionLabel:@"Appearance"]
                                  accessory:nil
@@ -2908,18 +2282,12 @@ static void openBrightnessKeyAccess(void) {
   self.appearanceBody = appearanceBody;
   NSStackView *appearanceSection = menuSection(@[ appearanceHeader, appearanceBody ], 10);
 
-  BOOL brightClosed = [self.collapsedSections containsObject:@"brightness"];
   BOOL appearanceClosed = [self.collapsedSections containsObject:@"appearance"];
-  [brightHeader setCollapsed:brightClosed animated:NO];
-  brightBody.hidden = brightClosed;
   [appearanceHeader setCollapsed:appearanceClosed animated:NO];
   appearanceBody.hidden = appearanceClosed;
 
-  NSView *brightDivider = menuHairline();
-  self.brightDivider = brightDivider;
   NSStackView *stack = [NSStackView stackViewWithViews:@[
-    nightSection, menuHairline(), rampSection, brightDivider, brightSection, menuHairline(),
-    appearanceSection
+    nightSection, menuHairline(), rampSection, menuHairline(), appearanceSection
   ]];
   stack.orientation = NSUserInterfaceLayoutOrientationVertical;
   stack.alignment = NSLayoutAttributeLeading;
@@ -2945,9 +2313,6 @@ static void openBrightnessKeyAccess(void) {
 - (void)applyAccent {
   tintSlider(self.nowSlider);
   tintSlider(self.maxSlider);
-  for (DisplayRow *row in self.displayRows) {
-    tintSlider(row.slider);
-  }
   self.scheduleControl.selectedSegmentBezelColor = NSColor.controlAccentColor;
   self.scheduleControl.needsDisplay = YES;
   self.rampClock.needsDisplay = YES;
@@ -3015,14 +2380,6 @@ static void openBrightnessKeyAccess(void) {
                  on:[trueToneClient() enabled]];
   }
   [self syncSchedule];
-  [self syncBrightness];
-  self.keyButton.hidden = brightnessKeysReady();
-  self.ddcNote.hidden = !externalNeedsDDC();
-}
-
-- (void)allowKeys:(id)sender {
-  (void)sender;
-  openBrightnessKeyAccess();
 }
 
 - (void)syncSchedule {
@@ -3040,116 +2397,6 @@ static void openBrightnessKeyAccess(void) {
   }
   if (self.scheduleControl.selectedSegment != segment) {
     self.scheduleControl.selectedSegment = segment;
-  }
-}
-
-- (BOOL)rowsMatchDisplays:(uint32_t *)ids count:(int)count {
-  if ((int)self.displayRows.count != count) {
-    return NO;
-  }
-  for (int i = 0; i < count; i++) {
-    if (self.displayRows[i].display != ids[i]) {
-      return NO;
-    }
-  }
-  return YES;
-}
-
-- (void)rebuildBrightness:(uint32_t *)ids count:(int)count {
-  NSArray<NSView *> *old = [self.brightRows.arrangedSubviews copy];
-  for (NSView *view in old) {
-    [self.brightRows removeArrangedSubview:view];
-    [view removeFromSuperview];
-  }
-  self.displayRows = [NSMutableArray array];
-  for (int i = 0; i < count; i++) {
-    float level = 0;
-    BOOL writable = NO;
-    BOOL readable = readDisplayBrightness(ids[i], &level, &writable);
-    ReleaseSlider *slider = [[ReleaseSlider alloc] initWithFrame:NSZeroRect];
-    slider.minValue = 0;
-    slider.maxValue = 100;
-    slider.continuous = YES;
-    tintSlider(slider);
-    slider.enabled = readable && writable;
-    slider.tag = (NSInteger)ids[i];
-    NSString *title = displayTitle(ids[i]);
-    slider.accessibilityLabel = title;
-    NSTextField *value = [self valueLabel];
-    NSTextField *name = [NSTextField labelWithString:title];
-    name.font = [NSFont systemFontOfSize:NSFont.systemFontSize];
-    name.lineBreakMode = NSLineBreakByTruncatingTail;
-    name.maximumNumberOfLines = 1;
-    [name.widthAnchor constraintEqualToConstant:kMenuContentWidth].active = YES;
-    NSStackView *controls = [NSStackView stackViewWithViews:@[ slider, value ]];
-    controls.orientation = NSUserInterfaceLayoutOrientationHorizontal;
-    controls.spacing = 8;
-    [controls setCustomSpacing:4 afterView:slider];
-    controls.alignment = NSLayoutAttributeCenterY;
-    [controls.widthAnchor constraintEqualToConstant:kMenuContentWidth].active = YES;
-    [controls.heightAnchor constraintGreaterThanOrEqualToConstant:24].active = YES;
-    NSStackView *row = [NSStackView stackViewWithViews:@[ name, controls ]];
-    row.orientation = NSUserInterfaceLayoutOrientationVertical;
-    row.alignment = NSLayoutAttributeLeading;
-    row.spacing = 4;
-    [row.widthAnchor constraintEqualToConstant:kMenuContentWidth].active = YES;
-    long percent = 0;
-    if (readable) {
-      percent = (long)llround(level * 100.0);
-      if (percent < 0) {
-        percent = 0;
-      }
-      if (percent > 100) {
-        percent = 100;
-      }
-      slider.doubleValue = percent;
-      value.stringValue = [NSString stringWithFormat:@"%ld%%", percent];
-    } else {
-      slider.doubleValue = 0;
-      value.stringValue = @"—";
-    }
-    DisplayRow *info = [[DisplayRow alloc] init];
-    info.display = ids[i];
-    info.slider = slider;
-    info.valueLabel = value;
-    [self.displayRows addObject:info];
-    [self.brightRows addArrangedSubview:row];
-  }
-}
-
-- (void)syncBrightness {
-  uint32_t ids[16];
-  int count = orderedDisplays(ids, 16);
-  self.brightSection.hidden = count == 0;
-  self.brightDivider.hidden = count == 0;
-  self.brightRows.hidden = count == 0;
-  if (self.trackingDisplay != 0) {
-    return;
-  }
-  if (![self rowsMatchDisplays:ids count:count]) {
-    [self rebuildBrightness:ids count:count];
-    return;
-  }
-  for (DisplayRow *row in self.displayRows) {
-    float level = 0;
-    BOOL writable = NO;
-    BOOL readable = readDisplayBrightness(row.display, &level, &writable);
-    row.slider.enabled = readable && writable;
-    if (!readable) {
-      row.valueLabel.stringValue = @"—";
-      continue;
-    }
-    long percent = (long)llround(level * 100.0);
-    if (percent < 0) {
-      percent = 0;
-    }
-    if (percent > 100) {
-      percent = 100;
-    }
-    if (llround(row.slider.doubleValue) != percent) {
-      row.slider.doubleValue = percent;
-    }
-    row.valueLabel.stringValue = [NSString stringWithFormat:@"%ld%%", percent];
   }
 }
 
@@ -3217,9 +2464,6 @@ static void openBrightnessKeyAccess(void) {
     if (header == self.rampHeader) {
       name = @"ramp";
       body = self.rampBody;
-    } else if (header == self.brightHeader) {
-      name = @"brightness";
-      body = self.brightBody;
     } else if (header == self.appearanceHeader) {
       name = @"appearance";
       body = self.appearanceBody;
@@ -3770,14 +3014,7 @@ static const CGFloat kIconTileImage = 60;
 @property(nonatomic, strong) FormRow *fullAtRow;
 @property(nonatomic, strong) NSButton *unlockButton;
 @property(nonatomic) BOOL editingFullAt;
-// Displays
-@property(nonatomic, strong) NSStackView *displaysStack;
-@property(nonatomic, strong) NSMutableArray<NSView *> *displaySections;
-@property(nonatomic, strong) NSMutableArray<DisplayRow *> *displayRows;
-@property(nonatomic, copy) NSString *displaySignature;
-@property(nonatomic) uint32_t trackingDisplay;
-@property(nonatomic, weak) id brightnessTarget;
-@property(nonatomic) SEL brightnessAction;
+// Keyboard
 @property(nonatomic, strong) DotView *keysDot;
 @property(nonatomic, strong) NSTextField *keysStatus;
 @property(nonatomic, strong) NSButton *keysButton;
@@ -3804,12 +3041,11 @@ static const CGFloat kIconTileImage = 60;
 - (void)syncPaid:(BOOL)paid soon:(BOOL)soon until:(NSString *)until buying:(BOOL)buying;
 - (void)paintSidebar;
 - (void)showMaxValue:(long)value;
-- (void)showBrightness:(long)percent forDisplay:(uint32_t)display;
 - (int)fullAtMinute;
 @end
 
 // The top menu bar while Settings is open. There is deliberately no Quit
-// here: quitting the daemon would drop brightness and warmth.
+// here: quitting the daemon would drop warmth.
 static void installSettingsMenu(void) {
   if (NSApp.mainMenu != nil) {
     return;
@@ -4417,47 +3653,11 @@ static void hugControls(NSView *view) {
                    @"extension?nightShift");
 }
 
-// MARK: Displays
-
-static void displayKind(uint32_t display, NSString **text, NSColor **color) {
-  float level = 0;
-  if (CGDisplayIsBuiltin(display)) {
-    *text = @"Built-in backlight";
-    *color = NSColor.secondaryLabelColor;
-  } else if (ddcReady(display)) {
-    // After a landed readback, or a framed DDC reply with a write. Not a bare write.
-    *text = [NSString stringWithUTF8String:nsDDCControlLabel(kNSDDCProbeControllable)];
-    *color = NSColor.systemGreenColor;
-  } else if (ddcPending(display) || ddcUnconfirmed(display)) {
-    *text = @"Checking DDC/CI…";
-    *color = NSColor.secondaryLabelColor;
-  } else if (readCoreBrightness(display, &level)) {
-    *text = @"Backlight";
-    *color = NSColor.secondaryLabelColor;
-  } else {
-    *text = [NSString stringWithUTF8String:nsDDCControlLabel(kNSDDCProbeSoftware)];
-    *color = NSColor.systemOrangeColor;
-  }
-}
-
-static NSString *displaySignature(uint32_t *ids, int count) {
-  NSMutableString *signature = [NSMutableString string];
-  for (int i = 0; i < count; i++) {
-    NSString *kind = nil;
-    NSColor *color = nil;
-    displayKind(ids[i], &kind, &color);
-    [signature appendFormat:@"%u:%@:%@;", ids[i], displayTitle(ids[i]), kind];
-  }
-  return signature;
-}
+// MARK: Keyboard
 
 - (NSView *)displaysPane {
-  self.displaySections = [NSMutableArray array];
-  self.displayRows = [NSMutableArray array];
-  [self addWords:@"Brightness"];
-  [self addWords:@"Display"];
-  [self addWords:@"DDC/CI"];
-  [self addWords:@"Software dimming"];
+  [self addWords:@"Keyboard"];
+  [self addWords:@"Warmth keys"];
 
   self.keysButton = [NSButton buttonWithTitle:@"Open Accessibility Settings…"
                                        target:nil
@@ -4473,111 +3673,23 @@ static NSString *displaySignature(uint32_t *ids, int count) {
   keysControl.orientation = NSUserInterfaceLayoutOrientationVertical;
   keysControl.alignment = NSLayoutAttributeTrailing;
   keysControl.spacing = 6;
-  FormRow *keysRow = [self row:@"Brightness Keys"
-                       caption:@"The brightness keys change the display under the pointer. "
-                               @"They need Accessibility access."
+  FormRow *keysRow = [self row:@"Warmth Keys"
+                       caption:@"Command-F1 and Command-F2 lower and raise Night Shift intensity. "
+                               @"With the brightness keys as media keys, they need "
+                               @"Accessibility access."
                        control:keysControl];
   NSView *keys = [self section:@"Keyboard"
                      accessory:nil
                           rows:@[ keysRow ]
-                        footer:@"When the backlight answers over DDC, the lower half of the range "
-                               @"dims the picture after the backlight is as low as it will go. "
-                               @"Otherwise the whole range is software dimming."];
-  NSStackView *stack = nil;
-  NSScrollView *page = [self pageWithSections:@[ keys ] stack:&stack];
-  self.displaysStack = stack;
-  return page;
-}
-
-- (void)rebuildDisplays:(uint32_t *)ids count:(int)count {
-  for (NSView *section in self.displaySections) {
-    [self.displaysStack removeArrangedSubview:section];
-    [section removeFromSuperview];
-  }
-  [self.displaySections removeAllObjects];
-  [self.displayRows removeAllObjects];
-  NSInteger saved = self.buildingPane;
-  self.buildingPane = kPaneDisplays;
-  for (int i = 0; i < count; i++) {
-    NSString *name = displayTitle(ids[i]);
-    NSString *kind = nil;
-    NSColor *color = nil;
-    displayKind(ids[i], &kind, &color);
-    PillView *pill = [[PillView alloc] initWithText:kind color:color solid:NO];
-    FormRow *control = [self row:@"Control" caption:nil control:pill];
-
-    NSSlider *slider = [self formSlider:200];
-    slider.tag = (NSInteger)ids[i];
-    slider.target = self.brightnessTarget;
-    slider.action = self.brightnessAction;
-    NSTextField *value = [self valueLabel];
-    FormRow *brightness = [self row:@"Brightness"
-                            caption:nil
-                            control:[self hstack:@[ slider, value ] spacing:8]];
-    slider.accessibilityLabel = [NSString stringWithFormat:@"%@ brightness", name];
-    // PHASE 2: Lowest brightness (a floor for the keys and the ramp) and a
-    // DDC/CI Test button join this group.
-    NSView *section = [self section:name
-                          accessory:nil
-                               rows:@[ control, brightness ]
-                             footer:nil];
-    DisplayRow *row = [[DisplayRow alloc] init];
-    row.display = ids[i];
-    row.slider = slider;
-    row.valueLabel = value;
-    [self.displayRows addObject:row];
-    [self.displaySections addObject:section];
-    [self.displaysStack insertArrangedSubview:section atIndex:(NSUInteger)i];
-  }
-  self.buildingPane = saved;
+                        footer:@"Brightness keys without Command are left to macOS."];
+  return [self pageWithSections:@[ keys ] stack:NULL];
 }
 
 - (void)syncDisplays {
-  uint32_t ids[16];
-  int count = orderedDisplays(ids, 16);
-  NSString *signature = displaySignature(ids, count);
-  if (self.trackingDisplay == 0 && ![signature isEqualToString:self.displaySignature]) {
-    self.displaySignature = signature;
-    [self rebuildDisplays:ids count:count];
-  }
-  for (DisplayRow *row in self.displayRows) {
-    if (row.display == self.trackingDisplay) {
-      continue;
-    }
-    float level = 0;
-    BOOL writable = NO;
-    BOOL readable = readDisplayBrightness(row.display, &level, &writable);
-    row.slider.enabled = readable && writable;
-    if (!readable) {
-      row.valueLabel.stringValue = @"—";
-      continue;
-    }
-    long percent = MAX(0L, MIN(100L, (long)llround(level * 100.0)));
-    [self showBrightness:percent forDisplay:row.display];
-  }
-  BOOL keys = brightnessKeysReady();
+  BOOL keys = warmthKeysReady();
   self.keysDot.color = keys ? NSColor.systemGreenColor : NSColor.systemOrangeColor;
   self.keysDot.needsDisplay = YES;
   self.keysStatus.stringValue = keys ? @"Allowed" : @"Not allowed";
-}
-
-- (void)showBrightness:(long)percent forDisplay:(uint32_t)display {
-  for (DisplayRow *row in self.displayRows) {
-    if (row.display == display) {
-      if (llround(row.slider.doubleValue) != percent) {
-        row.slider.doubleValue = percent;
-      }
-      row.valueLabel.stringValue = [NSString stringWithFormat:@"%ld%%", percent];
-      return;
-    }
-  }
-}
-
-- (void)screensChanged:(NSNotification *)notification {
-  (void)notification;
-  if (self.window.isVisible) {
-    [self syncDisplays];
-  }
 }
 
 // MARK: License
@@ -4616,8 +3728,8 @@ static NSString *licenseDay(NSString *until) {
   hero.edgeInsets = NSEdgeInsetsMake(12, kFormInset, 12, kFormInset);
   [hero.widthAnchor constraintEqualToConstant:kFormWidth].active = YES;
   NSTextField *about =
-      [self captionLabel:@"Pro unlocks the evening ramp, Max and Full at. Warmth, brightness, "
-                         @"Dark mode, and True Tone stay free."
+      [self captionLabel:@"Pro unlocks the evening ramp, Max and Full at. Warmth, Dark mode, "
+                         @"and True Tone stay free."
                    width:kFormWidth - 2 * kFormInset];
   NSStackView *aboutBox = [NSStackView stackViewWithViews:@[ about ]];
   aboutBox.edgeInsets = NSEdgeInsetsMake(0, kFormInset, 12, kFormInset);
@@ -4780,7 +3892,7 @@ static NSString *paneTitle(NSInteger pane) {
   switch (pane) {
     case kPaneGeneral: return @"General";
     case kPaneNightShift: return @"Night Shift";
-    case kPaneDisplays: return @"Displays";
+    case kPaneDisplays: return @"Keyboard";
     case kPaneLicense: return @"License";
     case kPaneAbout: return @"About";
     default: return @"";
@@ -4791,7 +3903,7 @@ static NSString *paneSymbol(NSInteger pane) {
   switch (pane) {
     case kPaneGeneral: return @"gearshape.fill";
     case kPaneNightShift: return @"sun.horizon.fill";
-    case kPaneDisplays: return @"display";
+    case kPaneDisplays: return @"keyboard";
     case kPaneLicense: return @"checkmark.seal.fill";
     case kPaneAbout: return @"info.circle.fill";
     default: return @"questionmark";
@@ -4977,11 +4089,6 @@ static NSImage *sidebarTile(NSInteger pane, CGFloat size) {
          selector:@selector(appResigned:)
              name:NSApplicationDidResignActiveNotification
            object:nil];
-  [[NSNotificationCenter defaultCenter]
-      addObserver:self
-         selector:@selector(screensChanged:)
-             name:NSApplicationDidChangeScreenParametersNotification
-           object:nil];
   [self.sidebarTable reloadData];
   [self.window center];
   [self applyPage:kPaneGeneral];
@@ -5114,9 +4221,6 @@ static NSImage *sidebarTile(NSInteger pane, CGFloat size) {
   [self.sidebarTable reloadData];
   [self selectPageRow];
   tintSlider(self.maxSlider);
-  for (DisplayRow *row in self.displayRows) {
-    tintSlider(row.slider);
-  }
   for (IconTile *tile in self.iconTiles) {
     tile.needsDisplay = YES;
   }
@@ -5249,7 +4353,6 @@ static NSImage *sidebarTile(NSInteger pane, CGFloat size) {
 @property(nonatomic, strong) StatusPanel *panel;
 @property(nonatomic) BOOL tracking;
 @property(nonatomic) BOOL menuOpen;
-@property(nonatomic) NSTimeInterval brightReleaseTime;
 @property(nonatomic) BOOL buying;
 @property(nonatomic) long pendingMax;
 @property(nonatomic, strong) id clockKeyMonitor;
@@ -5324,7 +4427,6 @@ static NSImage *sidebarTile(NSInteger pane, CGFloat size) {
                 if (strong.settings.window != nil) {
                   [strong.settings paintSidebar];
                 }
-                gBrightnessMeter.needsDisplay = YES;
               }];
   self.panel.sectionToggled = ^{
     [menu sizeMenuView];
@@ -5368,7 +4470,6 @@ static NSImage *sidebarTile(NSInteger pane, CGFloat size) {
   (void)menu;
   self.menuOpen = YES;
   self.tracking = NO;
-  probeDDC();
   [self refresh];
   [self armClockKeys];
   __weak MenuBar *menuBar = self;
@@ -5492,16 +4593,6 @@ static NSImage *sidebarTile(NSInteger pane, CGFloat size) {
   (void)menu;
   self.menuOpen = NO;
   [self disarmClockKeys];
-  if (self.panel.trackingDisplay != 0) {
-    for (DisplayRow *row in self.panel.displayRows) {
-      if (row.display == self.panel.trackingDisplay) {
-        [self brightReleaseHandled];
-        endBrightnessDrag(row.display, (long)llround(row.slider.doubleValue));
-        break;
-      }
-    }
-    self.panel.trackingDisplay = 0;
-  }
   [self commitPendingMax];
 }
 
@@ -5513,7 +4604,6 @@ static NSImage *sidebarTile(NSInteger pane, CGFloat size) {
   [self.panel syncSliders];
   [self.panel syncClock];
   [self.panel syncDisplay];
-  [self attachBrightnessSliders];
   [self syncLoginItem];
   [self syncStatusItem];
   [self sizeMenuView];
@@ -5567,9 +4657,6 @@ static NSImage *sidebarTile(NSInteger pane, CGFloat size) {
   if (self.settings == nil) {
     SettingsPanel *settings = [[SettingsPanel alloc] init];
     self.settings = settings;
-    // Display groups are built on the first sync, after this.
-    settings.brightnessTarget = self;
-    settings.brightnessAction = @selector(settingsBrightMoved:);
     settings.loginSwitch.target = self;
     settings.loginSwitch.action = @selector(toggleLogin:);
     settings.cycleSwitch.target = self;
@@ -5588,12 +4675,11 @@ static NSImage *sidebarTile(NSInteger pane, CGFloat size) {
     settings.fullAtPicker.action = @selector(settingsFullAtChanged:);
     __weak MenuBar *menu = self;
     settings.becameKey = ^{
-      probeDDC();
       [menu syncLoginItem];
     };
     settings.needsSync = ^{
       MenuBar *strong = menu;
-      if (strong != nil && !strong.settingsMaxTracking && strong.settings.trackingDisplay == 0) {
+      if (strong != nil && !strong.settingsMaxTracking) {
         [strong syncLoginItem];
       }
     };
@@ -5699,8 +4785,10 @@ static NSImage *sidebarTile(NSInteger pane, CGFloat size) {
   [self syncLoginItem];
 }
 
-// Like brightReleaseHandled, for the Settings sliders, which live outside
-// the menu and so always settle on mouse-up.
+// A mouse-up that already ended a Settings slider drag. NSSlider may send its
+// own action for the mouse-up, and ReleaseSlider sends another after
+// tracking; both look settled. The Settings sliders live outside the menu
+// and so always settle on mouse-up.
 - (BOOL)settingsReleaseHandled {
   NSEvent *event = NSApp.currentEvent;
   if (event == nil || event.type != NSEventTypeLeftMouseUp) {
@@ -5711,42 +4799,6 @@ static NSImage *sidebarTile(NSInteger pane, CGFloat size) {
   }
   self.settingsReleaseTime = event.timestamp;
   return NO;
-}
-
-// Brightness from Settings: the same paths as the menu. The built-in and a
-// confirmed DDC display follow the knob; every display saves once on release.
-- (void)settingsBrightMoved:(NSSlider *)slider {
-  uint32_t display = (uint32_t)slider.tag;
-  BOOL settled = sliderSettled();
-  if (settled && [self settingsReleaseHandled]) {
-    return;
-  }
-  long value = softwareDimPercent(display, (long)llround(slider.doubleValue));
-  [self.settings showBrightness:value forDisplay:display];
-  if (!settled) {
-    self.settings.trackingDisplay = display;
-    if (CGDisplayIsBuiltin(display) || ddcReady(display) || ddcFailed(display)) {
-      holdBrightnessTick(display, value);
-    }
-    return;
-  }
-  self.settings.trackingDisplay = 0;
-  if (!endBrightnessDrag(display, value)) {
-    [self syncLoginItem];
-    return;
-  }
-  long shown = readPercent(display);
-  if (shown >= 0) {
-    [self.settings showBrightness:shown forDisplay:display];
-  }
-  [self refresh];
-}
-
-- (void)attachBrightnessSliders {
-  for (DisplayRow *row in self.panel.displayRows) {
-    row.slider.target = self;
-    row.slider.action = @selector(brightMoved:);
-  }
 }
 
 - (void)previewCurrentIntensity:(long)value {
@@ -5931,65 +4983,6 @@ static NSImage *sidebarTile(NSInteger pane, CGFloat size) {
   });
 }
 
-// A mouse-up that already ended a brightness drag. NSSlider may send its own
-// action for the mouse-up, and ReleaseSlider sends another after tracking.
-// Both look settled, so without this a release sets and saves twice, the
-// second time with the readback brightMoved put on the slider.
-- (BOOL)brightReleaseHandled {
-  NSEvent *event = NSApp.currentEvent;
-  if (event == nil || event.type != NSEventTypeLeftMouseUp) {
-    return NO;
-  }
-  if (event.timestamp == self.brightReleaseTime) {
-    return YES;
-  }
-  self.brightReleaseTime = event.timestamp;
-  return NO;
-}
-
-- (void)brightMoved:(NSSlider *)slider {
-  uint32_t display = (uint32_t)slider.tag;
-  if ((sliderSettled() || !self.menuOpen) && [self brightReleaseHandled]) {
-    return;
-  }
-  long value = softwareDimPercent(display, (long)llround(slider.doubleValue));
-  slider.doubleValue = value;
-  for (DisplayRow *row in self.panel.displayRows) {
-    if (row.display == display) {
-      row.valueLabel.stringValue = [NSString stringWithFormat:@"%ld%%", value];
-      break;
-    }
-  }
-  // The built-in (a ~10ms DisplayServices call) and a confirmed DDC external
-  // (handed to the DDC worker, which keeps only the newest value) follow the
-  // knob live. Others still set once on release (ReleaseSlider sends that
-  // action after mouse-up). Ticks are held; the release saves once. Once
-  // the menu has closed, menuDidClose has ended the drag, so a late action
-  // ends it too rather than holding a value nothing would save.
-  if (!sliderSettled() && self.menuOpen) {
-    self.panel.trackingDisplay = display;
-    if (CGDisplayIsBuiltin(display) || ddcReady(display) || ddcFailed(display)) {
-      holdBrightnessTick(display, value);
-    }
-    return;
-  }
-  self.panel.trackingDisplay = 0;
-  if (!endBrightnessDrag(display, value)) {
-    [self refresh];
-    return;
-  }
-  long shown = readPercent(display);
-  if (shown >= 0) {
-    slider.doubleValue = shown;
-    for (DisplayRow *row in self.panel.displayRows) {
-      if (row.display == display) {
-        row.valueLabel.stringValue = [NSString stringWithFormat:@"%ld%%", shown];
-        break;
-      }
-    }
-  }
-}
-
 - (void)scheduleChanged:(NSSegmentedControl *)control {
   int modes[3] = {0, 2, 1};
   NSInteger segment = control.selectedSegment;
@@ -6045,7 +5038,7 @@ static NSImage *sidebarTile(NSInteger pane, CGFloat size) {
 
 - (void)allowKeys:(id)sender {
   (void)sender;
-  openBrightnessKeyAccess();
+  openWarmthKeyAccess();
   [self syncLoginItem];
 }
 
@@ -6053,24 +5046,11 @@ static NSImage *sidebarTile(NSInteger pane, CGFloat size) {
 
 static MenuBar *gMenu = nil;
 
-static NSRect menuBarIconFrame(void) {
-  NSButton *button = gMenu.item.button;
-  if (button == nil || button.window == nil) {
-    return NSZeroRect;
-  }
-  return [button.window convertRectToScreen:[button convertRect:button.bounds toView:nil]];
-}
-
 void refreshMenu(void) {
   if (gMenu == nil) {
     return;
   }
   [gMenu syncStatusItem];
-  // The probe finishes on the main queue. Refresh an open Settings window
-  // so the connected / software-dimming label updates with the result.
-  if (gMenu.settings.window.isVisible && gMenu.settings.trackingDisplay == 0) {
-    [gMenu.settings syncDisplays];
-  }
   if (!gMenu.menuOpen) {
     return;
   }
@@ -6112,415 +5092,20 @@ void refreshMenu(void) {
 
 static AppDelegate *gAppDelegate = nil;
 
-static long gBuiltinPercent = -1;
-static CFAbsoluteTime gLastBrightnessKey = 0;
 static BOOL gAskedForAccessibility = NO;
-static BOOL gHIDWatching = NO;
+static BOOL gWarmthKeysStarted = NO;
 static int gTapTries = 0;
 
-static BOOL brightnessKeysReady(void) {
+static BOOL warmthKeysReady(void) {
   return nsSessionTapInstalled();
 }
 
-typedef struct __IOHIDEvent *IOHIDEventRef;
-typedef struct __IOHIDEventSystemClient *IOHIDEventSystemClientRef;
-typedef void (*IOHIDEventCallback)(void *target, void *refcon, void *sender,
-                                   IOHIDEventRef event);
-// Monitor clients only watch HID events; they can't filter or take them.
-static const int kIOHIDEventSystemClientTypeMonitor = 1;
-extern IOHIDEventSystemClientRef IOHIDEventSystemClientCreateWithType(CFAllocatorRef allocator,
-                                                                      int type,
-                                                                      CFDictionaryRef attributes);
-extern void IOHIDEventSystemClientRegisterEventCallback(
-    IOHIDEventSystemClientRef client, IOHIDEventCallback callback, void *target,
-    void *refcon);
-extern void IOHIDEventSystemClientScheduleWithRunLoop(
-    IOHIDEventSystemClientRef client, CFRunLoopRef runLoop, CFStringRef mode);
-extern uint32_t IOHIDEventGetType(IOHIDEventRef event);
-extern int64_t IOHIDEventGetIntegerValue(IOHIDEventRef event, uint32_t field);
-extern CFArrayRef IOHIDEventGetChildren(IOHIDEventRef event);
-
-static uint32_t displayUnderPointer(void) {
-  NSPoint pointer = NSEvent.mouseLocation;
-  for (NSScreen *screen in NSScreen.screens) {
-    if (NSPointInRect(pointer, screen.frame)) {
-      return [screen.deviceDescription[@"NSScreenNumber"] unsignedIntValue];
-    }
-  }
-  return 0;
-}
-
-static uint32_t builtinDisplay(void) {
-  uint32_t count = 0;
-  CGDirectDisplayID ids[16];
-  if (CGGetOnlineDisplayList(16, ids, &count) != kCGErrorSuccess) {
-    return 0;
-  }
-  for (uint32_t i = 0; i < count; i++) {
-    if (CGDisplayIsBuiltin(ids[i])) {
-      return ids[i];
-    }
-  }
-  return 0;
-}
-
-static uint32_t gCursorHiddenDisplay = 0;
-static uint32_t gBlackCursorDisplays[8];
-static int gBlackCursorCount = 0;
-static NSTimer *gCursorHideTimer = nil;
-static id gCursorMonitor = nil;
-static CFMachPortRef gCursorTap = NULL;
-
-static void allowBackgroundCursor(void) {
-  static BOOL ready = NO;
-  if (ready) {
-    return;
-  }
-  typedef int (*SetProp)(int, int, CFStringRef, CFTypeRef);
-  typedef int (*Conn)(void);
-  SetProp setp = dlsym(RTLD_DEFAULT, "SLSSetConnectionProperty");
-  Conn conn = dlsym(RTLD_DEFAULT, "_SLSDefaultConnection");
-  if (setp == NULL || conn == NULL) {
-    return;
-  }
-  int cid = conn();
-  if (setp(cid, cid, CFSTR("SetsCursorInBackground"), kCFBooleanTrue) == 0) {
-    ready = YES;
-  }
-}
-
-static void showHiddenCursor(void) {
-  if (gCursorHiddenDisplay == 0) {
-    return;
-  }
-  allowBackgroundCursor();
-  CGDisplayShowCursor(gCursorHiddenDisplay);
-  gCursorHiddenDisplay = 0;
-}
-
-static void hideCursorOn(uint32_t display) {
-  if (display == 0 || gCursorHiddenDisplay == display) {
-    return;
-  }
-  showHiddenCursor();
-  allowBackgroundCursor();
-  if (CGDisplayHideCursor(display) != kCGErrorSuccess) {
-    return;
-  }
-  gCursorHiddenDisplay = display;
-}
-
-static void cancelCursorHide(void) {
-  [gCursorHideTimer invalidate];
-  gCursorHideTimer = nil;
-}
-
-static BOOL blackCursorHas(uint32_t display) {
-  for (int i = 0; i < gBlackCursorCount; i++) {
-    if (gBlackCursorDisplays[i] == display) {
-      return YES;
-    }
-  }
-  return NO;
-}
-
-static void blackCursorAdd(uint32_t display) {
-  if (display == 0 || blackCursorHas(display) || gBlackCursorCount >= 8) {
-    return;
-  }
-  gBlackCursorDisplays[gBlackCursorCount++] = display;
-}
-
-static void blackCursorRemove(uint32_t display) {
-  for (int i = 0; i < gBlackCursorCount; i++) {
-    if (gBlackCursorDisplays[i] != display) {
-      continue;
-    }
-    gBlackCursorCount--;
-    gBlackCursorDisplays[i] = gBlackCursorDisplays[gBlackCursorCount];
-    gBlackCursorDisplays[gBlackCursorCount] = 0;
-    return;
-  }
-}
-
-static BOOL displayIsBlack(uint32_t display) {
-  return blackCursorHas(display) && !CGDisplayIsBuiltin(display) && readPercent(display) == 0;
-}
-
-static void scheduleCursorHide(void) {
-  if (gCursorHideTimer != nil) {
-    [gCursorHideTimer setFireDate:[NSDate dateWithTimeIntervalSinceNow:1]];
-    return;
-  }
-  gCursorHideTimer = [NSTimer scheduledTimerWithTimeInterval:1
-                                                      repeats:NO
-                                                        block:^(NSTimer *timer) {
-                                                          (void)timer;
-                                                          gCursorHideTimer = nil;
-                                                          uint32_t under = displayUnderPointer();
-                                                          if (displayIsBlack(under)) {
-                                                            hideCursorOn(under);
-                                                          }
-                                                        }];
-}
-
-static void pokeCursor(void) {
-  if (gBlackCursorCount == 0 && gCursorHiddenDisplay == 0) {
-    return;
-  }
-  uint32_t under = displayUnderPointer();
-  if (!displayIsBlack(under)) {
-    cancelCursorHide();
-    showHiddenCursor();
-    return;
-  }
-  showHiddenCursor();
-  scheduleCursorHide();
-}
-
-static CGEventRef cursorTapEvent(CGEventTapProxy proxy, CGEventType type, CGEventRef event,
-                                 void *user) {
-  (void)proxy;
-  (void)user;
-  if (type == kCGEventTapDisabledByTimeout || type == kCGEventTapDisabledByUserInput) {
-    if (gCursorTap != NULL) {
-      CGEventTapEnable(gCursorTap, true);
-    }
-    return event;
-  }
-  if (gBlackCursorCount != 0 || gCursorHiddenDisplay != 0) {
-    pokeCursor();
-  }
-  return event;
-}
-
-static void watchCursor(void) {
-  if (gCursorTap == NULL) {
-    CGEventMask moved = CGEventMaskBit(kCGEventMouseMoved) | CGEventMaskBit(kCGEventLeftMouseDragged) |
-                        CGEventMaskBit(kCGEventRightMouseDragged) |
-                        CGEventMaskBit(kCGEventOtherMouseDragged) | CGEventMaskBit(kCGEventLeftMouseDown) |
-                        CGEventMaskBit(kCGEventRightMouseDown) | CGEventMaskBit(kCGEventOtherMouseDown) |
-                        CGEventMaskBit(kCGEventScrollWheel);
-    gCursorTap = CGEventTapCreate(kCGHIDEventTap, kCGHeadInsertEventTap, kCGEventTapOptionListenOnly,
-                                  moved, cursorTapEvent, NULL);
-    if (gCursorTap != NULL) {
-      CFRunLoopSourceRef source =
-          CFMachPortCreateRunLoopSource(kCFAllocatorDefault, gCursorTap, 0);
-      CFRunLoopAddSource(CFRunLoopGetMain(), source, kCFRunLoopCommonModes);
-      CFRelease(source);
-      CGEventTapEnable(gCursorTap, true);
-    }
-  }
-  if (gCursorMonitor != nil) {
-    return;
-  }
-  NSEventMask mask = NSEventMaskMouseMoved | NSEventMaskLeftMouseDragged |
-                     NSEventMaskRightMouseDragged | NSEventMaskOtherMouseDragged |
-                     NSEventMaskLeftMouseDown | NSEventMaskRightMouseDown |
-                     NSEventMaskOtherMouseDown | NSEventMaskScrollWheel;
-  gCursorMonitor = [NSEvent addGlobalMonitorForEventsMatchingMask:mask
-                                                          handler:^(NSEvent *event) {
-                                                            (void)event;
-                                                            pokeCursor();
-                                                          }];
-}
-
-void noteCursorBrightness(uint32_t display, long percent) {
-  if (![NSThread isMainThread]) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-      noteCursorBrightness(display, percent);
-    });
-    return;
-  }
-  if (display == 0 || CGDisplayIsBuiltin(display)) {
-    return;
-  }
-  if (percent <= 0) {
-    blackCursorAdd(display);
-    watchCursor();
-    cancelCursorHide();
-    if (displayUnderPointer() == display) {
-      hideCursorOn(display);
-    }
-    return;
-  }
-  blackCursorRemove(display);
-  if (gCursorHiddenDisplay == display) {
-    cancelCursorHide();
-    showHiddenCursor();
-  }
-}
-
-static BOOL cursorDisplayOnline(uint32_t display) {
-  for (NSScreen *screen in NSScreen.screens) {
-    if ([screen.deviceDescription[@"NSScreenNumber"] unsignedIntValue] == display) {
-      return YES;
-    }
-  }
-  return NO;
-}
-
-void noteCursorDisplaysOffline(void) {
-  if (gBlackCursorCount == 0 && gCursorHiddenDisplay == 0) {
-    return;
-  }
-  for (int i = gBlackCursorCount - 1; i >= 0; i--) {
-    uint32_t display = gBlackCursorDisplays[i];
-    if (cursorDisplayOnline(display)) {
-      continue;
-    }
-    blackCursorRemove(display);
-    if (gCursorHiddenDisplay == display) {
-      cancelCursorHide();
-      showHiddenCursor();
-    }
-  }
-  if (gCursorHiddenDisplay != 0 && !cursorDisplayOnline(gCursorHiddenDisplay)) {
-    cancelCursorHide();
-    showHiddenCursor();
-  }
-}
-
-long readPercent(uint32_t display) {
-  float level = 0;
-  BOOL writable = NO;
-  if (display == 0 || !readDisplayBrightness(display, &level, &writable) ||
-      !writable) {
-    return -1;
-  }
-  return (long)llround(level * 100.0);
-}
-
-static long steppedPercent(long percent, int direction, long stops) {
-  return nsSteppedPercent(percent, direction, stops);
-}
-
-static void rememberBuiltin(void) {
-  gBuiltinPercent = readPercent(builtinDisplay());
-}
-
-BOOL stepActiveBrightness(int direction) {
-  uint32_t display = displayUnderPointer();
-  uint32_t builtin = builtinDisplay();
-  if (display == 0) {
-    return NO;
-  }
-  long currentBuiltin = readPercent(builtin);
-  if (display == builtin && gBuiltinPercent >= 0 && currentBuiltin >= 0 &&
-      currentBuiltin != gBuiltinPercent) {
-    gBuiltinPercent = currentBuiltin;
-    showBrightnessHUD(display, currentBuiltin);
-    if (gMenu != nil && gMenu.menuOpen && !gMenu.tracking) {
-      [gMenu refresh];
-    }
-    return YES;
-  }
-  if (display != builtin && gBuiltinPercent >= 0 && currentBuiltin >= 0 &&
-      currentBuiltin != gBuiltinPercent) {
-    setDisplayBrightness(builtin, gBuiltinPercent);
-  }
-  long percent = readPercent(display);
-  if (percent < 0) {
-    if (ddcPending(display) && queueBrightnessKeyStep(direction)) {
-      return YES;
-    }
-    return NO;
-  }
-  long next = ddcReady(display) ? steppedPercent(percent, direction, 16)
-                               : softwareDimPercent(display, steppedPercent(percent, direction, 32));
-  if (next != percent && !setDisplayBrightness(display, next)) {
-    return NO;
-  }
-  long shown = next;
-  if (next != percent) {
-    long landed = readPercent(display);
-    if (landed >= 0) {
-      shown = landed;
-    }
-  }
-  rememberBuiltin();
-  refreshKeyDisplays();
-  showBrightnessHUD(display, shown);
-  if (gMenu != nil && gMenu.menuOpen && !gMenu.tracking) {
-    [gMenu refresh];
-  }
-  return YES;
-}
-
-static BOOL deliverBrightness(int direction) {
-  CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-  if (now - gLastBrightnessKey < 0.02) {
-    return YES;
-  }
-  if (![NSThread isMainThread]) {
-    gLastBrightnessKey = now;
-    dispatch_async(dispatch_get_main_queue(), ^{
-      stepActiveBrightness(direction);
-    });
-    return YES;
-  }
-  if (!stepActiveBrightness(direction)) {
-    return NO;
-  }
-  gLastBrightnessKey = now;
-  return YES;
-}
-
-static int brightnessDirection(NSEvent *key) {
-  if (key.type == NSEventTypeSystemDefined && key.subtype == 8) {
-    bool down = false;
-    int direction = nsMediaBrightnessKey((long)key.data1, &down);
-    return down ? direction : 0;
-  }
-  return 0;
-}
-
-// Whether to swallow a brightness key is decided from this copy of the
-// displays the main thread can step (readPercent works, or a DDC probe is
-// pending), refreshed on main by refreshKeyDisplays.
-static pthread_mutex_t gKeyLock = PTHREAD_MUTEX_INITIALIZER;
-static uint32_t gKeyDisplays[16];
-static int gKeyDisplayCount = 0;
-
-void refreshKeyDisplays(void) {
-  uint32_t ids[16];
-  int count = orderedDisplays(ids, 16);
-  uint32_t handled[16];
-  int kept = 0;
-  for (int i = 0; i < count; i++) {
-    if (readPercent(ids[i]) >= 0 || ddcPending(ids[i])) {
-      handled[kept++] = ids[i];
-    }
-  }
-  pthread_mutex_lock(&gKeyLock);
-  memcpy(gKeyDisplays, handled, sizeof(handled[0]) * (size_t)kept);
-  gKeyDisplayCount = kept;
-  pthread_mutex_unlock(&gKeyLock);
-}
-
-// Main thread. N5: a display whose step just failed stays out of the list
-// until the next refresh finds it working.
-static void dropKeyDisplay(uint32_t display) {
-  pthread_mutex_lock(&gKeyLock);
-  for (int i = 0; i < gKeyDisplayCount; i++) {
-    if (gKeyDisplays[i] == display) {
-      gKeyDisplays[i] = gKeyDisplays[--gKeyDisplayCount];
-      break;
-    }
-  }
-  pthread_mutex_unlock(&gKeyLock);
-}
-
-// Marks a key the tap swallowed and then handed back, so the taps let it
-// through the second time.
-static const int64_t kKeyReposted = 0x4e53686b;  // "NShk"
-
-// Tap thread: a brightness press the taps swallowed, so its release is
-// swallowed too. Cleared on main whenever the taps are (re-)created.
+// Tap thread: a Command+brightness press the tap swallowed, so its release
+// is swallowed too. Cleared on main whenever the tap is (re-)created.
 static BOOL gSwallowedPress[2];
 // Command+brightness was swallowed. Its release stays on the intensity path
-// even if Command is up first, and a later event for that key does not also
-// step the lamp. The tap thread sets it and main clears it, so it is atomic.
+// even if Command is up first. The tap thread sets it and main clears it,
+// so it is atomic.
 static atomic_bool gIntensityArm[2];
 static void commandWarmthFromMedia(int direction, bool down, bool repeat);
 static void endArmedIntensityHold(void);
@@ -6528,58 +5113,14 @@ static void endArmedIntensityHold(void);
 static atomic_bool gTapDisabledPending;
 static void handleTapsDisabled(void);
 
-// Tap thread. Whether the display under the event is one the main thread
-// can step; display is set to it either way.
-static BOOL keyDisplayHandled(CGEventRef event, uint32_t *displayOut) {
-  CGDirectDisplayID display = 0;
-  uint32_t found = 0;
-  *displayOut = 0;
-  if (CGGetDisplaysWithPoint(CGEventGetLocation(event), 1, &display, &found) != kCGErrorSuccess ||
-      found == 0) {
-    return NO;
-  }
-  *displayOut = display;
-  BOOL handled = NO;
-  pthread_mutex_lock(&gKeyLock);
-  for (int i = 0; i < gKeyDisplayCount; i++) {
-    if (gKeyDisplays[i] == display) {
-      handled = YES;
-      break;
-    }
-  }
-  pthread_mutex_unlock(&gKeyLock);
-  return handled;
-}
-
-// Main thread. Steps for a key the tap swallowed. When the step fails (a
-// stale list, a write error, a slot just demoted) the display is dropped
-// from the list and the key goes back to macOS, as if never tapped.
-static void deliverTappedKey(int direction, uint32_t display, CGEventRef copy) {
-  if (!deliverBrightness(direction)) {
-    refreshKeyDisplays();
-    dropKeyDisplay(display);
-    if (copy != NULL) {
-      CGEventSetIntegerValueField(copy, kCGEventSourceUserData, kKeyReposted);
-      CGEventPost(kCGHIDEventTap, copy);
-    }
-  }
-  if (copy != NULL) {
-    CFRelease(copy);
-  }
-}
-
-// Tap thread. Only system-defined (media) events reach the tap; plain
-// key-downs 144/145 come in as hotkeys instead.
-static int tapDirection(CGEventType type, CGEventRef event) {
-  if (type != (CGEventType)NSEventTypeSystemDefined) {
-    return 0;
-  }
-  NSEvent *key = [NSEvent eventWithCGEvent:event];
-  return key == nil ? 0 : brightnessDirection(key);
-}
-
-static CGEventRef brightnessKey(CGEventTapProxy proxy, CGEventType type,
-                                CGEventRef event, void *user) {
+// Tap thread. The tap exists only for the Cmd+F1 / Cmd+F2 warmth chord when
+// "Use F1, F2, etc. keys as standard function keys" is off: F1 and F2 are
+// then the brightness media keys, and Command alone on them steps Night
+// Shift intensity. Nightshift does not control brightness, so every other
+// event, a brightness key without Command included, goes back to macOS
+// untouched.
+static CGEventRef warmthKeyTap(CGEventTapProxy proxy, CGEventType type,
+                               CGEventRef event, void *user) {
   (void)proxy;
   (void)user;
   if (type == kCGEventTapDisabledByTimeout ||
@@ -6594,137 +5135,57 @@ static CGEventRef brightnessKey(CGEventTapProxy proxy, CGEventType type,
     }
     return event;
   }
+  if (type != (CGEventType)NSEventTypeSystemDefined) {
+    return event;
+  }
   @autoreleasepool {
-    if (CGEventGetIntegerValueField(event, kCGEventSourceUserData) == kKeyReposted) {
+    NSEvent *key = [NSEvent eventWithCGEvent:event];
+    if (key == nil || key.subtype != 8) {
       return event;
     }
-    // A brightness key whose press was swallowed has its release swallowed
-    // too, so nothing downstream sees a release without a press. Every
-    // other key, volume and mute included, goes back untouched.
-    //
-    // Command alone on brightness down/up is the same intensity chord as
-    // the NScm hotkey. fnState off delivers that as this media key, which
-    // RegisterEventHotKey cannot see. The event is consumed here. Command
-    // plus Shift, Control, Option, Help, or Function is left alone. No
-    // Command keeps the brightness path below.
-    if (type == (CGEventType)NSEventTypeSystemDefined) {
-      NSEvent *key = [NSEvent eventWithCGEvent:event];
-      bool down = false;
-      long data1 = 0;
-      int brightness = 0;
-      if (key != nil && key.subtype == 8) {
-        data1 = (long)key.data1;
-        brightness = nsMediaBrightnessKey(data1, &down);
-      }
-      if (brightness != 0) {
-        int index = brightness > 0;
-        if (atomic_load(&gIntensityArm[index])) {
-          if (!down) {
-            atomic_store(&gIntensityArm[index], false);
-            gSwallowedPress[index] = NO;
-            commandWarmthFromMedia(brightness, false, false);
-          } else {
-            // A repeat, or a second down beside the hotkey, must not step.
-            commandWarmthFromMedia(brightness, true, true);
-          }
-          return NULL;
-        }
-        NSMediaRoute route =
-            nsMediaBrightnessRoute(data1, (uint64_t)CGEventGetFlags(event), &down);
-        if (!down) {
-          // A press this tap swallowed still hides its release, including
-          // when the modifiers changed before the key came up.
-          BOOL *pressed = &gSwallowedPress[index];
-          BOOL swallow = *pressed;
-          *pressed = NO;
-          return swallow ? NULL : event;
-        }
-        if (route == kNSMediaRouteIntensity) {
-          atomic_store(&gIntensityArm[index], true);
-          gSwallowedPress[index] = YES;
-          commandWarmthFromMedia(brightness, true, nsMediaKeyRepeat(data1));
-          return NULL;
-        }
-        if (route == kNSMediaRouteUntouched) {
-          return event;
-        }
-      }
-    }
-    int direction = tapDirection(type, event);
-    uint32_t display = 0;
-    if (direction == 0 || !keyDisplayHandled(event, &display)) {
+    bool down = false;
+    long data1 = (long)key.data1;
+    int direction = nsMediaBrightnessKey(data1, &down);
+    if (direction == 0) {
+      // Volume, mute, play and the rest.
       return event;
     }
-    gSwallowedPress[direction > 0] = YES;
-    // Guards against a press delivered twice; only the first one steps.
-    static CFAbsoluteTime last = 0;
-    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-    if (now - last >= 0.02) {
-      last = now;
-      // N5: swallowed on the strength of the cached list, so keep a copy to
-      // hand back to macOS if the step fails.
-      CGEventRef copy = CGEventCreateCopy(event);
-      dispatch_async(dispatch_get_main_queue(), ^{
-        deliverTappedKey(direction, display, copy);
-      });
-    }
-    return NULL;
-  }
-}
-
-static void considerBrightnessEvent(IOHIDEventRef event) {
-  if (event == NULL) {
-    return;
-  }
-  if (IOHIDEventGetType(event) == 3) {
-    int64_t page = IOHIDEventGetIntegerValue(event, 3u << 16);
-    int64_t usage = IOHIDEventGetIntegerValue(event, (3u << 16) + 1);
-    int64_t down = IOHIDEventGetIntegerValue(event, (3u << 16) + 2);
-    if (page == 0x0C && down != 0 && (usage == 0x6F || usage == 0x70)) {
-      // This monitor cannot swallow the key. Command alone is intensity,
-      // owned by the session tap, and Command plus another modifier is left
-      // for macOS. Either one must not also move the lamp from here.
-      bool pressed = false;
-      long data1 = (3L << 16) | (0xAL << 8);
-      CGEventFlags flags = CGEventSourceFlagsState(kCGEventSourceStateCombinedSessionState);
-      NSMediaRoute route = nsMediaBrightnessRoute(data1, (uint64_t)flags, &pressed);
-      if (route == kNSMediaRouteBrightness) {
-        deliverBrightness(usage == 0x6F ? 1 : -1);
+    int index = direction > 0;
+    if (atomic_load(&gIntensityArm[index])) {
+      if (!down) {
+        atomic_store(&gIntensityArm[index], false);
+        gSwallowedPress[index] = NO;
+        commandWarmthFromMedia(direction, false, false);
+      } else {
+        // A repeat, or a second down beside the hotkey, must not step.
+        commandWarmthFromMedia(direction, true, true);
       }
+      return NULL;
     }
-  }
-  CFArrayRef children = IOHIDEventGetChildren(event);
-  if (children == NULL) {
-    return;
-  }
-  CFIndex count = CFArrayGetCount(children);
-  for (CFIndex i = 0; i < count; i++) {
-    considerBrightnessEvent((IOHIDEventRef)CFArrayGetValueAtIndex(children, i));
+    NSMediaRoute route =
+        nsMediaBrightnessRoute(data1, (uint64_t)CGEventGetFlags(event), &down);
+    if (!down) {
+      // A press this tap swallowed still hides its release, including when
+      // the modifiers changed before the key came up.
+      BOOL swallow = gSwallowedPress[index];
+      gSwallowedPress[index] = NO;
+      return swallow ? NULL : event;
+    }
+    if (route == kNSMediaRouteIntensity) {
+      atomic_store(&gIntensityArm[index], true);
+      gSwallowedPress[index] = YES;
+      commandWarmthFromMedia(direction, true, nsMediaKeyRepeat(data1));
+      return NULL;
+    }
+    // kNSMediaRouteBrightness (no Command) and kNSMediaRouteUntouched
+    // (Command plus another modifier): macOS handles them.
+    return event;
   }
 }
 
-static void hidBrightness(void *target, void *refcon, void *sender,
-                          IOHIDEventRef event) {
-  (void)target;
-  (void)refcon;
-  (void)sender;
-  considerBrightnessEvent(event);
-}
+static void startWarmthKeys(void);
 
-static void watchHIDBrightness(void) {
-  IOHIDEventSystemClientRef client = IOHIDEventSystemClientCreateWithType(
-      kCFAllocatorDefault, kIOHIDEventSystemClientTypeMonitor, NULL);
-  if (client == NULL) {
-    return;
-  }
-  IOHIDEventSystemClientRegisterEventCallback(client, hidBrightness, NULL, NULL);
-  IOHIDEventSystemClientScheduleWithRunLoop(client, CFRunLoopGetMain(),
-                                            kCFRunLoopCommonModes);
-}
-
-static void startBrightnessKeys(void);
-
-// Main thread. At most one pending retry of startBrightnessKeys.
+// Main thread. At most one pending retry of startWarmthKeys.
 static BOOL gTapRetryScheduled = NO;
 static void scheduleTapRetry(double delay) {
   if (gTapRetryScheduled) {
@@ -6734,11 +5195,11 @@ static void scheduleTapRetry(double delay) {
   dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
                  dispatch_get_main_queue(), ^{
                    gTapRetryScheduled = NO;
-                   startBrightnessKeys();
+                   startWarmthKeys();
                  });
 }
 
-// Main thread. Drops the taps so installBrightnessTap can re-create them,
+// Main thread. Drops the taps so installWarmthKeyTap can re-create them,
 // and lets the permission poll do that once Accessibility is back.
 void dropTapsAndRetry(void) {
   endArmedIntensityHold();
@@ -6770,7 +5231,7 @@ static void handleTapsDisabled(void) {
                  dispatch_get_main_queue(), ^{
                    if (!AXIsProcessTrusted()) {
                      // Revoked during the wait: disabled taps left in place
-                     // would block installBrightnessTap for good.
+                     // would block installWarmthKeyTap for good.
                      dropTapsAndRetry();
                      return;
                    }
@@ -6779,46 +5240,13 @@ static void handleTapsDisabled(void) {
                  });
 }
 
-bool installBrightnessTap(void) {
+bool installWarmthKeyTap(void) {
   if (nsSessionTapInstalled()) {
     return true;
   }
   endArmedIntensityHold();
   gSwallowedPress[0] = gSwallowedPress[1] = NO;
-  refreshKeyDisplays();
-  return nsSessionTapCreate(brightnessKey);
-}
-
-// Main thread. Key codes 144/145 (brightness on keyboards that send them as
-// plain keys) as hotkeys, so macOS reports only these two to Nightshift.
-static OSStatus brightnessHotKey(EventHandlerCallRef next, EventRef event, void *user) {
-  (void)next;
-  (void)user;
-  EventHotKeyID hotKey;
-  if (GetEventParameter(event, kEventParamDirectObject, typeEventHotKeyID, NULL,
-                        sizeof(hotKey), NULL, &hotKey) != noErr) {
-    return eventNotHandledErr;
-  }
-  // Cmd+F1 / Cmd+F2 use another signature. Without this they would also
-  // step through the plain brightness keys.
-  if (hotKey.signature != 'NShk') {
-    return eventNotHandledErr;
-  }
-  deliverBrightness(hotKey.id == 1 ? 1 : -1);
-  return noErr;
-}
-
-static void registerBrightnessHotKeys(void) {
-  EventTypeSpec pressed = {kEventClassKeyboard, kEventHotKeyPressed};
-  InstallApplicationEventHandler(brightnessHotKey, 1, &pressed, NULL, NULL);
-  const UInt32 codes[2] = {144, 145};
-  for (UInt32 i = 0; i < 2; i++) {
-    EventHotKeyRef ref = NULL;
-    EventHotKeyID hotKey = {'NShk', i + 1};
-    if (RegisterEventHotKey(codes[i], 0, hotKey, GetApplicationEventTarget(), 0, &ref) != noErr) {
-      NSLog(@"nightshift: brightness hotkey %u not registered", (unsigned)codes[i]);
-    }
-  }
+  return nsSessionTapCreate(warmthKeyTap);
 }
 
 // Cmd+F1 lowers Night Shift intensity, Cmd+F2 raises it. The value is the
@@ -7063,16 +5491,12 @@ static void unregisterCommandWarmthHotKeys(void) {
   }
 }
 
-static void startBrightnessKeys(void) {
-  if (!gHIDWatching) {
-    gHIDWatching = YES;
-    watchHIDBrightness();
-    registerBrightnessHotKeys();
+static void startWarmthKeys(void) {
+  if (!gWarmthKeysStarted) {
+    gWarmthKeysStarted = YES;
     registerCommandWarmthHotKeys();
-    rememberBuiltin();
-    probeDDC();
   }
-  if (installBrightnessTap()) {
+  if (installWarmthKeyTap()) {
     if (gMenu != nil) {
       [gMenu refresh];
     }
@@ -7083,7 +5507,7 @@ static void startBrightnessKeys(void) {
     [NSApp activate];
     NSDictionary *options = @{(__bridge id)kAXTrustedCheckOptionPrompt : @YES};
     AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)options);
-    notifyPlain(@"Allow Nightshift in Accessibility to use the brightness keys");
+    notifyPlain(@"Allow Nightshift in Accessibility to use Command-F1 and Command-F2 for warmth");
   }
   // Never gives up: 2 s for about a minute, then every 30 s.
   double retry = nsTapRetryDelay(gTapTries);
@@ -7093,7 +5517,7 @@ static void startBrightnessKeys(void) {
   scheduleTapRetry(retry);
 }
 
-// Main thread. Shows the Brightness Keys state in the menu and, when open,
+// Main thread. Shows the Warmth Keys state in the menu and, when open,
 // in Settings.
 void refreshKeysState(void) {
   if (gMenu == nil) {
@@ -7115,38 +5539,8 @@ static void installMenu(void) {
   [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
   gAppDelegate = [[AppDelegate alloc] init];
   NSApp.delegate = gAppDelegate;
-  [[NSNotificationCenter defaultCenter]
-      addObserverForName:NSApplicationDidChangeScreenParametersNotification
-                  object:nil
-                   queue:NSOperationQueue.mainQueue
-              usingBlock:^(NSNotification *note) {
-                (void)note;
-                refitDimWindows();
-                // Finding 4: drop slots for displays that left now, even
-                // when the probe below is throttled or busy, and re-read
-                // the ones that stayed, since a quick replug can keep the
-                // display ID with a new service behind it.
-                forgetOfflineDisplays();
-                ddcRevalidate();
-                refreshKeyDisplays();
-              }];
-  NSNotificationCenter *workspace = NSWorkspace.sharedWorkspace.notificationCenter;
-  for (NSNotificationName name in @[ NSWorkspaceDidWakeNotification,
-                                     NSWorkspaceScreensDidWakeNotification ]) {
-    [workspace addObserverForName:name
-                           object:nil
-                            queue:NSOperationQueue.mainQueue
-                       usingBlock:^(NSNotification *note) {
-                         (void)note;
-                         noteDisplayWake();
-                         // Finding 4: monitors may have power-cycled.
-                         forgetOfflineDisplays();
-                         ddcRevalidate();
-                         refreshKeyDisplays();
-                       }];
-  }
   gMenu = [[MenuBar alloc] init];
-  startBrightnessKeys();
+  startWarmthKeys();
   nsSessionTapWatch();
   [gMenu refresh];
 }
@@ -7160,20 +5554,15 @@ static void teardownDaemon(void) {
   }
   done = YES;
   unregisterCommandWarmthHotKeys();
-  settleBrightnessOnQuit();
-  gBlackCursorCount = 0;
-  cancelCursorHide();
-  showHiddenCursor();
   if (gSockPath[0] != '\0') {
     unlink(gSockPath);
     gSockPath[0] = '\0';
   }
-  drainBrightnessQueue();
 }
 
 // Finding 12: SIGINT and SIGTERM (logout, launchctl, kill) run the same
-// teardown as Quit, so held and pending brightness is saved and the shades
-// and cursor are put back. Handled on the main queue through dispatch
+// teardown as Quit, so a held warmth key is saved and the socket is
+// removed. Handled on the main queue through dispatch
 // sources, not in a signal handler, so teardown may use Cocoa.
 static dispatch_source_t gSignalSources[2];
 
@@ -7359,8 +5748,6 @@ int main(void) {
     chmod(dir.fileSystemRepresentation, S_IRWXU);
     gMaxPath = [dir stringByAppendingPathComponent:@"max"];
     gRampPath = [dir stringByAppendingPathComponent:@"full"];
-    setBrightnessPath([dir stringByAppendingPathComponent:@"brightness"]);
-    loadBrightness();
     long saved = 0;
     if (readMax(&saved)) {
       gMax = saved;
@@ -7403,12 +5790,11 @@ int main(void) {
     dispatch_source_set_event_handler(gTimer, ^{
       rampTick();
       refreshMenu();
-      refreshKeyDisplays();
     });
     dispatch_resume(gTimer);
 
     // Finding 5: accept and read off the main thread, so a client that
-    // connects and stalls can't freeze the menu or the brightness keys.
+    // connects and stalls can't freeze the menu or the warmth keys.
     // Only the parsed line is handled on main. Connections are read one at
     // a time on this one serial queue: a stalled client holds it for at most
     // the 2 s read timeout, and waiting clients stay in the listen backlog
@@ -7451,18 +5837,13 @@ int main(void) {
         return;
       }
       dispatch_async(dispatch_get_main_queue(), ^{
-        gKeepConnection = NO;
         handleLine(line, connection);
-        BOOL keep = gKeepConnection;
-        gKeepConnection = NO;
         free(line);
         refreshMenu();
         if (gMenu != nil) {
           [gMenu syncLoginItem];
         }
-        if (!keep) {
-          close(connection);
-        }
+        close(connection);
       });
     });
     dispatch_resume(gListener);
