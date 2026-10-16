@@ -78,6 +78,19 @@ bool nsDDCLocationSame(const char *a, const char *b);
 // target location that misses every located service, is not a guess.
 int nsDDCPickCandidate(const DDCCandidate *candidates, int count, const DDCTarget *target);
 
+// m1ddc 1.2.0 getDisplayAVService. Walk the service plane in order. phase
+// stays 0 until path equals the display's IODisplayLocation; that node is
+// not taken. After that, Take is true for each DCPAVServiceProxy whose
+// Location is exactly "External". A missing or empty location is not
+// external, so the caller keeps walking. The caller stops at the first true
+// for which IOAVServiceCreateWithService succeeds.
+typedef struct {
+  int phase;
+} NSDDCM1ddcWalk;
+void nsDDCM1ddcWalkInit(NSDDCM1ddcWalk *walk);
+bool nsDDCM1ddcWalkTake(NSDDCM1ddcWalk *walk, const char *path, const char *name,
+                        const char *location, const char *displayLocation);
+
 // MARK: DDC slots and readback
 
 // The slot a display's channel belongs in: its own slot when it has one, else

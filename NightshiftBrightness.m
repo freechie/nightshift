@@ -453,10 +453,6 @@ static BOOL ddcPortName(const char *name, char stop, char *out, size_t cap) {
   return nsDDCPortName(name, stop, out, cap);
 }
 
-static int ddcPickCandidate(const DDCCandidate *candidates, int count, const DDCTarget *target) {
-  return nsDDCPickCandidate(candidates, count, target);
-}
-
 typedef CFDictionaryRef (*DisplayInfoFn)(CGDirectDisplayID display);
 
 static void copyLocation(const char *path, char *out, size_t cap) {
@@ -499,11 +495,14 @@ static void portFromPath(const char *path, char *out, size_t cap) {
 // CGDisplay, so the path is kept either way. The port name is the dispext
 // segment, including when the framebuffer class is not AppleCLCD2.
 static void displayPipe(CGDirectDisplayID display, char *port, size_t portCap, char *location,
-                        size_t locationCap) {
+                        size_t locationCap, char *fullLocation, size_t fullCap) {
   static DisplayInfoFn info = NULL;
   static dispatch_once_t once;
   port[0] = '\0';
   location[0] = '\0';
+  if (fullLocation != NULL && fullCap > 0) {
+    fullLocation[0] = '\0';
+  }
   dispatch_once(&once, ^{
     info = (DisplayInfoFn)dlsym(RTLD_DEFAULT, "CoreDisplay_DisplayCreateInfoDictionary");
     if (info == NULL) {
@@ -529,225 +528,79 @@ static void displayPipe(CGDirectDisplayID display, char *port, size_t portCap, c
     return;
   }
   copyLocation(path, location, locationCap);
+  if (fullLocation != NULL && fullCap > 0) {
+    copyLocation(path, fullLocation, fullCap);
+  }
   portFromPath(path, port, portCap);
-}
-
-static void readProductAttributes(CFTypeRef attributes, DDCCandidate *candidate) {
-  if (attributes == NULL || CFGetTypeID(attributes) != CFDictionaryGetTypeID()) {
-    return;
-  }
-  CFTypeRef product = CFDictionaryGetValue(attributes, CFSTR("ProductAttributes"));
-  if (product == NULL || CFGetTypeID(product) != CFDictionaryGetTypeID()) {
-    return;
-  }
-  int64_t value = 0;
-  CFTypeRef legacy = CFDictionaryGetValue(product, CFSTR("LegacyManufacturerID"));
-  CFTypeRef productID = CFDictionaryGetValue(product, CFSTR("ProductID"));
-  CFTypeRef serial = CFDictionaryGetValue(product, CFSTR("SerialNumber"));
-  if (legacy != NULL && CFGetTypeID(legacy) == CFNumberGetTypeID() &&
-      CFNumberGetValue(legacy, kCFNumberSInt64Type, &value)) {
-    candidate->vendor = (uint32_t)value;
-  }
-  if (productID != NULL && CFGetTypeID(productID) == CFNumberGetTypeID() &&
-      CFNumberGetValue(productID, kCFNumberSInt64Type, &value)) {
-    candidate->product = (uint32_t)value;
-  }
-  if (serial != NULL && CFGetTypeID(serial) == CFNumberGetTypeID() &&
-      CFNumberGetValue(serial, kCFNumberSInt64Type, &value) && value > 0) {
-    candidate->serial = (uint32_t)value;
-  }
-}
-
-// AppleCLCD2, IOMobileFramebuffer (the shim and the built-in HDMI class), or
-// any sibling that publishes DisplayAttributes. Two different paths under one
-// proxy clear the location so the picker cannot bind the wrong display.
-static void considerFramebuffer(io_registry_entry_t entry, DDCCandidate *candidate, BOOL *blocked) {
-  if (blocked == NULL || *blocked || entry == MACH_PORT_NULL) {
-    return;
-  }
-  io_name_t name;
-  name[0] = '\0';
-  IORegistryEntryGetName(entry, name);
-  BOOL named = strstr(name, "AppleCLCD") != NULL || strstr(name, "IOMobileFramebuffer") != NULL;
-  CFTypeRef attributes =
-      IORegistryEntryCreateCFProperty(entry, CFSTR("DisplayAttributes"), kCFAllocatorDefault, 0);
-  if (!named && attributes == NULL) {
-    return;
-  }
-  io_string_t path;
-  path[0] = '\0';
-  if (IORegistryEntryGetPath(entry, kIOServicePlane, path) != KERN_SUCCESS) {
-    if (attributes != NULL) {
-      CFRelease(attributes);
-    }
-    return;
-  }
-  char location[256];
-  copyLocation(path, location, sizeof(location));
-  if (location[0] == '\0') {
-    if (attributes != NULL) {
-      CFRelease(attributes);
-    }
-    return;
-  }
-  if (candidate->location[0] != '\0' && strcmp(candidate->location, location) != 0) {
-    candidate->location[0] = '\0';
-    *blocked = YES;
-    if (attributes != NULL) {
-      CFRelease(attributes);
-    }
-    return;
-  }
-  if (candidate->location[0] == '\0') {
-    copyLocation(location, candidate->location, sizeof(candidate->location));
-  }
-  if (candidate->port[0] == '\0') {
-    portFromPath(path, candidate->port, sizeof(candidate->port));
-  }
-  if (candidate->product == 0) {
-    readProductAttributes(attributes, candidate);
-  }
-  if (attributes != NULL) {
-    CFRelease(attributes);
-  }
-}
-
-// The framebuffer is a sibling of DCPAVServiceProxy, or an ancestor, and on
-// built-in HDMI it is not always the direct parent named dispextN.
-static void inheritFramebuffer(io_service_t service, DDCCandidate *candidate) {
-  BOOL blocked = NO;
-  io_registry_entry_t node = service;
-  BOOL releaseNode = NO;
-  for (int depth = 0; depth < 6 && !blocked && candidate->location[0] == '\0'; depth++) {
-    io_registry_entry_t parent = MACH_PORT_NULL;
-    if (IORegistryEntryGetParentEntry(node, kIOServicePlane, &parent) != KERN_SUCCESS) {
-      break;
-    }
-    io_name_t name;
-    name[0] = '\0';
-    if (IORegistryEntryGetName(parent, name) == KERN_SUCCESS && candidate->port[0] == '\0') {
-      if (!ddcPortName(name, ':', candidate->port, sizeof(candidate->port))) {
-        ddcPortName(name, '@', candidate->port, sizeof(candidate->port));
-      }
-    }
-    considerFramebuffer(parent, candidate, &blocked);
-    io_iterator_t kids = 0;
-    if (!blocked &&
-        IORegistryEntryGetChildIterator(parent, kIOServicePlane, &kids) == KERN_SUCCESS) {
-      io_service_t child;
-      while ((child = IOIteratorNext(kids))) {
-        if (child != node) {
-          considerFramebuffer(child, candidate, &blocked);
-        }
-        IOObjectRelease(child);
-        if (blocked) {
-          break;
-        }
-      }
-      IOObjectRelease(kids);
-    }
-    if (releaseNode) {
-      IOObjectRelease(node);
-    }
-    node = parent;
-    releaseNode = YES;
-  }
-  if (releaseNode && node != MACH_PORT_NULL) {
-    IOObjectRelease(node);
-  }
 }
 
 // IORegistry path of the DCPAVServiceProxy bound for the display in progress.
 static char gBoundServicePath[512];
 
-// index, when set, receives the candidate ordinal or -1. The service is the
-// one path or identity that is unambiguous. EDID is optional: a framebuffer
-// path is enough, and a failed EDID copy no longer drops the HDMI service.
-static IOAVServiceRef serviceMatching(const DDCTarget *target, int *index) {
-  if (index != NULL) {
-    *index = -1;
-  }
-  io_iterator_t iter = 0;
-  if (IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("DCPAVServiceProxy"),
-                                   &iter) != KERN_SUCCESS) {
+// m1ddc 1.2.0 getDisplayAVService. The service nightshift writes is the
+// next DCPAVServiceProxy after this display's IODisplayLocation whose own
+// Location property is exactly "External". A missing Location is not external.
+static IOAVServiceRef ddcOpenM1ddcService(const char *displayLocation) {
+  gBoundServicePath[0] = '\0';
+  if (displayLocation == NULL || displayLocation[0] == '\0') {
     return NULL;
   }
+  io_registry_entry_t root = IORegistryGetRootEntry(kIOMainPortDefault);
+  if (root == MACH_PORT_NULL) {
+    return NULL;
+  }
+  io_iterator_t iter = 0;
+  kern_return_t kr =
+      IORegistryEntryCreateIterator(root, kIOServicePlane, kIORegistryIterateRecursively, &iter);
+  IOObjectRelease(root);
+  if (kr != KERN_SUCCESS || iter == 0) {
+    return NULL;
+  }
+  NSDDCM1ddcWalk walk;
+  nsDDCM1ddcWalkInit(&walk);
   io_service_t service;
-  IOAVServiceRef services[8];
-  DDCCandidate candidates[8];
-  char servicePaths[8][512];
-  int count = 0;
-  memset(servicePaths, 0, sizeof(servicePaths));
-  gBoundServicePath[0] = '\0';
-  while ((service = IOIteratorNext(iter))) {
-    DDCCandidate c;
-    memset(&c, 0, sizeof(c));
-    c.external = YES;
+  while ((service = IOIteratorNext(iter)) != MACH_PORT_NULL) {
+    io_string_t path;
+    path[0] = '\0';
+    if (IORegistryEntryGetPath(service, kIOServicePlane, path) != KERN_SUCCESS) {
+      path[0] = '\0';
+    }
+    io_name_t name;
+    name[0] = '\0';
+    IORegistryEntryGetName(service, name);
+    const char *loc = NULL;
+    char locBuf[64];
+    locBuf[0] = '\0';
     CFTypeRef location =
         IORegistryEntryCreateCFProperty(service, CFSTR("Location"), kCFAllocatorDefault, 0);
     if (location != NULL) {
-      if (CFGetTypeID(location) == CFStringGetTypeID()) {
-        c.external = CFEqual(location, CFSTR("External"));
+      if (CFGetTypeID(location) == CFStringGetTypeID() &&
+          CFStringGetCString(location, locBuf, sizeof(locBuf), kCFStringEncodingUTF8) &&
+          locBuf[0] != '\0') {
+        loc = locBuf;
       }
       CFRelease(location);
     }
-    if (c.external && count < 8) {
-      inheritFramebuffer(service, &c);
+    bool take = nsDDCM1ddcWalkTake(&walk, path[0] != '\0' ? path : NULL, name[0] != '\0' ? name : NULL,
+                                   loc, displayLocation);
+    if (!take) {
+      IOObjectRelease(service);
+      continue;
     }
-    io_string_t svcPath;
-    svcPath[0] = '\0';
-    if (c.external && count < 8) {
-      if (IORegistryEntryGetPath(service, kIOServicePlane, svcPath) != KERN_SUCCESS) {
-        svcPath[0] = '\0';
-      }
+    IOAVServiceRef av = IOAVServiceCreateWithService(kCFAllocatorDefault, service);
+    if (av == NULL) {
+      IOObjectRelease(service);
+      continue;
     }
-    IOAVServiceRef av = NULL;
-    if (c.external && count < 8) {
-      av = IOAVServiceCreateWithService(kCFAllocatorDefault, service);
+    if (path[0] != '\0') {
+      snprintf(gBoundServicePath, sizeof(gBoundServicePath), "%s", path);
     }
     IOObjectRelease(service);
-    if (av == NULL) {
-      continue;
-    }
-    CFDataRef edid = NULL;
-    BOOL haveEdid = IOAVServiceCopyEDID(av, &edid) == 0 && edid != NULL && CFDataGetLength(edid) >= 16;
-    if (haveEdid) {
-      const uint8_t *bytes = CFDataGetBytePtr(edid);
-      c.vendor = (uint32_t)((bytes[8] << 8) | bytes[9]);
-      c.product = (uint32_t)(bytes[10] | (bytes[11] << 8));
-      c.serial = (uint32_t)(bytes[12] | (bytes[13] << 8) | (bytes[14] << 16) |
-                            ((uint32_t)bytes[15] << 24));
-    }
-    if (edid != NULL) {
-      CFRelease(edid);
-    }
-    if (!haveEdid && c.product == 0 && c.location[0] == '\0') {
-      CFRelease(av);
-      continue;
-    }
-    if (svcPath[0] != '\0') {
-      snprintf(servicePaths[count], sizeof(servicePaths[count]), "%s", svcPath);
-    } else if (c.location[0] != '\0') {
-      snprintf(servicePaths[count], sizeof(servicePaths[count]), "%s", c.location);
-    }
-    services[count] = av;
-    candidates[count] = c;
-    count++;
+    IOObjectRelease(iter);
+    return av;
   }
   IOObjectRelease(iter);
-  int pick = ddcPickCandidate(candidates, count, target);
-  for (int i = 0; i < count; i++) {
-    if (i != pick) {
-      CFRelease(services[i]);
-    }
-  }
-  if (pick >= 0 && index != NULL) {
-    *index = pick;
-  }
-  if (pick >= 0) {
-    snprintf(gBoundServicePath, sizeof(gBoundServicePath), "%s", servicePaths[pick]);
-  }
-  return pick >= 0 ? services[pick] : NULL;
+  return NULL;
 }
 
 // DDC/CI wants a pause after a Set VCP before the monitor will answer the
@@ -1672,7 +1525,9 @@ void probeDDC(void) {
     int count = orderedDisplays(ids, 16);
     uint32_t targets[8];
     DDCTarget wanted[8];
+    char fullLocations[8][512];
     int pending = 0;
+    memset(fullLocations, 0, sizeof(fullLocations));
     for (int i = 0; i < count && pending < 8; i++) {
       if (CGDisplayIsBuiltin(ids[i]) || (!revalidate && snapshotReady(&seen, ids[i]))) {
         continue;
@@ -1692,7 +1547,8 @@ void probeDDC(void) {
           t->serialShared = YES;
         }
       }
-      displayPipe(ids[i], t->port, sizeof(t->port), t->location, sizeof(t->location));
+      displayPipe(ids[i], t->port, sizeof(t->port), t->location, sizeof(t->location),
+                  fullLocations[pending], sizeof(fullLocations[pending]));
       targets[pending] = ids[i];
       pending++;
     }
@@ -1723,11 +1579,10 @@ void probeDDC(void) {
       gBrightnessOutboundCount = 0;
       memset(&gBrightnessReply, 0, sizeof(gBrightnessReply));
       memset(gBrightnessOutbound, 0, sizeof(gBrightnessOutbound));
-      int serviceIndex = -1;
-      IOAVServiceRef service = serviceMatching(&wanted[i], &serviceIndex);
+      IOAVServiceRef service = ddcOpenM1ddcService(fullLocations[i]);
       results[i].display = targets[i];
       results[i].service = service;
-      results[i].serviceIndex = service == NULL ? -1 : serviceIndex;
+      results[i].serviceIndex = service == NULL ? -1 : 0;
       snprintf(results[i].servicePath, sizeof(results[i].servicePath), "%s", gBoundServicePath);
       results[i].evidence = service == NULL ? kNSDDCEvidenceNoService : kNSDDCEvidenceNone;
       results[i].current = 0;
