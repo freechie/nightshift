@@ -103,7 +103,7 @@ static void checkAccessibility(void) {
     refreshKeysState();
     break;
   case kNSAccessRebuild:
-    if (installBrightnessTap()) {
+    if (installWarmthKeyTap()) {
       nsSessionHostNoteRebuilt();
       refreshKeysState();
     }
