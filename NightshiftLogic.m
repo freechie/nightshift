@@ -128,21 +128,24 @@ double nsCommandWarmthRepeatGap(double seconds) {
   return seconds;
 }
 
-NSWarmthMediaAction nsCommandWarmthMediaAction(int direction, bool down, bool repeat,
-                                               int heldDirection) {
-  if (direction != 1 && direction != -1) {
-    return kNSWarmthMediaIgnore;
+NSWarmthShortcut nsWarmthShortcut(unsigned hotKeyID) {
+  const unsigned mods = kNSHotKeyCommand | kNSHotKeyOption | kNSHotKeyControl;
+  NSWarmthShortcut none = {0, 0, ""};
+  if (hotKeyID == 1) {
+    NSWarmthShortcut lower = {kNSKeyCodeMinus, mods, "\u2303\u2325\u2318\u2212"};
+    return lower;
   }
-  if (!down) {
-    return heldDirection == direction ? kNSWarmthMediaEnd : kNSWarmthMediaIgnore;
+  if (hotKeyID == 2) {
+    NSWarmthShortcut raise = {kNSKeyCodeEqual, mods, "\u2303\u2325\u2318="};
+    return raise;
   }
-  // A second down for the direction already held, or a repeat, must not
-  // step. The hold timer is the only repeat. A repeat does not begin a hold,
-  // so it cannot race the hotkey's own press and step twice.
-  if (repeat || heldDirection == direction) {
-    return heldDirection == direction ? kNSWarmthMediaRepeat : kNSWarmthMediaIgnore;
-  }
-  return kNSWarmthMediaBegin;
+  return none;
+}
+
+int nsWarmthShortcutFailure(unsigned hotKeyID, char *buf, size_t size) {
+  NSWarmthShortcut shortcut = nsWarmthShortcut(hotKeyID);
+  const char *name = shortcut.name[0] != '\0' ? shortcut.name : "A warmth shortcut";
+  return snprintf(buf, size, "%s is already used by another app", name);
 }
 
 // MARK: Daemon socket commands
@@ -469,72 +472,6 @@ NSLinkVerdict nsPurchaseURLVerdict(const char *url, size_t length) {
   return kNSLinkOK;
 }
 
-int nsMediaBrightnessKey(long data1, bool *down) {
-  long code = (data1 >> 16) & 0xFFFF;
-  *down = ((data1 >> 8) & 0xFF) == 0xA;
-  return code == 2 ? 1 : code == 3 ? -1 : 0;
-}
-
-bool nsMediaKeyRepeat(long data1) {
-  return (data1 & 0xFF) != 0;
-}
-
-static const uint64_t kNSChordModifiers = (uint64_t)kNSModifierShift | (uint64_t)kNSModifierControl |
-                                         (uint64_t)kNSModifierOption | (uint64_t)kNSModifierCommand |
-                                         (uint64_t)kNSModifierHelp | (uint64_t)kNSModifierFunction;
-
-NSMediaRoute nsMediaBrightnessRoute(long data1, uint64_t modifierFlags, bool *down) {
-  bool pressed = false;
-  int direction = nsMediaBrightnessKey(data1, &pressed);
-  if (down != NULL) {
-    *down = pressed;
-  }
-  if (direction == 0) {
-    return kNSMediaRouteNone;
-  }
-  uint64_t mods = modifierFlags & kNSChordModifiers;
-  if ((mods & (uint64_t)kNSModifierCommand) == 0) {
-    return kNSMediaRouteBrightness;
-  }
-  if (mods == (uint64_t)kNSModifierCommand) {
-    return kNSMediaRouteIntensity;
-  }
-  return kNSMediaRouteUntouched;
-}
-
-uint64_t nsMediaTapMaskBits(void) {
-  return (uint64_t)1 << 14;
-}
-
-bool nsMediaTapMaskAllowed(uint64_t bits) {
-  return bits == nsMediaTapMaskBits();
-}
-
-double nsTapRecoveryDelay(bool trusted, int recent) {
-  if (!trusted || recent > 5) {
-    return -1;
-  }
-  double delay = 0.25;
-  for (int i = 1; i < recent; i++) {
-    delay *= 2;
-  }
-  return delay;
-}
-
-double nsTapRetryDelay(int tries) {
-  return tries < 30 ? 2 : 30;
-}
-
-NSAccessAction nsAccessAction(bool trusted, bool haveTaps) {
-  if (!trusted && haveTaps) {
-    return kNSAccessDrop;
-  }
-  if (trusted && !haveTaps) {
-    return kNSAccessRebuild;
-  }
-  return kNSAccessKeep;
-}
-
 bool nsPurchaseURLAllowed(const char *url, size_t length) {
   return nsPurchaseURLVerdict(url, length) == kNSLinkOK;
 }
@@ -552,7 +489,6 @@ bool nsWorkspaceOpenAllowed(const char *url, size_t length, bool allowLoopbackHT
     return false;
   }
   static const char *const pages[] = {
-      "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Accessibility",
       "x-apple.systempreferences:com.apple.Displays-Settings.extension?nightShift",
       "x-apple.systempreferences:com.apple.Notifications-Settings.extension",
       "https://github.com/freechie/nightshift",
