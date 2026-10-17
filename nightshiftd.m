@@ -4333,6 +4333,9 @@ static NSImage *sidebarTile(NSInteger pane, CGFloat size) {
 @property(nonatomic) NSTimeInterval settingsReleaseTime;
 @property(nonatomic) BOOL settingsMaxTracking;
 @property(nonatomic, copy) NSString *statusIconID;
+// A held warmth hotkey's unsaved step, shown in the menu bar until release.
+@property(nonatomic) BOOL holdTitleActive;
+@property(nonatomic) long holdTitlePercent;
 - (void)refresh;
 - (void)syncLoginItem;
 - (void)syncStatusItem;
@@ -4603,7 +4606,9 @@ static NSImage *sidebarTile(NSInteger pane, CGFloat size) {
     long maxv = 0;
     const char *state = NULL;
     int full = -1;
-    if (warmthStatus(&now, &maxv, &state, &full)) {
+    if (self.holdTitleActive) {
+      title = [NSString stringWithFormat:@"%ld%%", self.holdTitlePercent];
+    } else if (warmthStatus(&now, &maxv, &state, &full)) {
       title = strcmp(state, "off") == 0 ? @"Off" : [NSString stringWithFormat:@"%ld%%", now];
     }
   } else if (image == nil) {
@@ -5100,6 +5105,8 @@ static void commandWarmthClearHold(void) {
   gCommandHoldDirty = NO;
   if (gMenu != nil) {
     gMenu.tracking = NO;
+    gMenu.holdTitleActive = NO;
+    [gMenu syncStatusItem];
   }
 }
 
@@ -5133,6 +5140,9 @@ static void commandWarmthTick(BOOL release) {
   gCommandHoldPercent = next;
   if (gMenu != nil) {
     [gMenu previewCurrentIntensity:next];
+    gMenu.holdTitlePercent = next;
+    gMenu.holdTitleActive = YES;
+    [gMenu syncStatusItem];
   }
 }
 
