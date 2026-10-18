@@ -233,6 +233,9 @@ static void postBanner(NSString *body, BOOL controls) {
     gHeldBannerControls = controls;
     return;
   }
+  // A banner shown now replaces any warmth key banner still waiting, so an
+  // older value never lands on top of a newer one.
+  gHeldBanner = nil;
   fprintf(stderr, "%s\n", body.UTF8String);
   if (gBannerReady) {
     sendBanner(body, controls);
@@ -5022,11 +5025,15 @@ static NSImage *sidebarTile(NSInteger pane, CGFloat size) {
       [self refresh];
       return;
     }
+    if (value == live) {
+      reportWarmth(live);
+    }
     [self refresh];
     return;
   }
   BOOL raise = maxv >= 1 && value > maxv;
   if (value == live && !raise) {
+    reportWarmth(live);
     [self refresh];
     return;
   }
@@ -5353,11 +5360,19 @@ static BOOL commandWarmthKeyDown(unsigned keyCode) {
 // once, through the slider's mouse-up path, and does not take another step.
 static void commandWarmthTick(BOOL release) {
   if (release) {
+    gBannerHoldoff = YES;
     if (gCommandHoldDirty && gCommandHoldPercent >= 0 && gMenu != nil) {
-      gBannerHoldoff = YES;
       [gMenu commitCurrentIntensity:gCommandHoldPercent];
-      gBannerHoldoff = NO;
     }
+    // A press that changed nothing, such as raise at 100%, still says
+    // where warmth is.
+    if (gHeldBanner == nil) {
+      long now = commandWarmthNow();
+      if (now >= 0) {
+        reportWarmth(now);
+      }
+    }
+    gBannerHoldoff = NO;
     commandWarmthClearHold();
     if (gHeldBanner != nil) {
       scheduleHeldBanner();
