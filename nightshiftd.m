@@ -23,7 +23,13 @@
 #import <UserNotifications/UserNotifications.h>
 #import <objc/runtime.h>
 
-static BOOL warmthKeysReady(void);
+static NSShortcut warmthShortcut(unsigned hotKeyID);
+static NSShortcutState warmthKeyState(unsigned hotKeyID);
+static void retryWarmthKeys(void);
+static void pauseWarmthKeys(void);
+static void resumeWarmthKeys(void);
+static BOOL setWarmthShortcut(unsigned hotKeyID, NSShortcut shortcut);
+static BOOL resetWarmthShortcuts(void);
 static void teardownDaemon(void);
 static void startWarmthKeys(void);
 void notifyPlain(NSString *body);
@@ -2999,8 +3005,12 @@ static const CGFloat kIconTileImage = 60;
 @property(nonatomic, strong) NSButton *unlockButton;
 @property(nonatomic) BOOL editingFullAt;
 // Keyboard
-@property(nonatomic, strong) DotView *keysDot;
-@property(nonatomic, strong) NSTextField *keysStatus;
+@property(nonatomic, strong) NSArray<NSButton *> *shortcutButtons;
+@property(nonatomic, strong) NSArray<DotView *> *shortcutDots;
+@property(nonatomic, strong) NSArray<NSTextField *> *shortcutLabels;
+@property(nonatomic) unsigned recordingID;  // 0, or the hotkey id being recorded
+@property(nonatomic, copy) NSString *recordNote;
+@property(nonatomic, strong) id recordMonitor;
 // License
 @property(nonatomic, strong) DotView *licenseDot;
 @property(nonatomic, strong) NSTextField *licenseStatus;
@@ -3641,28 +3651,150 @@ static void hugControls(NSView *view) {
 - (NSView *)displaysPane {
   [self addWords:@"Keyboard"];
   [self addWords:@"Warmth keys"];
+  [self addWords:@"Shortcuts"];
 
-  DotView *dot = nil;
-  NSTextField *status = nil;
-  NSStackView *keysState = [self dot:&dot label:&status];
-  self.keysDot = dot;
-  self.keysStatus = status;
-  FormRow *keysRow = [self row:@"Warmth Keys"
-                       caption:@"⌃⌥⌘− lowers and ⌃⌥⌘= raises Night Shift intensity. "
-                               @"Hold to keep stepping."
-                       control:keysState];
+  NSString *titles[2] = {@"Lower Warmth", @"Raise Warmth"};
+  NSString *captions[2] = {@"Steps Night Shift intensity down. Hold to keep stepping.",
+                           @"Steps Night Shift intensity up. Hold to keep stepping."};
+  NSMutableArray<NSView *> *rows = [NSMutableArray array];
+  NSMutableArray<NSButton *> *buttons = [NSMutableArray array];
+  NSMutableArray<DotView *> *dots = [NSMutableArray array];
+  NSMutableArray<NSTextField *> *labels = [NSMutableArray array];
+  for (NSInteger i = 0; i < 2; i++) {
+    DotView *dot = nil;
+    NSTextField *label = nil;
+    NSStackView *state = [self dot:&dot label:&label];
+    NSButton *button = [self pushButton:@"" action:@selector(recordShortcut:)];
+    button.tag = i + 1;
+    [rows addObject:[self row:titles[i]
+                      caption:captions[i]
+                      control:[self hstack:@[ state, button ] spacing:10]]];
+    [buttons addObject:button];
+    [dots addObject:dot];
+    [labels addObject:label];
+  }
+  self.shortcutButtons = buttons;
+  self.shortcutDots = dots;
+  self.shortcutLabels = labels;
+  NSButton *reset = [self pushButton:@"Restore Defaults" action:@selector(resetShortcuts:)];
+  [rows addObject:[self row:@"Defaults" caption:@"⌃⌥⌘− and ⌃⌥⌘=." control:reset]];
   NSView *keys = [self section:@"Keyboard"
                      accessory:nil
-                          rows:@[ keysRow ]
-                        footer:nil];
+                          rows:rows
+                        footer:@"Click a shortcut, then press the new keys. Esc cancels."];
   return [self pageWithSections:@[ keys ] stack:NULL];
 }
 
 - (void)syncDisplays {
-  BOOL keys = warmthKeysReady();
-  self.keysDot.color = keys ? NSColor.systemGreenColor : NSColor.systemOrangeColor;
-  self.keysDot.needsDisplay = YES;
-  self.keysStatus.stringValue = keys ? @"⌃⌥⌘− / ⌃⌥⌘=" : @"In use by another app";
+  retryWarmthKeys();
+  for (NSUInteger i = 0; i < self.shortcutButtons.count; i++) {
+    unsigned hotKeyID = (unsigned)i + 1;
+    BOOL recording = self.recordingID == hotKeyID;
+    NSShortcut shortcut = warmthShortcut(hotKeyID);
+    NSShortcutState state = warmthKeyState(hotKeyID);
+    self.shortcutButtons[i].title =
+        recording ? @"Type Shortcut…" : [NSString stringWithUTF8String:shortcut.name];
+    DotView *dot = self.shortcutDots[i];
+    if (recording) {
+      dot.color = NSColor.controlAccentColor;
+      self.shortcutLabels[i].stringValue = self.recordNote ?: @"Recording";
+    } else {
+      dot.color = state == kNSShortcutReady ? NSColor.systemGreenColor : NSColor.systemOrangeColor;
+      self.shortcutLabels[i].stringValue = [NSString stringWithUTF8String:nsShortcutStateLabel(state)];
+    }
+    dot.needsDisplay = YES;
+  }
+}
+
+- (void)recordShortcut:(NSButton *)sender {
+  unsigned hotKeyID = (unsigned)sender.tag;
+  if (self.recordingID == hotKeyID) {
+    [self stopRecording];
+    return;
+  }
+  [self stopRecording];
+  self.recordingID = hotKeyID;
+  self.recordNote = nil;
+  pauseWarmthKeys();
+  __weak SettingsPanel *weakSelf = self;
+  self.recordMonitor = [NSEvent
+      addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown
+                                   handler:^NSEvent *(NSEvent *event) {
+                                     SettingsPanel *panel = weakSelf;
+                                     if (panel == nil || panel.recordingID == 0) {
+                                       return event;
+                                     }
+                                     [panel recordKey:event];
+                                     return nil;
+                                   }];
+  [self syncDisplays];
+}
+
+- (void)recordKey:(NSEvent *)event {
+  if (event.isARepeat) {
+    return;
+  }
+  NSEventModifierFlags flags = event.modifierFlags & NSEventModifierFlagDeviceIndependentFlagsMask;
+  unsigned modifiers = 0;
+  if (flags & NSEventModifierFlagCommand) {
+    modifiers |= cmdKey;
+  }
+  if (flags & NSEventModifierFlagShift) {
+    modifiers |= shiftKey;
+  }
+  if (flags & NSEventModifierFlagOption) {
+    modifiers |= optionKey;
+  }
+  if (flags & NSEventModifierFlagControl) {
+    modifiers |= controlKey;
+  }
+  if (event.keyCode == kVK_Escape && modifiers == 0) {
+    [self stopRecording];
+    return;
+  }
+  NSShortcut shortcut;
+  NSString *key = event.charactersIgnoringModifiers.uppercaseString;
+  if (!nsShortcutMake(event.keyCode, modifiers, key.UTF8String, &shortcut)) {
+    self.recordNote =
+        nsShortcutAllowed(event.keyCode, modifiers) ? @"Pick another key" : @"Add ⌃, ⌥ or ⌘";
+    [self syncDisplays];
+    return;
+  }
+  NSShortcut other = warmthShortcut(self.recordingID == 1 ? 2 : 1);
+  if (nsShortcutSame(&shortcut, &other)) {
+    self.recordNote = @"Used by the other key";
+    [self syncDisplays];
+    return;
+  }
+  if (!setWarmthShortcut(self.recordingID, shortcut)) {
+    self.recordNote = @"Couldn't save";
+    [self syncDisplays];
+    return;
+  }
+  [self stopRecording];
+}
+
+- (void)stopRecording {
+  if (self.recordMonitor != nil) {
+    [NSEvent removeMonitor:self.recordMonitor];
+    self.recordMonitor = nil;
+  }
+  BOOL wasRecording = self.recordingID != 0;
+  self.recordingID = 0;
+  self.recordNote = nil;
+  if (wasRecording) {
+    resumeWarmthKeys();
+    [self syncDisplays];
+  }
+}
+
+- (void)resetShortcuts:(id)sender {
+  (void)sender;
+  [self stopRecording];
+  if (!resetWarmthShortcuts()) {
+    notifyPlain(@"Couldn't save the default warmth shortcuts.");
+  }
+  [self syncDisplays];
 }
 
 // MARK: License
@@ -4182,6 +4314,7 @@ static NSImage *sidebarTile(NSInteger pane, CGFloat size) {
   if (index < 0 || index >= kPaneCount) {
     index = kPaneGeneral;
   }
+  [self stopRecording];
   self.page = index;
   for (NSUInteger i = 0; i < self.pages.count; i++) {
     self.pages[i].hidden = (NSInteger)i != index;
@@ -4282,6 +4415,7 @@ static NSImage *sidebarTile(NSInteger pane, CGFloat size) {
   (void)notification;
   self.stayOpen = NO;
   gSettingsKeepsOpenForOtherApp = NO;
+  [self stopRecording];
   [self stopOutsideClicks];
   [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
   [self.syncTimer invalidate];
@@ -4446,6 +4580,7 @@ static NSImage *sidebarTile(NSInteger pane, CGFloat size) {
   (void)menu;
   self.menuOpen = YES;
   self.tracking = NO;
+  retryWarmthKeys();
   [self refresh];
   [self armClockKeys];
   __weak MenuBar *menuBar = self;
@@ -5064,13 +5199,15 @@ static AppDelegate *gAppDelegate = nil;
 
 static BOOL gWarmthKeysStarted = NO;
 
-// ⌃⌥⌘− lowers Night Shift intensity, ⌃⌥⌘= raises it. The value is the
-// menu's Current slider. Nothing here changes display brightness.
+// Two shortcuts, ⌃⌥⌘− and ⌃⌥⌘= unless changed in Settings, lower and
+// raise Night Shift intensity. The value is the menu's Current slider. Nothing here changes display brightness.
 //
 // Both are Carbon RegisterEventHotKey hotkeys: no event tap, so no
 // Accessibility permission, and a rebuild or re-sign cannot silently turn
-// them off. A combo another app already owns fails to register; that is
-// shown with notifyPlain and in Settings, and the other key still works.
+// them off. A combo macOS (CopySymbolicHotKeys) or another app already owns
+// is not registered: launch says which key and why with notifyPlain,
+// Settings shows it per key, and the other key still works. Menu open and
+// Settings try failed keys again, so a freed combo works without a relaunch.
 //
 // Carbon reports the chord once on press and once on release, with no
 // repeat. The hold repeats on the main queue and only previews, the way
@@ -5078,10 +5215,15 @@ static BOOL gWarmthKeysStarted = NO;
 // commitCurrentIntensity, which is that slider's save.
 _Static_assert(kNSHotKeyCommand == cmdKey, "Carbon cmdKey");
 _Static_assert(kNSHotKeyOption == optionKey, "Carbon optionKey");
+_Static_assert(kNSHotKeyShift == shiftKey, "Carbon shiftKey");
 _Static_assert(kNSHotKeyControl == controlKey, "Carbon controlKey");
 _Static_assert(kNSKeyCodeMinus == kVK_ANSI_Minus, "kVK_ANSI_Minus");
 _Static_assert(kNSKeyCodeEqual == kVK_ANSI_Equal, "kVK_ANSI_Equal");
 static EventHotKeyRef gCommandHotKeys[2];
+static NSShortcut gWarmthShortcuts[2];
+static NSShortcutState gWarmthKeyStates[2];
+static BOOL gWarmthShortcutsLoaded = NO;
+static BOOL gWarmthKeysPaused = NO;
 static EventHandlerRef gCommandHotKeyHandler = NULL;
 static int gCommandHoldGeneration = 0;
 static int gCommandHoldDirection = 0;
@@ -5214,6 +5356,153 @@ static OSStatus commandWarmthHotKey(EventHandlerCallRef next, EventRef event, vo
   return noErr;
 }
 
+static NSString *shortcutsPath(void) {
+  return [[NSHomeDirectory()
+      stringByAppendingPathComponent:@"Library/Application Support/nightshift"]
+      stringByAppendingPathComponent:@"shortcuts"];
+}
+
+static void ensureWarmthShortcuts(void) {
+  if (gWarmthShortcutsLoaded) {
+    return;
+  }
+  gWarmthShortcutsLoaded = YES;
+  NSString *text = [NSString stringWithContentsOfFile:shortcutsPath()
+                                             encoding:NSUTF8StringEncoding
+                                                error:NULL];
+  nsShortcutsParse(text.UTF8String, gWarmthShortcuts);
+}
+
+static void loadWarmthShortcuts(void) {
+  gWarmthShortcutsLoaded = NO;
+  ensureWarmthShortcuts();
+}
+
+static BOOL saveWarmthShortcuts(void) {
+  char buf[256];
+  int n = nsShortcutsFormat(gWarmthShortcuts, buf, sizeof buf);
+  if (n < 0 || (size_t)n >= sizeof buf) {
+    return NO;
+  }
+  NSString *path = shortcutsPath();
+  [[NSFileManager defaultManager] createDirectoryAtPath:path.stringByDeletingLastPathComponent
+                            withIntermediateDirectories:YES
+                                             attributes:@{NSFilePosixPermissions : @0700}
+                                                  error:NULL];
+  NSString *text = [NSString stringWithUTF8String:buf];
+  if (text == nil || ![text writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:NULL]) {
+    return NO;
+  }
+  chmod(path.fileSystemRepresentation, 0600);
+  return YES;
+}
+
+static NSShortcut warmthShortcut(unsigned hotKeyID) {
+  ensureWarmthShortcuts();
+  NSShortcut none = {0, 0, "", ""};
+  return hotKeyID >= 1 && hotKeyID <= 2 ? gWarmthShortcuts[hotKeyID - 1] : none;
+}
+
+static NSShortcutState warmthKeyState(unsigned hotKeyID) {
+  return hotKeyID >= 1 && hotKeyID <= 2 ? gWarmthKeyStates[hotKeyID - 1] : kNSShortcutFailed;
+}
+
+// True when an enabled macOS shortcut (Mission Control, Spotlight, input
+// sources...) uses this key and modifiers. Those win over an app's hotkey
+// without RegisterEventHotKey saying so.
+static BOOL systemShortcutTaken(NSShortcut shortcut) {
+  CFArrayRef keys = NULL;
+  if (CopySymbolicHotKeys(&keys) != noErr || keys == NULL) {
+    return NO;
+  }
+  const UInt32 mask = cmdKey | shiftKey | optionKey | controlKey;
+  BOOL taken = NO;
+  for (CFIndex i = 0; i < CFArrayGetCount(keys) && !taken; i++) {
+    CFDictionaryRef key = CFArrayGetValueAtIndex(keys, i);
+    if (key == NULL || CFGetTypeID(key) != CFDictionaryGetTypeID()) {
+      continue;
+    }
+    CFTypeRef enabled = CFDictionaryGetValue(key, kHISymbolicHotKeyEnabled);
+    CFTypeRef code = CFDictionaryGetValue(key, kHISymbolicHotKeyCode);
+    CFTypeRef mods = CFDictionaryGetValue(key, kHISymbolicHotKeyModifiers);
+    if (enabled == NULL || CFGetTypeID(enabled) != CFBooleanGetTypeID() ||
+        !CFBooleanGetValue(enabled) || code == NULL || CFGetTypeID(code) != CFNumberGetTypeID() ||
+        mods == NULL || CFGetTypeID(mods) != CFNumberGetTypeID()) {
+      continue;
+    }
+    SInt64 keyCode = -1;
+    SInt64 modifiers = 0;
+    CFNumberGetValue(code, kCFNumberSInt64Type, &keyCode);
+    CFNumberGetValue(mods, kCFNumberSInt64Type, &modifiers);
+    taken = keyCode == (SInt64)shortcut.keyCode && ((UInt32)modifiers & mask) == shortcut.modifiers;
+  }
+  CFRelease(keys);
+  return taken;
+}
+
+static NSShortcutState registerWarmthKey(unsigned i) {
+  if (gCommandHotKeys[i] != NULL) {
+    return kNSShortcutReady;
+  }
+  NSShortcut shortcut = gWarmthShortcuts[i];
+  if (systemShortcutTaken(shortcut)) {
+    return kNSShortcutTakenBySystem;
+  }
+  EventHotKeyID hotKey = {'NScm', i + 1};
+  EventHotKeyRef ref = NULL;
+  OSStatus err = RegisterEventHotKey(shortcut.keyCode, shortcut.modifiers, hotKey,
+                                     GetApplicationEventTarget(), 0, &ref);
+  if (err == noErr) {
+    gCommandHotKeys[i] = ref;
+    return kNSShortcutReady;
+  }
+  return err == eventHotKeyExistsErr ? kNSShortcutTakenByApp : kNSShortcutFailed;
+}
+
+// Registers whichever keys are not registered yet. With notify, a key that
+// newly fails says which key and why; Settings shows the rest.
+static void registerWarmthKeys(BOOL notify) {
+  if (gWarmthKeysPaused) {
+    return;
+  }
+  ensureWarmthShortcuts();
+  for (unsigned i = 0; i < 2; i++) {
+    NSShortcutState before = gWarmthKeyStates[i];
+    NSShortcutState now = registerWarmthKey(i);
+    gWarmthKeyStates[i] = now;
+    if (now != kNSShortcutReady && now != before) {
+      char message[160];
+      nsShortcutNotice(i + 1, gWarmthShortcuts[i].name, now, message, sizeof message);
+      NSLog(@"%s", message);
+      if (notify) {
+        notifyPlain([NSString stringWithUTF8String:message]);
+      }
+    }
+  }
+}
+
+// Releases key i so it can be registered again, as a new shortcut.
+static void dropWarmthKey(unsigned i) {
+  if (gCommandHotKeys[i] != NULL) {
+    UnregisterEventHotKey(gCommandHotKeys[i]);
+    gCommandHotKeys[i] = NULL;
+  }
+  gWarmthKeyStates[i] = kNSShortcutReady;
+}
+
+static void unregisterWarmthKeys(void) {
+  gCommandHoldGeneration++;
+  if (gCommandHoldDirection != 0) {
+    commandWarmthTick(YES);
+  }
+  for (unsigned i = 0; i < 2; i++) {
+    if (gCommandHotKeys[i] != NULL) {
+      UnregisterEventHotKey(gCommandHotKeys[i]);
+      gCommandHotKeys[i] = NULL;
+    }
+  }
+}
+
 static void registerCommandWarmthHotKeys(void) {
   if (gCommandHotKeyHandler != NULL) {
     return;
@@ -5229,43 +5518,70 @@ static void registerCommandWarmthHotKeys(void) {
     return;
   }
   gCommandHotKeyHandler = handler;
-  for (UInt32 i = 0; i < 2; i++) {
-    UInt32 id = i + 1;
-    NSWarmthShortcut shortcut = nsWarmthShortcut(id);
-    EventHotKeyID hotKey = {'NScm', id};
-    EventHotKeyRef ref = NULL;
-    err = RegisterEventHotKey(shortcut.keyCode, shortcut.modifiers, hotKey,
-                              GetApplicationEventTarget(), 0, &ref);
-    if (err != noErr) {
-      char message[128];
-      nsWarmthShortcutFailure(id, message, sizeof message);
-      NSLog(@"%s (%d)", message, (int)err);
-      notifyPlain([NSString stringWithUTF8String:message]);
-      continue;
-    }
-    gCommandHotKeys[i] = ref;
-  }
-}
-
-static BOOL warmthKeysReady(void) {
-  return gCommandHotKeys[0] != NULL && gCommandHotKeys[1] != NULL;
+  loadWarmthShortcuts();
+  registerWarmthKeys(YES);
 }
 
 static void unregisterCommandWarmthHotKeys(void) {
-  gCommandHoldGeneration++;
-  if (gCommandHoldDirection != 0) {
-    commandWarmthTick(YES);
-  }
-  for (int i = 0; i < 2; i++) {
-    if (gCommandHotKeys[i] != NULL) {
-      UnregisterEventHotKey(gCommandHotKeys[i]);
-      gCommandHotKeys[i] = NULL;
-    }
-  }
+  unregisterWarmthKeys();
   if (gCommandHotKeyHandler != NULL) {
     RemoveEventHandler(gCommandHotKeyHandler);
     gCommandHotKeyHandler = NULL;
   }
+}
+
+static void retryWarmthKeys(void) {
+  if (gCommandHotKeyHandler != NULL) {
+    registerWarmthKeys(NO);
+  }
+}
+
+// Settings records a new shortcut with both released, so pressing the
+// current one records it instead of changing warmth.
+static void pauseWarmthKeys(void) {
+  gWarmthKeysPaused = YES;
+  unregisterWarmthKeys();
+}
+
+static void resumeWarmthKeys(void) {
+  gWarmthKeysPaused = NO;
+  retryWarmthKeys();
+}
+
+static BOOL setWarmthShortcut(unsigned hotKeyID, NSShortcut shortcut) {
+  if (hotKeyID < 1 || hotKeyID > 2) {
+    return NO;
+  }
+  ensureWarmthShortcuts();
+  unsigned i = hotKeyID - 1;
+  if (nsShortcutSame(&shortcut, &gWarmthShortcuts[1 - i])) {
+    return NO;
+  }
+  NSShortcut old = gWarmthShortcuts[i];
+  gWarmthShortcuts[i] = shortcut;
+  if (!saveWarmthShortcuts()) {
+    gWarmthShortcuts[i] = old;
+    return NO;
+  }
+  dropWarmthKey(i);
+  retryWarmthKeys();
+  return YES;
+}
+
+static BOOL resetWarmthShortcuts(void) {
+  ensureWarmthShortcuts();
+  NSShortcut old[2] = {gWarmthShortcuts[0], gWarmthShortcuts[1]};
+  nsShortcutDefault(1, &gWarmthShortcuts[0]);
+  nsShortcutDefault(2, &gWarmthShortcuts[1]);
+  if (!saveWarmthShortcuts()) {
+    gWarmthShortcuts[0] = old[0];
+    gWarmthShortcuts[1] = old[1];
+    return NO;
+  }
+  dropWarmthKey(0);
+  dropWarmthKey(1);
+  retryWarmthKeys();
+  return YES;
 }
 
 static void startWarmthKeys(void) {
