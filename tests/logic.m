@@ -398,16 +398,17 @@ static void checkWarmthShortcuts(void) {
   CHECK_EQ(none.keyCode, 0);
   CHECK(strcmp(none.name, "") == 0);
 
-  // A modifier other than shift is required; only four modifiers count.
+  // Two of ⌃ ⌥ ⌘ are required (⇧ never counts); only four modifiers count.
   CHECK(!nsShortcutAllowed(0x00, 0));
   CHECK(!nsShortcutAllowed(0x00, kNSHotKeyShift));
-  CHECK(nsShortcutAllowed(0x00, kNSHotKeyControl));
+  CHECK(!nsShortcutAllowed(0x00, kNSHotKeyControl));                   // ⌃A
   CHECK(!nsShortcutAllowed(0x00, kNSHotKeyShift | kNSHotKeyCommand));
-  CHECK(nsShortcutAllowed(0x00, kNSHotKeyShift | kNSHotKeyControl));
+  CHECK(!nsShortcutAllowed(0x00, kNSHotKeyShift | kNSHotKeyControl));  // ⌃⇧A, allowed before
+  CHECK(nsShortcutAllowed(0x00, kNSHotKeyControl | kNSHotKeyOption));  // ⌃⌥A
   CHECK(!nsShortcutAllowed(0x00, kNSHotKeyCommand | (1 << 7)));
   CHECK(!nsShortcutAllowed(128, kNSHotKeyCommand));
   // Global hotkeys: a lone ⌘ or ⌥ with a letter, digit or arrow is refused so
-  // ⌘Q, ⌘W, ⌘C and ⌥E keep working in every app. F-keys and ⌃ are fine.
+  // ⌘Q, ⌘W, ⌘C and ⌥E keep working in every app. F-keys are fine.
   CHECK(!nsShortcutAllowed(0x0C, kNSHotKeyCommand));  // ⌘Q
   CHECK(!nsShortcutAllowed(0x0D, kNSHotKeyCommand));  // ⌘W
   CHECK(!nsShortcutAllowed(0x08, kNSHotKeyCommand));  // ⌘C
@@ -416,7 +417,21 @@ static void checkWarmthShortcuts(void) {
   CHECK(!nsShortcutAllowed(0x0E, kNSHotKeyOption));   // ⌥E
   CHECK(nsShortcutAllowed(0x7A, kNSHotKeyCommand));   // ⌘F1
   CHECK(nsShortcutAllowed(0x78, kNSHotKeyOption));    // ⌥F2
-  CHECK(nsShortcutAllowed(0x0C, kNSHotKeyControl));   // ⌃Q
+  // A lone ⌃ is refused too: ⌃C, ⌃D, ⌃Z, ⌃A, ⌃E and ⌃K belong to Terminal
+  // and text fields. Two of ⌃ ⌥ ⌘ pass.
+  CHECK(!nsShortcutAllowed(0x0C, kNSHotKeyControl));  // ⌃Q
+  CHECK(!nsShortcutAllowed(0x08, kNSHotKeyControl));  // ⌃C
+  CHECK(!nsShortcutAllowed(0x02, kNSHotKeyControl));  // ⌃D
+  CHECK(!nsShortcutAllowed(0x06, kNSHotKeyControl));  // ⌃Z
+  CHECK(!nsShortcutAllowed(0x00, kNSHotKeyControl));  // ⌃A
+  CHECK(!nsShortcutAllowed(0x0E, kNSHotKeyControl));  // ⌃E
+  CHECK(!nsShortcutAllowed(0x28, kNSHotKeyControl));  // ⌃K
+  CHECK(!nsShortcutAllowed(0x7E, kNSHotKeyControl));  // ⌃↑ (Mission Control)
+  CHECK(!nsShortcutAllowed(0x31, kNSHotKeyControl));  // ⌃Space
+  CHECK(nsShortcutAllowed(0x28, kNSHotKeyControl | kNSHotKeyOption));   // ⌃⌥K
+  CHECK(nsShortcutAllowed(0x07, kNSHotKeyControl | kNSHotKeyCommand));  // ⌃⌘X
+  CHECK(nsShortcutAllowed(0x7A, kNSHotKeyControl));                     // ⌃F1
+  CHECK(nsShortcutAllowed(0x6F, kNSHotKeyControl));                     // ⌃F12
   CHECK(nsShortcutAllowed(0x0C, kNSHotKeyOption | kNSHotKeyCommand));  // ⌥⌘Q
   // ⇧ is not the second modifier: ⌘⇧Z, ⌘⇧T and ⌥⇧K stay with apps.
   CHECK(!nsShortcutAllowed(0x06, kNSHotKeyCommand | kNSHotKeyShift));  // ⌘⇧Z
@@ -424,6 +439,36 @@ static void checkWarmthShortcuts(void) {
   CHECK(!nsShortcutAllowed(0x28, kNSHotKeyOption | kNSHotKeyShift));   // ⌥⇧K
   CHECK(nsShortcutAllowed(0x7A, kNSHotKeyCommand | kNSHotKeyShift));   // ⌘⇧F1
   CHECK(nsShortcutAllowed(0x06, kNSHotKeyOption | kNSHotKeyCommand | kNSHotKeyShift));  // ⌥⇧⌘Z
+
+  // Every key the recorder can produce, 0...127, with ⌃ alone or ⌃⇧: only
+  // F1...F12 pass. No letter, digit, punctuation, Space, Return, Tab, arrow
+  // or Escape slips through. F-keys alone (no modifier) stay refused.
+  static const unsigned fKeys[12] = {0x7A, 0x78, 0x63, 0x76, 0x60, 0x61,
+                                     0x62, 0x64, 0x65, 0x6D, 0x67, 0x6F};
+  int loneControlAllowed = 0;
+  for (unsigned code = 0; code < 128; code++) {
+    bool fKey = false;
+    for (int f = 0; f < 12; f++) {
+      fKey = fKey || fKeys[f] == code;
+    }
+    if (fKey) {
+      continue;
+    }
+    if (nsShortcutAllowed(code, kNSHotKeyControl) ||
+        nsShortcutAllowed(code, kNSHotKeyControl | kNSHotKeyShift) ||
+        nsShortcutAllowed(code, kNSHotKeyCommand) || nsShortcutAllowed(code, kNSHotKeyOption)) {
+      loneControlAllowed++;
+      fprintf(stderr, "key code 0x%02X passes with one modifier\n", code);
+    }
+    CHECK(nsShortcutAllowed(code, kNSHotKeyControl | kNSHotKeyOption));
+  }
+  CHECK_EQ(loneControlAllowed, 0);
+  for (int f = 0; f < 12; f++) {
+    CHECK(nsShortcutAllowed(fKeys[f], kNSHotKeyControl));
+    CHECK(nsShortcutAllowed(fKeys[f], kNSHotKeyControl | kNSHotKeyShift));
+    CHECK(!nsShortcutAllowed(fKeys[f], 0));
+    CHECK(!nsShortcutAllowed(fKeys[f], kNSHotKeyShift));
+  }
 
   NSShortcut made;
   CHECK(nsShortcutMake(0x0B, kNSHotKeyShift | kNSHotKeyCommand | kNSHotKeyOption |
@@ -439,7 +484,16 @@ static void checkWarmthShortcuts(void) {
   CHECK(!nsShortcutMake(0x0B, kNSHotKeyControl, "TOOLONGKEY", &made));
   CHECK(!nsShortcutMake(0x0B, kNSHotKeyControl, NULL, &made));
   CHECK(!nsShortcutMake(0x0B, 0, "B", &made));
+  CHECK(!nsShortcutMake(0x0B, kNSHotKeyControl, "B", &made));  // ⌃B
   CHECK(nsShortcutSame(&made, &kept));
+  // A refusal can still name what was pressed.
+  char pressed[40];
+  CHECK(nsShortcutName(0x28, kNSHotKeyCommand, "K", pressed, sizeof pressed));
+  CHECK(strcmp(pressed, "\u2318K") == 0);
+  CHECK(nsShortcutName(0x7E, kNSHotKeyControl, NULL, pressed, sizeof pressed));
+  CHECK(strcmp(pressed, "\u2303\u2191") == 0);
+  CHECK(!nsShortcutName(0x0B, kNSHotKeyCommand, "", pressed, sizeof pressed));
+  CHECK(!nsShortcutName(0x0B, kNSHotKeyCommand, "B", pressed, 2));
 
   // The saved file round-trips, and anything wrong keeps the default.
   NSShortcut pair[2];
@@ -477,6 +531,40 @@ static void checkWarmthShortcuts(void) {
   CHECK_EQ(nsShortcutsParse("lower 11 256 B\n", back), 0);  // lone ⌘ from an old file
   CHECK_EQ(nsShortcutsParse("lower 11 768 B\n", back), 0);  // ⌘⇧ from an old file
   CHECK(nsShortcutSame(&back[0], &lower));
+  // A lone ⌃ saved by the last build is refused now and keeps the default.
+  CHECK_EQ(nsShortcutsParse("lower 40 4096 K\nraise 11 6144 B\n", back), 2);
+  CHECK(nsShortcutSame(&back[0], &lower));
+  CHECK_EQ(nsShortcutsParse("raise 8 4096 C\n", back), 0);
+  CHECK(nsShortcutSame(&back[1], &raise));
+  // And the load can say which line it dropped, once, in plain words.
+  char refused[2][40];
+  CHECK_EQ(nsShortcutsParseRefused("lower 40 4096 K\nraise 11 6144 B\n", back, refused), 2);
+  CHECK(strcmp(refused[0], "\u2303K") == 0);
+  CHECK(strcmp(refused[1], "") == 0);
+  CHECK_EQ(nsShortcutsParseRefused("lower 11 768 B\nraise 40 2560 K\n", back, refused), 0);
+  CHECK(strcmp(refused[0], "\u21E7\u2318B") == 0);
+  CHECK(strcmp(refused[1], "\u2325\u21E7K") == 0);
+  // Garbage is not a refused shortcut, and a later good line wins.
+  CHECK_EQ(nsShortcutsParseRefused("lower 999 256 B\nraise 11 6144 B extra\n", back, refused), 0);
+  CHECK(refused[0][0] == '\0' && refused[1][0] == '\0');
+  CHECK_EQ(nsShortcutsParseRefused("lower 40 4096 K\nlower 11 6144 B\n", back, refused), 1);
+  CHECK(refused[0][0] == '\0');
+  CHECK_EQ(nsShortcutsParseRefused(NULL, back, refused), 0);
+  CHECK(refused[0][0] == '\0' && refused[1][0] == '\0');
+  // The defaults themselves pass the new rule.
+  CHECK(nsShortcutAllowed(lower.keyCode, lower.modifiers));
+  CHECK(nsShortcutAllowed(raise.keyCode, raise.modifiers));
+  char notice[200];
+  n = nsShortcutDroppedNotice("\u2303K", lower.name, "", raise.name, notice, sizeof notice);
+  CHECK(strcmp(notice, "Your shortcut \u2303K no longer works. Now using \u2303\u2325\u2318\u2212.") == 0);
+  CHECK_EQ(n, (long)strlen(notice));
+  nsShortcutDroppedNotice(NULL, lower.name, "\u2303J", raise.name, notice, sizeof notice);
+  CHECK(strcmp(notice, "Your shortcut \u2303J no longer works. Now using \u2303\u2325\u2318=.") == 0);
+  nsShortcutDroppedNotice("\u2303K", lower.name, "\u2303J", raise.name, notice, sizeof notice);
+  CHECK(strcmp(notice, "Your shortcuts \u2303K and \u2303J no longer work. Now using "
+                       "\u2303\u2325\u2318\u2212 and \u2303\u2325\u2318=.") == 0);
+  CHECK_EQ(nsShortcutDroppedNotice("", lower.name, NULL, raise.name, notice, sizeof notice), 0);
+  CHECK(notice[0] == '\0');
   char tiny[4];
   n = nsShortcutsFormat(pair, tiny, sizeof tiny);
   CHECK(n > 3 && tiny[3] == '\0');
@@ -499,6 +587,116 @@ static void checkWarmthShortcuts(void) {
   CHECK(strcmp(nsShortcutStateLabel(kNSShortcutTakenBySystem), "Used by macOS") == 0);
   CHECK(strcmp(nsShortcutStateLabel(kNSShortcutTakenByApp), "Used by another app") == 0);
   CHECK(strcmp(nsShortcutStateLabel(kNSShortcutFailed), "Couldn't turn on") == 0);
+}
+
+// Pretend clashes for nsShortcutSuggest: the shortcuts named in a NULL-ended
+// list are taken. Counts each probe.
+typedef struct {
+  const char *const *taken;
+  int probes;
+} Clashes;
+
+static bool notTaken(const NSShortcut *shortcut, void *context) {
+  Clashes *clashes = context;
+  clashes->probes++;
+  for (const char *const *t = clashes->taken; *t != NULL; t++) {
+    if (strcmp(*t, shortcut->name) == 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static void checkShortcutRefusals(void) {
+  const unsigned C = kNSHotKeyControl, O = kNSHotKeyOption, M = kNSHotKeyCommand,
+                 S = kNSHotKeyShift;
+  const unsigned K = 0x28, Q = 0x0C;
+  const char *const none[] = {NULL};
+  Clashes clear = {none, 0};
+  NSShortcut tryThis;
+
+  // Each refusal's first choice.
+  CHECK(nsShortcutSuggest(K, M, "K", NULL, notTaken, &clear, &tryThis));  // ⌘K
+  CHECK(strcmp(tryThis.name, "\u2325\u2318K") == 0);
+  CHECK(nsShortcutSuggest(K, 0, "K", NULL, notTaken, &clear, &tryThis));  // K
+  CHECK(strcmp(tryThis.name, "\u2303\u2325K") == 0);
+  CHECK(nsShortcutSuggest(K, C, "K", NULL, notTaken, &clear, &tryThis));  // ⌃K
+  CHECK(strcmp(tryThis.name, "\u2303\u2325K") == 0);
+  CHECK(nsShortcutSuggest(K, O, "K", NULL, notTaken, &clear, &tryThis));  // ⌥K
+  CHECK(strcmp(tryThis.name, "\u2303\u2325K") == 0);
+  CHECK(nsShortcutSuggest(Q, C | M, "Q", NULL, notTaken, &clear, &tryThis));  // ⌃⌘Q
+  CHECK(strcmp(tryThis.name, "\u2303\u2325\u2318Q") == 0);
+  CHECK(nsShortcutSuggest(K, O | M, "K", NULL, notTaken, &clear, &tryThis));  // ⌥⌘K
+  CHECK(strcmp(tryThis.name, "\u2303\u2325\u2318K") == 0);
+  // ⇧ stays, since the typed label came with it.
+  CHECK(nsShortcutSuggest(K, C | S, "K", NULL, notTaken, &clear, &tryThis));
+  CHECK(strcmp(tryThis.name, "\u2303\u2325\u21E7K") == 0);
+  // Every suggestion passes the rule itself.
+  for (unsigned code = 0; code < 128; code++) {
+    for (unsigned m = 0; m <= (C | O | M | S); m += 256) {
+      if ((m & ~(C | O | M | S)) != 0) {
+        continue;
+      }
+      if (nsShortcutSuggest(code, m, "K", NULL, NULL, NULL, &tryThis)) {
+        CHECK(nsShortcutAllowed(tryThis.keyCode, tryThis.modifiers));
+        CHECK(tryThis.keyCode == code && tryThis.modifiers != m);
+      }
+    }
+  }
+
+  // A taken candidate is skipped for the next one; the other key's too.
+  const char *const takenTwo[] = {"\u2325\u2318K", "\u2303\u2318K", NULL};
+  Clashes some = {takenTwo, 0};
+  CHECK(nsShortcutSuggest(K, M, "K", NULL, notTaken, &some, &tryThis));
+  CHECK(strcmp(tryThis.name, "\u2303\u2325\u2318K") == 0);
+  CHECK_EQ(some.probes, 3);
+  NSShortcut other;
+  CHECK(nsShortcutMake(K, C | O | M, "K", &other));
+  some.probes = 0;
+  CHECK(nsShortcutSuggest(K, M, "K", &other, notTaken, &some, &tryThis));
+  CHECK(strcmp(tryThis.name, "\u2303\u2325K") == 0);  // after the keepers, the rest
+  // None free: no suggestion, out untouched.
+  const char *const takenAll[] = {"\u2303\u2325K", "\u2325\u2318K", "\u2303\u2318K",
+                                  "\u2303\u2325\u2318K", NULL};
+  Clashes all = {takenAll, 0};
+  NSShortcut untouched = other;
+  CHECK(!nsShortcutSuggest(K, M, "K", NULL, notTaken, &all, &untouched));
+  CHECK(nsShortcutSame(&untouched, &other));
+  CHECK_EQ(all.probes, 4);
+  // A key with no label has no suggestion.
+  CHECK(!nsShortcutSuggest(0x0B, M, "", NULL, NULL, NULL, &tryThis));
+  CHECK(!nsShortcutSuggest(0x0B, M, NULL, NULL, NULL, NULL, &tryThis));
+
+  // The notes, word for word.
+  char buf[160];
+  int n = nsShortcutRefusal(kNSRefusalOtherApps, "\u2318K", "\u2325\u2318K", buf, sizeof buf);
+  CHECK(strcmp(buf, "Other apps use \u2318K. Try \u2325\u2318K.") == 0);
+  CHECK_EQ(n, (long)strlen(buf));
+  nsShortcutRefusal(kNSRefusalModifiers, NULL, "\u2303\u2325K", buf, sizeof buf);
+  CHECK(strcmp(buf, "Add two of \u2303 \u2325 \u2318. Try \u2303\u2325K.") == 0);
+  nsShortcutRefusal(kNSRefusalSystem, "\u2303\u2318Q", "\u2303\u2325\u2318Q", buf, sizeof buf);
+  CHECK(strcmp(buf, "Your Mac uses \u2303\u2318Q. Try \u2303\u2325\u2318Q.") == 0);
+  nsShortcutRefusal(kNSRefusalApp, "\u2325\u2318K", "\u2303\u2325\u2318K", buf, sizeof buf);
+  CHECK(strcmp(buf, "Another app has \u2325\u2318K. Try \u2303\u2325\u2318K.") == 0);
+  nsShortcutRefusal(kNSRefusalOtherKey, "\u2325\u2318K", "\u2303\u2325K", buf, sizeof buf);
+  CHECK(strcmp(buf, "The other key has \u2325\u2318K. Pick a new one.") == 0);
+  nsShortcutRefusal(kNSRefusalKey, "\u2325\u2318K", "\u2303\u2325K", buf, sizeof buf);
+  CHECK(strcmp(buf, "That key won't work. Pick a new one.") == 0);
+  nsShortcutRefusal(kNSRefusalSave, "\u2325\u2318K", NULL, buf, sizeof buf);
+  CHECK(strcmp(buf, "That didn't save. Try again.") == 0);
+  // No suggestion that passes: no "Try".
+  nsShortcutRefusal(kNSRefusalOtherApps, "\u2318K", NULL, buf, sizeof buf);
+  CHECK(strcmp(buf, "Other apps use \u2318K. Pick a new one.") == 0);
+  nsShortcutRefusal(kNSRefusalModifiers, NULL, "", buf, sizeof buf);
+  CHECK(strcmp(buf, "Add two of \u2303 \u2325 \u2318. Pick a new one.") == 0);
+  nsShortcutRefusal(kNSRefusalSystem, "\u2303\u2318Q", NULL, buf, sizeof buf);
+  CHECK(strcmp(buf, "Your Mac uses \u2303\u2318Q. Pick a new one.") == 0);
+  // Nothing to name: the plain note.
+  nsShortcutRefusal(kNSRefusalApp, NULL, "\u2303\u2325K", buf, sizeof buf);
+  CHECK(strcmp(buf, "That key won't work. Pick a new one.") == 0);
+  char tiny[4];
+  n = nsShortcutRefusal(kNSRefusalApp, "\u2325\u2318K", "\u2303\u2325\u2318K", tiny, sizeof tiny);
+  CHECK(n > 3 && tiny[3] == '\0');
 }
 
 // A pretend panel. sticky reads ignore writes (a cached brightness). echo
@@ -620,6 +818,7 @@ static void checkDaemonCommands(void) {
 
 int main(void) {
   checkWarmthShortcuts();
+  checkShortcutRefusals();
   checkRamp();
   checkCommandWarmth();
   checkOldBrightnessSettings();
