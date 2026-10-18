@@ -2911,7 +2911,6 @@ static NSString *const kSettingsWindowID = @"NightshiftSettings";
 
 // The square the glyph is centered in; the ring hugs 80% of it.
 static const CGFloat kIconTileImage = 60;
-static const CGFloat kIconTileGlyph = 28;
 
 @implementation IconTile
 - (instancetype)initWithChoice:(IconChoice *)choice {
@@ -2921,9 +2920,19 @@ static const CGFloat kIconTileGlyph = 28;
   }
   self.choice = choice;
   self.translatesAutoresizingMaskIntoConstraints = NO;
-  NSImage *glyph = [choice menuImage] ?: [[IconChoice standard] menuImage];
-  CGFloat scale = kIconTileGlyph / MAX(glyph.size.width, glyph.size.height);
-  glyph.size = NSMakeSize(glyph.size.width * scale, glyph.size.height * scale);
+  // The menu bar image at its own size, on whole points so @1x stays sharp.
+  NSImage *menu = [choice menuImage] ?: [[IconChoice standard] menuImage];
+  NSRect target = NSMakeRect(round((kIconTileImage - menu.size.width) / 2),
+                             round((kIconTileImage - menu.size.height) / 2), menu.size.width,
+                             menu.size.height);
+  NSImage *glyph = [NSImage imageWithSize:NSMakeSize(kIconTileImage, kIconTileImage)
+                                  flipped:NO
+                           drawingHandler:^BOOL(NSRect rect) {
+                             (void)rect;
+                             [menu drawInRect:target];
+                             return YES;
+                           }];
+  glyph.template = YES;
   self.imageView = [NSImageView imageViewWithImage:glyph];
   self.imageView.translatesAutoresizingMaskIntoConstraints = NO;
   self.nameField = [NSTextField labelWithString:choice.name];
