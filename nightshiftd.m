@@ -28,7 +28,18 @@ static NSShortcutState warmthKeyState(unsigned hotKeyID);
 static void retryWarmthKeys(void);
 static void pauseWarmthKeys(void);
 static void resumeWarmthKeys(void);
-static BOOL setWarmthShortcut(unsigned hotKeyID, NSShortcut shortcut);
+// How setWarmthShortcut went. Anything but saved leaves the old shortcut
+// saved and in use.
+typedef enum {
+  kWarmthSetSaved = 0,
+  kWarmthSetOtherKey,  // the other warmth key has it
+  kWarmthSetSystem,    // a macOS shortcut
+  kWarmthSetApp,       // another app's hotkey
+  kWarmthSetFailed,    // any other registration error
+  kWarmthSetNotSaved,  // the shortcuts file was not written
+} WarmthSetResult;
+static WarmthSetResult setWarmthShortcut(unsigned hotKeyID, NSShortcut shortcut);
+static bool warmthShortcutUsable(const NSShortcut *shortcut, void *context);
 static BOOL resetWarmthShortcuts(void);
 static void teardownDaemon(void);
 static void startWarmthKeys(void);
@@ -3746,7 +3757,8 @@ static void hugControls(NSView *view) {
 }
 
 // YES when the key press was used for recording. ⌘W and ⌘Q stop recording
-// and go on to the app as usual; other refused lone-⌘ chords say why.
+// and go on to the app as usual. Any other refused key says why and, when
+// one passes, which shortcut to try; recording goes on.
 - (BOOL)recordKey:(NSEvent *)event {
   if (event.isARepeat) {
     return YES;
@@ -3773,32 +3785,61 @@ static void hugControls(NSView *view) {
     [self stopRecording];
     return NO;
   }
-  NSShortcut shortcut;
+  unsigned keyCode = event.keyCode;
   NSString *key = event.charactersIgnoringModifiers.uppercaseString;
-  if (!nsShortcutMake(event.keyCode, modifiers, key.UTF8String, &shortcut)) {
-    if (nsShortcutAllowed(event.keyCode, modifiers)) {
-      self.recordNote = @"Pick another key";
-    } else if (modifiers & (cmdKey | optionKey | controlKey)) {
-      self.recordNote = @"Add ⌃, or use both ⌥ and ⌘";
-    } else {
-      self.recordNote = @"Add ⌃, ⌥ or ⌘";
-    }
-    [self syncDisplays];
+  const char *typed = key.UTF8String;
+  if (!nsShortcutAllowed(keyCode, modifiers)) {
+    char pressed[40];
+    BOOL named = nsShortcutName(keyCode, modifiers, typed, pressed, sizeof pressed);
+    BOOL loneCommand = (modifiers & (cmdKey | optionKey | controlKey)) == cmdKey;
+    [self refuse:loneCommand && named ? kNSRefusalOtherApps : kNSRefusalModifiers
+         pressed:named ? pressed : NULL
+         keyCode:keyCode
+       modifiers:modifiers
+             key:typed];
     return YES;
   }
-  NSShortcut other = warmthShortcut(self.recordingID == 1 ? 2 : 1);
-  if (nsShortcutSame(&shortcut, &other)) {
-    self.recordNote = @"Used by the other key";
-    [self syncDisplays];
+  NSShortcut shortcut;
+  if (!nsShortcutMake(keyCode, modifiers, typed, &shortcut)) {
+    [self refuse:kNSRefusalKey pressed:NULL keyCode:keyCode modifiers:modifiers key:typed];
     return YES;
   }
-  if (!setWarmthShortcut(self.recordingID, shortcut)) {
-    self.recordNote = @"Couldn't save";
-    [self syncDisplays];
-    return YES;
+  NSShortcutRefusal why = kNSRefusalKey;
+  switch (setWarmthShortcut(self.recordingID, shortcut)) {
+    case kWarmthSetSaved:
+      [self stopRecording];
+      return YES;
+    case kWarmthSetOtherKey: why = kNSRefusalOtherKey; break;
+    case kWarmthSetSystem: why = kNSRefusalSystem; break;
+    case kWarmthSetApp: why = kNSRefusalApp; break;
+    case kWarmthSetFailed: why = kNSRefusalKey; break;
+    case kWarmthSetNotSaved: why = kNSRefusalSave; break;
   }
-  [self stopRecording];
+  [self refuse:why pressed:shortcut.name keyCode:keyCode modifiers:modifiers key:typed];
   return YES;
+}
+
+// Says why a recorded key was refused, in place of the status, and goes on
+// recording. A "Try" suggestion is offered only when it passes the same
+// checks a recorded key does: the rule, the other key, macOS shortcuts and
+// a trial registration.
+- (void)refuse:(NSShortcutRefusal)why
+       pressed:(const char *)pressed
+       keyCode:(unsigned)keyCode
+     modifiers:(unsigned)modifiers
+           key:(const char *)key {
+  NSShortcut suggestion;
+  BOOL suggest = NO;
+  if (why == kNSRefusalOtherApps || why == kNSRefusalModifiers || why == kNSRefusalSystem ||
+      why == kNSRefusalApp) {
+    NSShortcut other = warmthShortcut(self.recordingID == 1 ? 2 : 1);
+    suggest = nsShortcutSuggest(keyCode, modifiers, key, &other, warmthShortcutUsable, NULL,
+                                &suggestion);
+  }
+  char note[160];
+  nsShortcutRefusal(why, pressed, suggest ? suggestion.name : NULL, note, sizeof note);
+  self.recordNote = [NSString stringWithUTF8String:note];
+  [self syncDisplays];
 }
 
 - (void)stopRecording {
@@ -5430,6 +5471,9 @@ static NSString *shortcutsPath(void) {
       stringByAppendingPathComponent:@"shortcuts"];
 }
 
+// Set by a load that found a saved shortcut this build refuses.
+static NSString *gRefusedShortcutsNotice = nil;
+
 static void ensureWarmthShortcuts(void) {
   if (gWarmthShortcutsLoaded) {
     return;
@@ -5438,7 +5482,12 @@ static void ensureWarmthShortcuts(void) {
   NSString *text = [NSString stringWithContentsOfFile:shortcutsPath()
                                              encoding:NSUTF8StringEncoding
                                                 error:NULL];
-  nsShortcutsParse(text.UTF8String, gWarmthShortcuts);
+  char refused[2][40];
+  nsShortcutsParseRefused(text.UTF8String, gWarmthShortcuts, refused);
+  char notice[200];
+  nsShortcutDroppedNotice(refused[0], gWarmthShortcuts[0].name, refused[1],
+                          gWarmthShortcuts[1].name, notice, sizeof notice);
+  gRefusedShortcutsNotice = notice[0] != '\0' ? [NSString stringWithUTF8String:notice] : nil;
 }
 
 static void loadWarmthShortcuts(void) {
@@ -5469,6 +5518,23 @@ static BOOL saveWarmthShortcuts(void) {
     return NO;
   }
   return YES;
+}
+
+// A saved shortcut this build refuses (a lone ⌃K, or ⌘⇧K from an older
+// build) loads as its default. Say so once with notifyPlain, then save the
+// file with what is in use, so the next launch is quiet. If that save
+// fails, the next launch says it again.
+static void noticeRefusedShortcuts(void) {
+  if (gRefusedShortcutsNotice == nil) {
+    return;
+  }
+  NSString *notice = gRefusedShortcutsNotice;
+  gRefusedShortcutsNotice = nil;
+  NSLog(@"%@", notice);
+  notifyPlain(notice);
+  if (!saveWarmthShortcuts()) {
+    NSLog(@"Couldn't save the warmth shortcuts.");
+  }
 }
 
 static NSShortcut warmthShortcut(unsigned hotKeyID) {
@@ -5512,6 +5578,29 @@ static BOOL systemShortcutTaken(NSShortcut shortcut) {
   }
   CFRelease(keys);
   return taken;
+}
+
+// What registering shortcut would run into now, without keeping it: a macOS
+// shortcut, another app's hotkey, or nothing. The trial has its own
+// signature, which the hotkey handler ignores, and is released at once.
+static NSShortcutState probeShortcut(NSShortcut shortcut) {
+  if (systemShortcutTaken(shortcut)) {
+    return kNSShortcutTakenBySystem;
+  }
+  EventHotKeyID trial = {'NStr', 1};
+  EventHotKeyRef ref = NULL;
+  OSStatus err = RegisterEventHotKey(shortcut.keyCode, shortcut.modifiers, trial,
+                                     GetApplicationEventTarget(), 0, &ref);
+  if (err == noErr) {
+    UnregisterEventHotKey(ref);
+    return kNSShortcutReady;
+  }
+  return err == eventHotKeyExistsErr ? kNSShortcutTakenByApp : kNSShortcutFailed;
+}
+
+static bool warmthShortcutUsable(const NSShortcut *shortcut, void *context) {
+  (void)context;
+  return probeShortcut(*shortcut) == kNSShortcutReady;
 }
 
 static NSShortcutState registerWarmthKey(unsigned i) {
@@ -5593,6 +5682,7 @@ static void registerCommandWarmthHotKeys(void) {
   }
   gCommandHotKeyHandler = handler;
   loadWarmthShortcuts();
+  noticeRefusedShortcuts();
   registerWarmthKeys(YES);
 }
 
@@ -5622,24 +5712,50 @@ static void resumeWarmthKeys(void) {
   retryWarmthKeys();
 }
 
-static BOOL setWarmthShortcut(unsigned hotKeyID, NSShortcut shortcut) {
+// Checks before it saves: a shortcut the other key has, a macOS shortcut,
+// or one another app holds is refused with nothing changed, so the old
+// shortcut stays saved and, outside recording, registered. The new hotkey
+// is registered before the old one is released, so there is no moment with
+// neither. While Settings records, both are paused; the new one stays
+// registered and stopRecording's resume keeps it.
+static WarmthSetResult setWarmthShortcut(unsigned hotKeyID, NSShortcut shortcut) {
   if (hotKeyID < 1 || hotKeyID > 2) {
-    return NO;
+    return kWarmthSetFailed;
   }
   ensureWarmthShortcuts();
   unsigned i = hotKeyID - 1;
   if (nsShortcutSame(&shortcut, &gWarmthShortcuts[1 - i])) {
-    return NO;
+    return kWarmthSetOtherKey;
+  }
+  if (systemShortcutTaken(shortcut)) {
+    return kWarmthSetSystem;
+  }
+  EventHotKeyRef ref = NULL;
+  if (!(nsShortcutSame(&shortcut, &gWarmthShortcuts[i]) && gCommandHotKeys[i] != NULL)) {
+    EventHotKeyID hotKey = {'NScm', hotKeyID};
+    OSStatus err = RegisterEventHotKey(shortcut.keyCode, shortcut.modifiers, hotKey,
+                                       GetApplicationEventTarget(), 0, &ref);
+    if (err != noErr) {
+      return err == eventHotKeyExistsErr ? kWarmthSetApp : kWarmthSetFailed;
+    }
   }
   NSShortcut old = gWarmthShortcuts[i];
   gWarmthShortcuts[i] = shortcut;
   if (!saveWarmthShortcuts()) {
     gWarmthShortcuts[i] = old;
-    return NO;
+    if (ref != NULL) {
+      UnregisterEventHotKey(ref);
+    }
+    return kWarmthSetNotSaved;
   }
-  dropWarmthKey(i);
-  retryWarmthKeys();
-  return YES;
+  if (ref != NULL) {
+    if (gCommandHotKeys[i] != NULL) {
+      UnregisterEventHotKey(gCommandHotKeys[i]);
+    }
+    gCommandHotKeys[i] = ref;
+  }
+  gWarmthKeyStates[i] = kNSShortcutReady;
+  return kWarmthSetSaved;
 }
 
 static BOOL resetWarmthShortcuts(void) {

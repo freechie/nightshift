@@ -75,9 +75,10 @@ typedef struct {
 // false and an all-zero shortcut for any other id.
 bool nsShortcutDefault(unsigned hotKeyID, NSShortcut *out);
 // A shortcut Nightshift will register: a key code below 128, only the four
-// modifiers above, and at least one of ⌃, ⌥ or ⌘ (⇧ alone would eat typing).
-// Without ⌃ it needs both ⌥ and ⌘, unless the key is F1...F12: a lone ⌘ or ⌥
-// with a letter, even with ⇧, would take ⌘Q, ⌘⇧Z and the like from every app.
+// modifiers above, and at least two of ⌃, ⌥ and ⌘ for every key but
+// F1...F12, which need one. ⇧ never counts. A lone ⌘, ⌥ or ⌃ with a letter,
+// digit, arrow, Space, Return or punctuation, even with ⇧, would take ⌘Q,
+// ⌘⇧Z, ⌥E, ⌃C, ⌃D, ⌃A and the like from every app and from Terminal.
 bool nsShortcutAllowed(unsigned keyCode, unsigned modifiers);
 // The label for keys whose typed character is not one (F1...F12, arrows,
 // Space, Return, Tab, Delete, Escape, and − for kNSKeyCodeMinus), else NULL.
@@ -86,11 +87,50 @@ const char *nsShortcutKeyLabel(unsigned keyCode);
 // nsShortcutKeyLabel does not name: 1...8 bytes, no spaces or control
 // characters. false, out untouched, when the shortcut or label is not allowed.
 bool nsShortcutMake(unsigned keyCode, unsigned modifiers, const char *key, NSShortcut *out);
+// The name nsShortcutMake would show (⌃⌥⇧⌘ and the label), allowed or not,
+// so a refusal can say what was pressed. false when the label is not one.
+bool nsShortcutName(unsigned keyCode, unsigned modifiers, const char *key, char *buf,
+                    size_t size);
 // The saved shortcuts file: one "lower" or "raise" line each,
 // "<word> <keyCode> <modifiers> <label>". A missing, broken or not allowed
 // line keeps that id's default; the same shortcut on both lines keeps both
 // defaults. Returns a bit per id (1 << (id - 1)) read from text.
 unsigned nsShortcutsParse(const char *text, NSShortcut out[2]);
+// nsShortcutsParse, and refused[i] is the name of id i + 1's line when it was
+// well formed but this build's rule refuses it (an old lone ⌃K, ⌘⇧K, ⌥⇧K),
+// so its default is in use; "" otherwise. refused may be NULL.
+unsigned nsShortcutsParseRefused(const char *text, NSShortcut out[2], char refused[][40]);
+// The one notice for refused saved lines: "Your shortcut ⌃K no longer works.
+// Now using ⌃⌥⌘=." or, for both, "Your shortcuts ⌃K and ⌃J no longer work.
+// Now using ⌃⌥⌘− and ⌃⌥⌘=." NULL or "" old names are skipped; 0 and "" when
+// none. Returns the full length, like snprintf.
+int nsShortcutDroppedNotice(const char *oldLower, const char *nowLower, const char *oldRaise,
+                            const char *nowRaise, char *buf, size_t size);
+// Whether a candidate shortcut is free right now (no macOS or app clash).
+typedef bool (*NSShortcutUsable)(const NSShortcut *shortcut, void *context);
+// A shortcut to suggest instead of keyCode with modifiers: the same key (and
+// ⇧, if pressed) with ⌃⌥, ⌥⌘, ⌃⌘ or ⌃⌥⌘, those that keep every pressed
+// modifier first, fewest added first. Each must pass nsShortcutMake, differ
+// from what was pressed and from other (may be NULL), and pass usable (may
+// be NULL). false, out untouched, when none does.
+bool nsShortcutSuggest(unsigned keyCode, unsigned modifiers, const char *key,
+                       const NSShortcut *other, NSShortcutUsable usable, void *context,
+                       NSShortcut *out);
+// Why the recorder refused a key, for the note under the shortcut.
+typedef enum {
+  kNSRefusalOtherApps = 0,  // lone ⌘: "Other apps use ⌘K."
+  kNSRefusalModifiers,      // too few modifiers: "Add two of ⌃ ⌥ ⌘."
+  kNSRefusalSystem,         // a macOS shortcut: "Your Mac uses ⌃⌘Q."
+  kNSRefusalApp,            // another app's hotkey: "Another app has ⌥⌘K."
+  kNSRefusalOtherKey,       // the other warmth key has it
+  kNSRefusalKey,            // no usable label, or registering failed
+  kNSRefusalSave,           // the shortcuts file was not written
+} NSShortcutRefusal;
+// The note for why, NUL-terminated and cut to fit. pressed is the pressed
+// shortcut's name. The first four end in "Try <suggestion>." when suggestion
+// is a name, else "Pick a new one." Returns the full length, like snprintf.
+int nsShortcutRefusal(NSShortcutRefusal why, const char *pressed, const char *suggestion,
+                      char *buf, size_t size);
 // The file text for shortcuts, NUL-terminated and cut to fit. Returns the
 // full length, like snprintf.
 int nsShortcutsFormat(const NSShortcut shortcuts[2], char *buf, size_t size);
