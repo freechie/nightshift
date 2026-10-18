@@ -21,6 +21,8 @@
 #endif
 
 #include "NightshiftLogic.h"
+#include <limits.h>
+#include <errno.h>
 
 #include <stdio.h>
 #include <string.h>
@@ -128,24 +130,220 @@ double nsCommandWarmthRepeatGap(double seconds) {
   return seconds;
 }
 
-NSWarmthShortcut nsWarmthShortcut(unsigned hotKeyID) {
-  const unsigned mods = kNSHotKeyCommand | kNSHotKeyOption | kNSHotKeyControl;
-  NSWarmthShortcut none = {0, 0, ""};
-  if (hotKeyID == 1) {
-    NSWarmthShortcut lower = {kNSKeyCodeMinus, mods, "\u2303\u2325\u2318\u2212"};
-    return lower;
+static const unsigned kShortcutModifiers =
+    kNSHotKeyCommand | kNSHotKeyShift | kNSHotKeyOption | kNSHotKeyControl;
+
+static bool isFunctionKey(unsigned keyCode) {
+  switch (keyCode) {
+    case 0x7A: case 0x78: case 0x63: case 0x76: case 0x60: case 0x61:
+    case 0x62: case 0x64: case 0x65: case 0x6D: case 0x67: case 0x6F:
+      return true;
+    default:
+      return false;
   }
-  if (hotKeyID == 2) {
-    NSWarmthShortcut raise = {kNSKeyCodeEqual, mods, "\u2303\u2325\u2318="};
-    return raise;
-  }
-  return none;
 }
 
-int nsWarmthShortcutFailure(unsigned hotKeyID, char *buf, size_t size) {
-  NSWarmthShortcut shortcut = nsWarmthShortcut(hotKeyID);
-  const char *name = shortcut.name[0] != '\0' ? shortcut.name : "A warmth shortcut";
-  return snprintf(buf, size, "%s is already used by another app", name);
+bool nsShortcutAllowed(unsigned keyCode, unsigned modifiers) {
+  if (keyCode >= 128 || (modifiers & ~kShortcutModifiers) != 0) {
+    return false;
+  }
+  if ((modifiers & (kNSHotKeyCommand | kNSHotKeyOption | kNSHotKeyControl)) == 0) {
+    return false;
+  }
+  if ((modifiers & kNSHotKeyControl) != 0) {
+    return true;
+  }
+  // These hotkeys are global, so a lone ⌘ or ⌥ with a letter, digit or arrow
+  // would take ⌘Q, ⌘W, ⌥E and the like from every app. F-keys stay allowed.
+  bool oneModifier = (modifiers & (modifiers - 1)) == 0;
+  return !oneModifier || isFunctionKey(keyCode);
+}
+
+const char *nsShortcutKeyLabel(unsigned keyCode) {
+  switch (keyCode) {
+    case kNSKeyCodeMinus: return "\u2212";
+    case 0x7A: return "F1";
+    case 0x78: return "F2";
+    case 0x63: return "F3";
+    case 0x76: return "F4";
+    case 0x60: return "F5";
+    case 0x61: return "F6";
+    case 0x62: return "F7";
+    case 0x64: return "F8";
+    case 0x65: return "F9";
+    case 0x6D: return "F10";
+    case 0x67: return "F11";
+    case 0x6F: return "F12";
+    case 0x7B: return "\u2190";
+    case 0x7C: return "\u2192";
+    case 0x7D: return "\u2193";
+    case 0x7E: return "\u2191";
+    case 0x31: return "Space";
+    case 0x24: return "\u21A9";
+    case 0x30: return "\u21E5";
+    case 0x33: return "\u232B";
+    case 0x35: return "\u238B";
+    default: return NULL;
+  }
+}
+
+static bool labelAllowed(const char *key) {
+  if (key == NULL) {
+    return false;
+  }
+  size_t n = strlen(key);
+  if (n == 0 || n > 8) {
+    return false;
+  }
+  for (size_t i = 0; i < n; i++) {
+    unsigned char c = (unsigned char)key[i];
+    if (c <= 0x20 || c == 0x7F) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool nsShortcutMake(unsigned keyCode, unsigned modifiers, const char *key, NSShortcut *out) {
+  if (out == NULL || !nsShortcutAllowed(keyCode, modifiers)) {
+    return false;
+  }
+  const char *label = nsShortcutKeyLabel(keyCode);
+  if (label == NULL) {
+    label = key;
+  }
+  if (!labelAllowed(label)) {
+    return false;
+  }
+  NSShortcut made = {keyCode, modifiers, "", ""};
+  snprintf(made.key, sizeof made.key, "%s", label);
+  snprintf(made.name, sizeof made.name, "%s%s%s%s%s",
+           (modifiers & kNSHotKeyControl) ? "\u2303" : "",
+           (modifiers & kNSHotKeyOption) ? "\u2325" : "",
+           (modifiers & kNSHotKeyShift) ? "\u21E7" : "",
+           (modifiers & kNSHotKeyCommand) ? "\u2318" : "", label);
+  *out = made;
+  return true;
+}
+
+bool nsShortcutDefault(unsigned hotKeyID, NSShortcut *out) {
+  NSShortcut none = {0, 0, "", ""};
+  if (out == NULL) {
+    return false;
+  }
+  *out = none;
+  const unsigned mods = kNSHotKeyCommand | kNSHotKeyOption | kNSHotKeyControl;
+  if (hotKeyID == 1) {
+    return nsShortcutMake(kNSKeyCodeMinus, mods, NULL, out);
+  }
+  if (hotKeyID == 2) {
+    return nsShortcutMake(kNSKeyCodeEqual, mods, "=", out);
+  }
+  return false;
+}
+
+bool nsShortcutSame(const NSShortcut *a, const NSShortcut *b) {
+  return a != NULL && b != NULL && a->keyCode == b->keyCode && a->modifiers == b->modifiers;
+}
+
+static const char *const kShortcutWords[2] = {"lower", "raise"};
+
+// Decimal digits only; false on anything else or a value past UINT_MAX.
+static bool parseUnsigned(const char *text, unsigned *out) {
+  if (text[0] < '0' || text[0] > '9') {
+    return false;
+  }
+  errno = 0;
+  char *end = NULL;
+  unsigned long value = strtoul(text, &end, 10);
+  if (errno != 0 || *end != '\0' || value > UINT_MAX) {
+    return false;
+  }
+  *out = (unsigned)value;
+  return true;
+}
+
+unsigned nsShortcutsParse(const char *text, NSShortcut out[2]) {
+  nsShortcutDefault(1, &out[0]);
+  nsShortcutDefault(2, &out[1]);
+  unsigned found = 0;
+  const char *line = text;
+  while (line != NULL && *line != '\0') {
+    const char *nl = strchr(line, '\n');
+    size_t len = nl != NULL ? (size_t)(nl - line) : strlen(line);
+    char buf[96];
+    if (len < sizeof buf) {
+      memcpy(buf, line, len);
+      while (len > 0 && (buf[len - 1] == '\r' || buf[len - 1] == ' ' || buf[len - 1] == '\t')) {
+        len--;
+      }
+      buf[len] = '\0';
+      char word[8];
+      char codeText[16];
+      char modText[16];
+      unsigned keyCode = 0;
+      unsigned modifiers = 0;
+      char key[16];
+      int used = 0;
+      if (sscanf(buf, "%7s %15s %15s %15s%n", word, codeText, modText, key, &used) == 4 &&
+          buf[used] == '\0' && parseUnsigned(codeText, &keyCode) &&
+          parseUnsigned(modText, &modifiers)) {
+        for (unsigned i = 0; i < 2; i++) {
+          NSShortcut made;
+          if (strcmp(word, kShortcutWords[i]) == 0 && !(found & (1u << i)) &&
+              nsShortcutMake(keyCode, modifiers, key, &made)) {
+            out[i] = made;
+            found |= 1u << i;
+          }
+        }
+      }
+    }
+    line = nl != NULL ? nl + 1 : NULL;
+  }
+  if (nsShortcutSame(&out[0], &out[1])) {
+    nsShortcutDefault(1, &out[0]);
+    nsShortcutDefault(2, &out[1]);
+    return 0;
+  }
+  return found;
+}
+
+int nsShortcutsFormat(const NSShortcut shortcuts[2], char *buf, size_t size) {
+  return snprintf(buf, size, "%s %u %u %s\n%s %u %u %s\n", kShortcutWords[0],
+                  shortcuts[0].keyCode, shortcuts[0].modifiers, shortcuts[0].key,
+                  kShortcutWords[1], shortcuts[1].keyCode, shortcuts[1].modifiers,
+                  shortcuts[1].key);
+}
+
+const char *nsShortcutStateLabel(NSShortcutState state) {
+  switch (state) {
+    case kNSShortcutReady: return "On";
+    case kNSShortcutTakenBySystem: return "Used by macOS";
+    case kNSShortcutTakenByApp: return "Used by another app";
+    case kNSShortcutFailed: return "Couldn't turn on";
+  }
+  return "Couldn't turn on";
+}
+
+int nsShortcutNotice(unsigned hotKeyID, const char *name, NSShortcutState state, char *buf,
+                     size_t size) {
+  const char *what = hotKeyID == 1 ? "lower warmth" : hotKeyID == 2 ? "raise warmth" : "warmth";
+  const char *shown = name != NULL && name[0] != '\0' ? name : "A warmth shortcut";
+  switch (state) {
+    case kNSShortcutReady:
+      if (size > 0) {
+        buf[0] = '\0';
+      }
+      return 0;
+    case kNSShortcutTakenBySystem:
+      return snprintf(buf, size, "%s (%s) is a macOS shortcut. Pick another in Settings.", shown,
+                      what);
+    case kNSShortcutTakenByApp:
+      return snprintf(buf, size, "%s (%s) is already used by another app.", shown, what);
+    case kNSShortcutFailed:
+      break;
+  }
+  return snprintf(buf, size, "%s (%s) couldn't be turned on.", shown, what);
 }
 
 // MARK: Daemon socket commands
