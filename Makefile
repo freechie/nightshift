@@ -81,9 +81,12 @@ nightshift-testkey: main.m $(SHARED) $(LOGIC)
 license-server-check: scripts/license-server-check.m $(LOGIC)
 	clang $(CFLAGS) -I. -o $@ scripts/license-server-check.m NightshiftLogic.m
 
-$(BUNDLED): nightshiftd Info.plist
-	mkdir -p $(dir $@)
+GLYPHS := $(wildcard icons/*.pdf)
+
+$(BUNDLED): nightshiftd Info.plist $(GLYPHS)
+	mkdir -p $(dir $@) $(APP)/Contents/Resources
 	cp Info.plist $(APP)/Contents/
+	cp $(GLYPHS) $(APP)/Contents/Resources/
 	cp nightshiftd $@
 	sh scripts/dev-sign.sh $(APP)
 
