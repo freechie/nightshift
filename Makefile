@@ -119,7 +119,4 @@ clean:
 hooks:
 	git config core.hooksPath scripts/hooks
 
-icon-lab:
-	open prototype/icon/index.html
-
-.PHONY: all test server-test install package clean hooks icon-lab secret-scan workspace-open-check
+.PHONY: all test server-test install package clean hooks secret-scan workspace-open-check
