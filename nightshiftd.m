@@ -2726,13 +2726,22 @@ static BOOL appearanceIsDark(NSAppearance *appearance) {
   if (self.menuSymbol != nil) {
     NSImageSymbolConfiguration *symbol =
         [NSImageSymbolConfiguration configurationWithPointSize:16 weight:NSFontWeightRegular];
-    image = [[NSImage imageWithSystemSymbolName:self.menuSymbol
-                       accessibilityDescription:@"Nightshift"]
+    NSImage *glyph = [[NSImage imageWithSystemSymbolName:self.menuSymbol
+                                accessibilityDescription:nil]
         imageWithSymbolConfiguration:symbol];
+    // The status bar fits a symbol to its alignment rect without scaling,
+    // which cuts off whatever sits outside it. A plain image is drawn whole.
+    image = glyph == nil ? nil
+                         : [NSImage imageWithSize:glyph.size
+                                          flipped:NO
+                                   drawingHandler:^BOOL(NSRect rect) {
+                                     [glyph drawInRect:rect];
+                                     return YES;
+                                   }];
   } else {
     image = [IconChoice bundled:[NSString stringWithFormat:@"icon-%@-glyph", self.ident]];
-    image.accessibilityDescription = @"Nightshift";
   }
+  image.accessibilityDescription = @"Nightshift";
   image.template = YES;
   return image;
 }
