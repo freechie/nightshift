@@ -28,6 +28,8 @@ static NSShortcutState warmthKeyState(unsigned hotKeyID);
 static void retryWarmthKeys(void);
 static void pauseWarmthKeys(void);
 static void resumeWarmthKeys(void);
+static void startMenuWarmthKeys(void);
+static void stopMenuWarmthKeys(void);
 // How setWarmthShortcut went. Anything but saved leaves the old shortcut
 // saved and in use.
 typedef enum {
@@ -4655,6 +4657,7 @@ static NSImage *sidebarTile(NSInteger pane, CGFloat size) {
   retryWarmthKeys();
   [self refresh];
   [self armClockKeys];
+  startMenuWarmthKeys();
   __weak MenuBar *menuBar = self;
   dispatch_async(dispatch_get_main_queue(), ^{
     MenuBar *ready = menuBar;
@@ -4774,6 +4777,7 @@ static NSImage *sidebarTile(NSInteger pane, CGFloat size) {
 
 - (void)menuDidClose:(NSMenu *)menu {
   (void)menu;
+  stopMenuWarmthKeys();
   self.menuOpen = NO;
   [self disarmClockKeys];
   [self commitPendingMax];
@@ -5297,6 +5301,14 @@ static NSShortcutState gWarmthKeyStates[2];
 static BOOL gWarmthShortcutsLoaded = NO;
 static BOOL gWarmthKeysPaused = NO;
 static EventHandlerRef gCommandHotKeyHandler = NULL;
+// While the menu is open its tracking holds the Carbon hotkey events until
+// it closes, so the menu reads the keys on a timer and feeds the same
+// press and release path. Times are GetCurrentEventTime's, so they compare
+// with GetEventTime of the held events, which are then dropped.
+static NSTimer *gMenuKeyTimer = nil;
+static BOOL gMenuKeyHeld[2];
+static EventTime gMenuKeysOpenedAt = -1;
+static EventTime gMenuKeysClosedAt = -1;
 static int gCommandHoldGeneration = 0;
 static int gCommandHoldDirection = 0;
 static long gCommandHoldPercent = -1;
@@ -5465,6 +5477,9 @@ static OSStatus commandWarmthHotKey(EventHandlerCallRef next, EventRef event, vo
   if (hotKey.signature != 'NScm') {
     return eventNotHandledErr;
   }
+  if (nsHotKeyDuringMenu(GetEventTime(event), gMenuKeysOpenedAt, gMenuKeysClosedAt)) {
+    return noErr;
+  }
   UInt32 kind = GetEventKind(event);
   if (![NSThread isMainThread]) {
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -5552,6 +5567,67 @@ static NSShortcut warmthShortcut(unsigned hotKeyID) {
   ensureWarmthShortcuts();
   NSShortcut none = {0, 0, "", ""};
   return hotKeyID >= 1 && hotKeyID <= 2 ? gWarmthShortcuts[hotKeyID - 1] : none;
+}
+
+static unsigned heldWarmthModifiers(void) {
+  CGEventFlags flags = CGEventSourceFlagsState(kCGEventSourceStateHIDSystemState);
+  unsigned held = 0;
+  if (flags & kCGEventFlagMaskCommand) {
+    held |= kNSHotKeyCommand;
+  }
+  if (flags & kCGEventFlagMaskShift) {
+    held |= kNSHotKeyShift;
+  }
+  if (flags & kCGEventFlagMaskAlternate) {
+    held |= kNSHotKeyOption;
+  }
+  if (flags & kCGEventFlagMaskControl) {
+    held |= kNSHotKeyControl;
+  }
+  return held;
+}
+
+static BOOL menuWarmthKeyHeld(unsigned i, unsigned heldModifiers) {
+  NSShortcut shortcut = warmthShortcut(i + 1);
+  return nsShortcutHeld(shortcut.modifiers, commandWarmthKeyDown(shortcut.keyCode), heldModifiers);
+}
+
+static void pollMenuWarmthKeys(void) {
+  unsigned held = heldWarmthModifiers();
+  for (unsigned i = 0; i < 2; i++) {
+    BOOL down = menuWarmthKeyHeld(i, held);
+    if (down == gMenuKeyHeld[i]) {
+      continue;
+    }
+    gMenuKeyHeld[i] = down;
+    if (gCommandHotKeys[i] == NULL) {
+      continue;
+    }
+    EventHotKeyID hotKey = {'NScm', i + 1};
+    commandWarmthHotKeyOnMain(down ? kEventHotKeyPressed : kEventHotKeyReleased, hotKey);
+  }
+}
+
+static void startMenuWarmthKeys(void) {
+  [gMenuKeyTimer invalidate];
+  gMenuKeysOpenedAt = GetCurrentEventTime();
+  unsigned held = heldWarmthModifiers();
+  for (unsigned i = 0; i < 2; i++) {
+    gMenuKeyHeld[i] = menuWarmthKeyHeld(i, held);
+  }
+  gMenuKeyTimer = [NSTimer timerWithTimeInterval:0.008
+                                         repeats:YES
+                                           block:^(NSTimer *timer) {
+                                             (void)timer;
+                                             pollMenuWarmthKeys();
+                                           }];
+  [NSRunLoop.mainRunLoop addTimer:gMenuKeyTimer forMode:NSRunLoopCommonModes];
+}
+
+static void stopMenuWarmthKeys(void) {
+  [gMenuKeyTimer invalidate];
+  gMenuKeyTimer = nil;
+  gMenuKeysClosedAt = GetCurrentEventTime();
 }
 
 static NSShortcutState warmthKeyState(unsigned hotKeyID) {
