@@ -21,6 +21,8 @@
 #endif
 
 #include "NightshiftLogic.h"
+#include <limits.h>
+#include <errno.h>
 
 #include <stdio.h>
 #include <string.h>
@@ -131,11 +133,30 @@ double nsCommandWarmthRepeatGap(double seconds) {
 static const unsigned kShortcutModifiers =
     kNSHotKeyCommand | kNSHotKeyShift | kNSHotKeyOption | kNSHotKeyControl;
 
+static bool isFunctionKey(unsigned keyCode) {
+  switch (keyCode) {
+    case 0x7A: case 0x78: case 0x63: case 0x76: case 0x60: case 0x61:
+    case 0x62: case 0x64: case 0x65: case 0x6D: case 0x67: case 0x6F:
+      return true;
+    default:
+      return false;
+  }
+}
+
 bool nsShortcutAllowed(unsigned keyCode, unsigned modifiers) {
   if (keyCode >= 128 || (modifiers & ~kShortcutModifiers) != 0) {
     return false;
   }
-  return (modifiers & (kNSHotKeyCommand | kNSHotKeyOption | kNSHotKeyControl)) != 0;
+  if ((modifiers & (kNSHotKeyCommand | kNSHotKeyOption | kNSHotKeyControl)) == 0) {
+    return false;
+  }
+  if ((modifiers & kNSHotKeyControl) != 0) {
+    return true;
+  }
+  // These hotkeys are global, so a lone ⌘ or ⌥ with a letter, digit or arrow
+  // would take ⌘Q, ⌘W, ⌥E and the like from every app. F-keys stay allowed.
+  bool oneModifier = (modifiers & (modifiers - 1)) == 0;
+  return !oneModifier || isFunctionKey(keyCode);
 }
 
 const char *nsShortcutKeyLabel(unsigned keyCode) {
@@ -227,6 +248,21 @@ bool nsShortcutSame(const NSShortcut *a, const NSShortcut *b) {
 
 static const char *const kShortcutWords[2] = {"lower", "raise"};
 
+// Decimal digits only; false on anything else or a value past UINT_MAX.
+static bool parseUnsigned(const char *text, unsigned *out) {
+  if (text[0] < '0' || text[0] > '9') {
+    return false;
+  }
+  errno = 0;
+  char *end = NULL;
+  unsigned long value = strtoul(text, &end, 10);
+  if (errno != 0 || *end != '\0' || value > UINT_MAX) {
+    return false;
+  }
+  *out = (unsigned)value;
+  return true;
+}
+
 unsigned nsShortcutsParse(const char *text, NSShortcut out[2]) {
   nsShortcutDefault(1, &out[0]);
   nsShortcutDefault(2, &out[1]);
@@ -238,14 +274,20 @@ unsigned nsShortcutsParse(const char *text, NSShortcut out[2]) {
     char buf[96];
     if (len < sizeof buf) {
       memcpy(buf, line, len);
+      while (len > 0 && (buf[len - 1] == '\r' || buf[len - 1] == ' ' || buf[len - 1] == '\t')) {
+        len--;
+      }
       buf[len] = '\0';
       char word[8];
+      char codeText[16];
+      char modText[16];
       unsigned keyCode = 0;
       unsigned modifiers = 0;
       char key[16];
       int used = 0;
-      if (sscanf(buf, "%7s %u %u %15s%n", word, &keyCode, &modifiers, key, &used) == 4 &&
-          buf[used] == '\0') {
+      if (sscanf(buf, "%7s %15s %15s %15s%n", word, codeText, modText, key, &used) == 4 &&
+          buf[used] == '\0' && parseUnsigned(codeText, &keyCode) &&
+          parseUnsigned(modText, &modifiers)) {
         for (unsigned i = 0; i < 2; i++) {
           NSShortcut made;
           if (strcmp(word, kShortcutWords[i]) == 0 && !(found & (1u << i)) &&

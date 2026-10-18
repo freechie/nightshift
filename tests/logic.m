@@ -405,6 +405,18 @@ static void checkWarmthShortcuts(void) {
   CHECK(nsShortcutAllowed(0x00, kNSHotKeyShift | kNSHotKeyCommand));
   CHECK(!nsShortcutAllowed(0x00, kNSHotKeyCommand | (1 << 7)));
   CHECK(!nsShortcutAllowed(128, kNSHotKeyCommand));
+  // Global hotkeys: a lone ⌘ or ⌥ with a letter, digit or arrow is refused so
+  // ⌘Q, ⌘W, ⌘C and ⌥E keep working in every app. F-keys and ⌃ are fine.
+  CHECK(!nsShortcutAllowed(0x0C, kNSHotKeyCommand));  // ⌘Q
+  CHECK(!nsShortcutAllowed(0x0D, kNSHotKeyCommand));  // ⌘W
+  CHECK(!nsShortcutAllowed(0x08, kNSHotKeyCommand));  // ⌘C
+  CHECK(!nsShortcutAllowed(0x12, kNSHotKeyCommand));  // ⌘1
+  CHECK(!nsShortcutAllowed(0x7B, kNSHotKeyCommand));  // ⌘←
+  CHECK(!nsShortcutAllowed(0x0E, kNSHotKeyOption));   // ⌥E
+  CHECK(nsShortcutAllowed(0x7A, kNSHotKeyCommand));   // ⌘F1
+  CHECK(nsShortcutAllowed(0x78, kNSHotKeyOption));    // ⌥F2
+  CHECK(nsShortcutAllowed(0x0C, kNSHotKeyControl));   // ⌃Q
+  CHECK(nsShortcutAllowed(0x0C, kNSHotKeyOption | kNSHotKeyCommand));  // ⌥⌘Q
 
   NSShortcut made;
   CHECK(nsShortcutMake(0x0B, kNSHotKeyShift | kNSHotKeyCommand | kNSHotKeyOption |
@@ -414,11 +426,11 @@ static void checkWarmthShortcuts(void) {
   CHECK(nsShortcutMake(0x7A, kNSHotKeyOption, "\xef\x9c\x84", &made));  // F1's private glyph
   CHECK(strcmp(made.name, "\u2325F1") == 0);
   NSShortcut kept = made;
-  CHECK(!nsShortcutMake(0x0B, kNSHotKeyCommand, "", &made));
-  CHECK(!nsShortcutMake(0x0B, kNSHotKeyCommand, "a b", &made));
-  CHECK(!nsShortcutMake(0x0B, kNSHotKeyCommand, "\t", &made));
-  CHECK(!nsShortcutMake(0x0B, kNSHotKeyCommand, "TOOLONGKEY", &made));
-  CHECK(!nsShortcutMake(0x0B, kNSHotKeyCommand, NULL, &made));
+  CHECK(!nsShortcutMake(0x0B, kNSHotKeyControl, "", &made));
+  CHECK(!nsShortcutMake(0x0B, kNSHotKeyControl, "a b", &made));
+  CHECK(!nsShortcutMake(0x0B, kNSHotKeyControl, "\t", &made));
+  CHECK(!nsShortcutMake(0x0B, kNSHotKeyControl, "TOOLONGKEY", &made));
+  CHECK(!nsShortcutMake(0x0B, kNSHotKeyControl, NULL, &made));
   CHECK(!nsShortcutMake(0x0B, 0, "B", &made));
   CHECK(nsShortcutSame(&made, &kept));
 
@@ -427,25 +439,35 @@ static void checkWarmthShortcuts(void) {
   CHECK_EQ(nsShortcutsParse(NULL, pair), 0);
   CHECK(nsShortcutSame(&pair[0], &lower) && nsShortcutSame(&pair[1], &raise));
   CHECK(nsShortcutMake(0x7B, kNSHotKeyControl | kNSHotKeyCommand, NULL, &pair[0]));
-  CHECK(nsShortcutMake(0x0B, kNSHotKeyOption, "B", &pair[1]));
+  CHECK(!nsShortcutMake(0x0B, kNSHotKeyOption, "B", &pair[1]));
+  CHECK(nsShortcutMake(0x0B, kNSHotKeyOption | kNSHotKeyShift, "B", &pair[1]));
   char text[128];
   int n = nsShortcutsFormat(pair, text, sizeof text);
   CHECK_EQ(n, (long)strlen(text));
-  CHECK(strcmp(text, "lower 123 4352 \u2190\nraise 11 2048 B\n") == 0);
+  CHECK(strcmp(text, "lower 123 4352 \u2190\nraise 11 2560 B\n") == 0);
   NSShortcut back[2];
   CHECK_EQ(nsShortcutsParse(text, back), 3);
   CHECK(nsShortcutSame(&back[0], &pair[0]) && nsShortcutSame(&back[1], &pair[1]));
   CHECK(strcmp(back[0].name, pair[0].name) == 0);
-  CHECK(strcmp(back[1].name, "\u2325B") == 0);
-  CHECK_EQ(nsShortcutsParse("raise 11 2048 B\n", back), 2);
+  CHECK(strcmp(back[1].name, "\u2325\u21E7B") == 0);
+  CHECK_EQ(nsShortcutsParse("raise 11 2560 B\n", back), 2);
   CHECK(nsShortcutSame(&back[0], &lower));
-  CHECK_EQ(nsShortcutsParse("lower 11 0 B\nraise 11 2048 B extra\n", back), 0);
+  CHECK_EQ(nsShortcutsParse("lower 11 0 B\nraise 11 2560 B extra\n", back), 0);
   CHECK(nsShortcutSame(&back[0], &lower) && nsShortcutSame(&back[1], &raise));
   CHECK_EQ(nsShortcutsParse("lower 999 256 B\nbogus\n\n", back), 0);
-  CHECK_EQ(nsShortcutsParse("lower 11 2048 B\nraise 11 2048 B\n", back), 0);
+  CHECK_EQ(nsShortcutsParse("lower 11 2560 B\nraise 11 2560 B\n", back), 0);
   CHECK(nsShortcutSame(&back[0], &lower) && nsShortcutSame(&back[1], &raise));
-  CHECK_EQ(nsShortcutsParse("lower 11 2048 B\nlower 12 2048 Q\n", back), 1);
+  CHECK_EQ(nsShortcutsParse("lower 11 2560 B\nlower 12 2560 Q\n", back), 1);
   CHECK(strcmp(back[0].key, "B") == 0);
+  // A saved file from an editor (CRLF, trailing blanks) still loads.
+  CHECK_EQ(nsShortcutsParse("lower 11 2560 B\r\nraise 12 2560 Q \t\r\n", back), 3);
+  CHECK(strcmp(back[1].key, "Q") == 0);
+  // Numbers are plain decimal and in range; %u would have wrapped these.
+  CHECK_EQ(nsShortcutsParse("lower 4294967307 2560 B\n", back), 0);
+  CHECK_EQ(nsShortcutsParse("lower 11 18446744073709551616 B\n", back), 0);
+  CHECK_EQ(nsShortcutsParse("lower -1 2560 B\nraise +11 2560 B\n", back), 0);
+  CHECK_EQ(nsShortcutsParse("lower 11 256 B\n", back), 0);  // lone ⌘ from an old file
+  CHECK(nsShortcutSame(&back[0], &lower));
   char tiny[4];
   n = nsShortcutsFormat(pair, tiny, sizeof tiny);
   CHECK(n > 3 && tiny[3] == '\0');
