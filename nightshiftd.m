@@ -3724,15 +3724,16 @@ static void hugControls(NSView *view) {
                                      if (panel == nil || panel.recordingID == 0) {
                                        return event;
                                      }
-                                     [panel recordKey:event];
-                                     return nil;
+                                     return [panel recordKey:event] ? nil : event;
                                    }];
   [self syncDisplays];
 }
 
-- (void)recordKey:(NSEvent *)event {
+// YES when the key press was used for recording. A refused lone-⌘ chord
+// (⌘W, ⌘Q...) stops recording and goes on to the app as usual.
+- (BOOL)recordKey:(NSEvent *)event {
   if (event.isARepeat) {
-    return;
+    return YES;
   }
   NSEventModifierFlags flags = event.modifierFlags & NSEventModifierFlagDeviceIndependentFlagsMask;
   unsigned modifiers = 0;
@@ -3750,28 +3751,38 @@ static void hugControls(NSView *view) {
   }
   if (event.keyCode == kVK_Escape && modifiers == 0) {
     [self stopRecording];
-    return;
+    return YES;
+  }
+  if (modifiers == cmdKey && !nsShortcutAllowed(event.keyCode, modifiers)) {
+    [self stopRecording];
+    return NO;
   }
   NSShortcut shortcut;
   NSString *key = event.charactersIgnoringModifiers.uppercaseString;
   if (!nsShortcutMake(event.keyCode, modifiers, key.UTF8String, &shortcut)) {
-    self.recordNote =
-        nsShortcutAllowed(event.keyCode, modifiers) ? @"Pick another key" : @"Add ⌃, ⌥ or ⌘";
+    if (nsShortcutAllowed(event.keyCode, modifiers)) {
+      self.recordNote = @"Pick another key";
+    } else if (modifiers & (cmdKey | optionKey | controlKey)) {
+      self.recordNote = @"Add ⌃ or a second modifier";
+    } else {
+      self.recordNote = @"Add ⌃, ⌥ or ⌘";
+    }
     [self syncDisplays];
-    return;
+    return YES;
   }
   NSShortcut other = warmthShortcut(self.recordingID == 1 ? 2 : 1);
   if (nsShortcutSame(&shortcut, &other)) {
     self.recordNote = @"Used by the other key";
     [self syncDisplays];
-    return;
+    return YES;
   }
   if (!setWarmthShortcut(self.recordingID, shortcut)) {
     self.recordNote = @"Couldn't save";
     [self syncDisplays];
-    return;
+    return YES;
   }
   [self stopRecording];
+  return YES;
 }
 
 - (void)stopRecording {
@@ -4409,6 +4420,7 @@ static NSImage *sidebarTile(NSInteger pane, CGFloat size) {
 
 - (void)appResigned:(NSNotification *)notification {
   (void)notification;
+  [self stopRecording];
 }
 
 - (void)windowWillClose:(NSNotification *)notification {
@@ -5389,11 +5401,17 @@ static BOOL saveWarmthShortcuts(void) {
                             withIntermediateDirectories:YES
                                              attributes:@{NSFilePosixPermissions : @0700}
                                                   error:NULL];
-  NSString *text = [NSString stringWithUTF8String:buf];
-  if (text == nil || ![text writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:NULL]) {
+  NSString *temp = [path stringByAppendingString:@".tmp"];
+  NSData *data = [NSData dataWithBytes:buf length:(NSUInteger)n];
+  if (![[NSFileManager defaultManager] createFileAtPath:temp
+                                               contents:data
+                                             attributes:@{NSFilePosixPermissions : @0600}]) {
     return NO;
   }
-  chmod(path.fileSystemRepresentation, 0600);
+  if (rename(temp.fileSystemRepresentation, path.fileSystemRepresentation) != 0) {
+    unlink(temp.fileSystemRepresentation);
+    return NO;
+  }
   return YES;
 }
 

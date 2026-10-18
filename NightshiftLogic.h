@@ -76,6 +76,8 @@ typedef struct {
 bool nsShortcutDefault(unsigned hotKeyID, NSShortcut *out);
 // A shortcut Nightshift will register: a key code below 128, only the four
 // modifiers above, and at least one of ⌃, ⌥ or ⌘ (⇧ alone would eat typing).
+// Without ⌃ it needs two modifiers, unless the key is F1...F12: a lone ⌘ or ⌥
+// with a letter would take ⌘Q, ⌘W and the like from every app.
 bool nsShortcutAllowed(unsigned keyCode, unsigned modifiers);
 // The label for keys whose typed character is not one (F1...F12, arrows,
 // Space, Return, Tab, Delete, Escape, and − for kNSKeyCodeMinus), else NULL.
