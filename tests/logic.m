@@ -103,14 +103,18 @@ static void checkCommandWarmth(void) {
 
   // Measured on John's Mac: menu open 100.0 to 108.5, presses held by macOS
   // until close are dropped, and a release after close still counts.
-  CHECK(!nsHotKeyDuringMenu(101.7, -1, -1));
-  CHECK(nsHotKeyDuringMenu(101.7, 100.0, 108.5));
-  CHECK(nsHotKeyDuringMenu(108.5, 100.0, 108.5));
-  CHECK(nsHotKeyDuringMenu(100.0, 100.0, 108.5));
-  CHECK(!nsHotKeyDuringMenu(99.9, 100.0, 108.5));
-  CHECK(!nsHotKeyDuringMenu(108.6, 100.0, 108.5));
-  CHECK(nsHotKeyDuringMenu(101.7, 100.0, 50.0));
-  CHECK(!nsHotKeyDuringMenu(51.0, 100.0, 50.0));
+  CHECK(!nsHotKeyDuringMenu(101.7, -1, -1, true));
+  CHECK(nsHotKeyDuringMenu(101.7, 100.0, 108.5, true));
+  CHECK(nsHotKeyDuringMenu(108.5, 100.0, 108.5, true));
+  CHECK(nsHotKeyDuringMenu(100.0, 100.0, 108.5, true));
+  CHECK(!nsHotKeyDuringMenu(99.9, 100.0, 108.5, true));
+  CHECK(!nsHotKeyDuringMenu(108.6, 100.0, 108.5, true));
+  CHECK(nsHotKeyDuringMenu(101.7, 100.0, 50.0, true));
+  CHECK(!nsHotKeyDuringMenu(51.0, 100.0, 50.0, true));
+  // Keys the menu never read, say without Input Monitoring, still count
+  // once the menu closes instead of being lost.
+  CHECK(!nsHotKeyDuringMenu(101.7, 100.0, 108.5, false));
+  CHECK(!nsHotKeyDuringMenu(101.7, 100.0, 50.0, false));
 
   CHECK_EQ(nsCommandWarmthNext(50, 1), 55);
   CHECK_EQ(nsCommandWarmthNext(50, -1), 45);

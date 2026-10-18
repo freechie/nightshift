@@ -134,8 +134,8 @@ bool nsShortcutHeld(unsigned modifiers, bool keyDown, unsigned heldModifiers) {
   return keyDown && heldModifiers == modifiers;
 }
 
-bool nsHotKeyDuringMenu(double eventTime, double openedAt, double closedAt) {
-  if (openedAt < 0 || eventTime < openedAt) {
+bool nsHotKeyDuringMenu(double eventTime, double openedAt, double closedAt, bool polled) {
+  if (!polled || openedAt < 0 || eventTime < openedAt) {
     return false;
   }
   return closedAt < openedAt || eventTime <= closedAt;

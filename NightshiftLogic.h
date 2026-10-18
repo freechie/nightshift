@@ -55,10 +55,12 @@ double nsCommandWarmthRepeatGap(double seconds);
 // true when keyDown and the held modifiers (the kNSHotKey bits below) are
 // exactly the shortcut's.
 bool nsShortcutHeld(unsigned modifiers, bool keyDown, unsigned heldModifiers);
-// true for a hotkey event pressed while the menu was open, which the menu's
-// own key reading already handled. Times share one clock; openedAt < 0 is
-// never opened, and closedAt < openedAt is still open.
-bool nsHotKeyDuringMenu(double eventTime, double openedAt, double closedAt);
+// true for a hotkey event pressed while the menu was open, when the menu's
+// own key reading handled that key (polled), so the held event is a double.
+// Unpolled keys (say, no Input Monitoring) keep their held events. Times
+// share one clock; openedAt < 0 is never opened, closedAt < openedAt is
+// still open.
+bool nsHotKeyDuringMenu(double eventTime, double openedAt, double closedAt, bool polled);
 
 // The warmth hotkeys, as RegisterEventHotKey takes them. The values are
 // Carbon's (kVK_ANSI_Minus / kVK_ANSI_Equal, cmdKey, shiftKey, optionKey,
