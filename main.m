@@ -313,8 +313,9 @@ static void help(void) {
       "\n"
       "Notifications:\n"
       "  Every command goes through Nightshift.app, which starts on its own\n"
-      "  if it is not running. It posts a banner when it starts and whenever\n"
-      "  warmth or the max changes.\n"
+      "  if it is not running. Plain nightshift only reports, so it says\n"
+      "  Nightshift isn't running instead. The app posts a banner when it\n"
+      "  starts and whenever warmth or the max changes.\n"
       "\n"
       "  A banner's Options menu, or its arrow, has Set Max and Set Time.\n"
       "  They do the same as nightshift max and nightshift ramp. For banners\n"
@@ -402,12 +403,14 @@ int main(int argc, const char *argv[]) {
     readHourCycle();
     if (argc == 1) {
       char reply[64];
-      int sent = ask("status\n", reply, sizeof(reply));
+      int sent = talk("status\n", reply, sizeof(reply), NO);
       if (sent == 0) {
         printStatus(reply);
         return 0;
       }
-      fprintf(stderr, "failed to reach nightshiftd\n");
+      fprintf(stderr, sent < 0 ? "Nightshift isn't running\n"
+                                 "Open Nightshift.app, or set a warmth with nightshift <0-100>\n"
+                               : "failed to reach nightshiftd\n");
       return 1;
     }
 
