@@ -143,22 +143,29 @@ static bool isFunctionKey(unsigned keyCode) {
   }
 }
 
+static const unsigned kShortcutStrong = kNSHotKeyCommand | kNSHotKeyOption | kNSHotKeyControl;
+
+static unsigned bitCount(unsigned value) {
+  unsigned n = 0;
+  for (; value != 0; value &= value - 1) {
+    n++;
+  }
+  return n;
+}
+
 bool nsShortcutAllowed(unsigned keyCode, unsigned modifiers) {
   if (keyCode >= 128 || (modifiers & ~kShortcutModifiers) != 0) {
     return false;
   }
-  if ((modifiers & (kNSHotKeyCommand | kNSHotKeyOption | kNSHotKeyControl)) == 0) {
+  unsigned strong = modifiers & kShortcutStrong;
+  if (strong == 0) {
     return false;
   }
-  if ((modifiers & kNSHotKeyControl) != 0) {
-    return true;
-  }
-  // These hotkeys are global, so a lone ⌘ or ⌥ with a letter, digit or arrow
-  // would take ⌘Q, ⌘W, ⌥E and the like from every app. ⇧ doesn't help, since
-  // ⌘⇧Z and ⌘⇧T are app shortcuts too. F-keys stay allowed.
-  unsigned strong = modifiers & (kNSHotKeyCommand | kNSHotKeyOption);
-  bool oneModifier = (strong & (strong - 1)) == 0;
-  return !oneModifier || isFunctionKey(keyCode);
+  // These hotkeys are global, so one of ⌘, ⌥ or ⌃ with any other key would
+  // take ⌘Q, ⌘W, ⌥E, ⌃C, ⌃D, ⌃A and the like from every app and Terminal.
+  // ⇧ doesn't help, since ⌘⇧Z and ⌃⇧A are app shortcuts too. Only F-keys
+  // get by with one; every other key, arrows and Space included, needs two.
+  return isFunctionKey(keyCode) || bitCount(strong) >= 2;
 }
 
 const char *nsShortcutKeyLabel(unsigned keyCode) {
@@ -206,24 +213,33 @@ static bool labelAllowed(const char *key) {
   return true;
 }
 
+static const char *shortcutLabel(unsigned keyCode, const char *key) {
+  const char *label = nsShortcutKeyLabel(keyCode);
+  return label != NULL ? label : key;
+}
+
+bool nsShortcutName(unsigned keyCode, unsigned modifiers, const char *key, char *buf,
+                    size_t size) {
+  const char *label = shortcutLabel(keyCode, key);
+  if (buf == NULL || size == 0 || !labelAllowed(label)) {
+    return false;
+  }
+  int n = snprintf(buf, size, "%s%s%s%s%s", (modifiers & kNSHotKeyControl) ? "\u2303" : "",
+                   (modifiers & kNSHotKeyOption) ? "\u2325" : "",
+                   (modifiers & kNSHotKeyShift) ? "\u21E7" : "",
+                   (modifiers & kNSHotKeyCommand) ? "\u2318" : "", label);
+  return n >= 0 && (size_t)n < size;
+}
+
 bool nsShortcutMake(unsigned keyCode, unsigned modifiers, const char *key, NSShortcut *out) {
   if (out == NULL || !nsShortcutAllowed(keyCode, modifiers)) {
     return false;
   }
-  const char *label = nsShortcutKeyLabel(keyCode);
-  if (label == NULL) {
-    label = key;
-  }
-  if (!labelAllowed(label)) {
+  NSShortcut made = {keyCode, modifiers, "", ""};
+  if (!nsShortcutName(keyCode, modifiers, key, made.name, sizeof made.name)) {
     return false;
   }
-  NSShortcut made = {keyCode, modifiers, "", ""};
-  snprintf(made.key, sizeof made.key, "%s", label);
-  snprintf(made.name, sizeof made.name, "%s%s%s%s%s",
-           (modifiers & kNSHotKeyControl) ? "\u2303" : "",
-           (modifiers & kNSHotKeyOption) ? "\u2325" : "",
-           (modifiers & kNSHotKeyShift) ? "\u21E7" : "",
-           (modifiers & kNSHotKeyCommand) ? "\u2318" : "", label);
+  snprintf(made.key, sizeof made.key, "%s", shortcutLabel(keyCode, key));
   *out = made;
   return true;
 }
@@ -266,6 +282,14 @@ static bool parseUnsigned(const char *text, unsigned *out) {
 }
 
 unsigned nsShortcutsParse(const char *text, NSShortcut out[2]) {
+  return nsShortcutsParseRefused(text, out, NULL);
+}
+
+unsigned nsShortcutsParseRefused(const char *text, NSShortcut out[2], char refused[][40]) {
+  if (refused != NULL) {
+    refused[0][0] = '\0';
+    refused[1][0] = '\0';
+  }
   nsShortcutDefault(1, &out[0]);
   nsShortcutDefault(2, &out[1]);
   unsigned found = 0;
@@ -292,15 +316,29 @@ unsigned nsShortcutsParse(const char *text, NSShortcut out[2]) {
           parseUnsigned(modText, &modifiers)) {
         for (unsigned i = 0; i < 2; i++) {
           NSShortcut made;
-          if (strcmp(word, kShortcutWords[i]) == 0 && !(found & (1u << i)) &&
-              nsShortcutMake(keyCode, modifiers, key, &made)) {
+          if (strcmp(word, kShortcutWords[i]) != 0 || (found & (1u << i))) {
+            continue;
+          }
+          if (nsShortcutMake(keyCode, modifiers, key, &made)) {
             out[i] = made;
             found |= 1u << i;
+          } else if (refused != NULL && refused[i][0] == '\0' && keyCode < 128 &&
+                     (modifiers & ~kShortcutModifiers) == 0 &&
+                     !nsShortcutAllowed(keyCode, modifiers) &&
+                     !nsShortcutName(keyCode, modifiers, key, refused[i], 40)) {
+            refused[i][0] = '\0';
           }
         }
       }
     }
     line = nl != NULL ? nl + 1 : NULL;
+  }
+  if (refused != NULL) {
+    for (unsigned i = 0; i < 2; i++) {
+      if (found & (1u << i)) {
+        refused[i][0] = '\0';
+      }
+    }
   }
   if (nsShortcutSame(&out[0], &out[1])) {
     nsShortcutDefault(1, &out[0]);
@@ -308,6 +346,103 @@ unsigned nsShortcutsParse(const char *text, NSShortcut out[2]) {
     return 0;
   }
   return found;
+}
+
+static bool named(const char *name) {
+  return name != NULL && name[0] != '\0';
+}
+
+int nsShortcutDroppedNotice(const char *oldLower, const char *nowLower, const char *oldRaise,
+                            const char *nowRaise, char *buf, size_t size) {
+  bool lower = named(oldLower);
+  bool raise = named(oldRaise);
+  if (lower && raise) {
+    return snprintf(buf, size,
+                    "Your shortcuts %s and %s no longer work. Now using %s and %s.", oldLower,
+                    oldRaise, nowLower != NULL ? nowLower : "", nowRaise != NULL ? nowRaise : "");
+  }
+  if (lower || raise) {
+    const char *now = lower ? nowLower : nowRaise;
+    return snprintf(buf, size, "Your shortcut %s no longer works. Now using %s.",
+                    lower ? oldLower : oldRaise, now != NULL ? now : "");
+  }
+  if (size > 0) {
+    buf[0] = '\0';
+  }
+  return 0;
+}
+
+bool nsShortcutSuggest(unsigned keyCode, unsigned modifiers, const char *key,
+                       const NSShortcut *other, NSShortcutUsable usable, void *context,
+                       NSShortcut *out) {
+  static const unsigned candidates[4] = {
+      kNSHotKeyControl | kNSHotKeyOption,
+      kNSHotKeyOption | kNSHotKeyCommand,
+      kNSHotKeyControl | kNSHotKeyCommand,
+      kNSHotKeyControl | kNSHotKeyOption | kNSHotKeyCommand,
+  };
+  if (out == NULL) {
+    return false;
+  }
+  unsigned pressed = modifiers & kShortcutStrong;
+  unsigned shift = modifiers & kNSHotKeyShift;
+  // First the candidates that keep every pressed modifier (⌘K suggests
+  // ⌥⌘K), then the rest; the list is already fewest modifiers first.
+  for (int pass = 0; pass < 2; pass++) {
+    for (int i = 0; i < 4; i++) {
+      bool keeps = (candidates[i] & pressed) == pressed;
+      if (keeps != (pass == 0)) {
+        continue;
+      }
+      unsigned mods = candidates[i] | shift;
+      NSShortcut made;
+      if (mods == modifiers || !nsShortcutMake(keyCode, mods, key, &made) ||
+          (other != NULL && nsShortcutSame(&made, other)) ||
+          (usable != NULL && !usable(&made, context))) {
+        continue;
+      }
+      *out = made;
+      return true;
+    }
+  }
+  return false;
+}
+
+int nsShortcutRefusal(NSShortcutRefusal why, const char *pressed, const char *suggestion,
+                      char *buf, size_t size) {
+  const char *pick = "That key won't work. Pick a new one.";
+  char first[96];
+  switch (why) {
+    case kNSRefusalModifiers:
+      snprintf(first, sizeof first, "Add two of \u2303 \u2325 \u2318.");
+      break;
+    case kNSRefusalOtherApps:
+    case kNSRefusalSystem:
+    case kNSRefusalApp:
+      if (!named(pressed)) {
+        return snprintf(buf, size, "%s", pick);
+      }
+      snprintf(first, sizeof first, "%s %s.",
+               why == kNSRefusalOtherApps ? "Other apps use"
+               : why == kNSRefusalSystem  ? "Your Mac uses"
+                                          : "Another app has",
+               pressed);
+      break;
+    case kNSRefusalOtherKey:
+      if (!named(pressed)) {
+        return snprintf(buf, size, "%s", pick);
+      }
+      return snprintf(buf, size, "The other key has %s. Pick a new one.", pressed);
+    case kNSRefusalSave:
+      return snprintf(buf, size, "That didn't save. Try again.");
+    case kNSRefusalKey:
+    default:
+      return snprintf(buf, size, "%s", pick);
+  }
+  if (named(suggestion)) {
+    return snprintf(buf, size, "%s Try %s.", first, suggestion);
+  }
+  return snprintf(buf, size, "%s Pick a new one.", first);
 }
 
 int nsShortcutsFormat(const NSShortcut shortcuts[2], char *buf, size_t size) {
