@@ -378,38 +378,96 @@ static void checkWorkspaceOpens(void) {
   CHECK(!nsWorkspaceOpenAllowed(embedded, sizeof embedded - 1, false));
 }
 
-// ⌃⌥⌘− / ⌃⌥⌘=: Carbon key codes and modifiers, and the notice when one
-// cannot be registered.
+// Warmth shortcuts: defaults, what may be recorded, the saved file, and the
+// notice and Settings label for each way registering can fail.
 static void checkWarmthShortcuts(void) {
-  NSWarmthShortcut lower = nsWarmthShortcut(1);
-  NSWarmthShortcut raise = nsWarmthShortcut(2);
+  NSShortcut lower;
+  NSShortcut raise;
+  CHECK(nsShortcutDefault(1, &lower));
+  CHECK(nsShortcutDefault(2, &raise));
   CHECK_EQ(lower.keyCode, 27);   // kVK_ANSI_Minus
   CHECK_EQ(raise.keyCode, 24);   // kVK_ANSI_Equal
   CHECK_EQ(lower.modifiers, 0x1900);  // cmdKey | optionKey | controlKey
   CHECK_EQ(raise.modifiers, 0x1900);
   CHECK(strcmp(lower.name, "\u2303\u2325\u2318\u2212") == 0);
   CHECK(strcmp(raise.name, "\u2303\u2325\u2318=") == 0);
-  // Directions match the ids the shortcuts register with.
   CHECK_EQ(nsCommandWarmthDirection(1), -1);
   CHECK_EQ(nsCommandWarmthDirection(2), 1);
-  NSWarmthShortcut none = nsWarmthShortcut(0);
+  NSShortcut none;
+  CHECK(!nsShortcutDefault(3, &none));
   CHECK_EQ(none.keyCode, 0);
-  CHECK_EQ(none.modifiers, 0);
   CHECK(strcmp(none.name, "") == 0);
-  CHECK_EQ(nsWarmthShortcut(3).modifiers, 0);
 
-  char buf[128];
-  int n = nsWarmthShortcutFailure(2, buf, sizeof buf);
-  CHECK(strcmp(buf, "\u2303\u2325\u2318= is already used by another app") == 0);
-  CHECK_EQ(n, (long)strlen(buf));
-  nsWarmthShortcutFailure(1, buf, sizeof buf);
-  CHECK(strcmp(buf, "\u2303\u2325\u2318\u2212 is already used by another app") == 0);
-  nsWarmthShortcutFailure(9, buf, sizeof buf);
-  CHECK(strcmp(buf, "A warmth shortcut is already used by another app") == 0);
+  // A modifier other than shift is required; only four modifiers count.
+  CHECK(!nsShortcutAllowed(0x00, 0));
+  CHECK(!nsShortcutAllowed(0x00, kNSHotKeyShift));
+  CHECK(nsShortcutAllowed(0x00, kNSHotKeyControl));
+  CHECK(nsShortcutAllowed(0x00, kNSHotKeyShift | kNSHotKeyCommand));
+  CHECK(!nsShortcutAllowed(0x00, kNSHotKeyCommand | (1 << 7)));
+  CHECK(!nsShortcutAllowed(128, kNSHotKeyCommand));
+
+  NSShortcut made;
+  CHECK(nsShortcutMake(0x0B, kNSHotKeyShift | kNSHotKeyCommand | kNSHotKeyOption |
+                                 kNSHotKeyControl, "B", &made));
+  CHECK(strcmp(made.name, "\u2303\u2325\u21E7\u2318B") == 0);
+  CHECK(strcmp(made.key, "B") == 0);
+  CHECK(nsShortcutMake(0x7A, kNSHotKeyOption, "\xef\x9c\x84", &made));  // F1's private glyph
+  CHECK(strcmp(made.name, "\u2325F1") == 0);
+  NSShortcut kept = made;
+  CHECK(!nsShortcutMake(0x0B, kNSHotKeyCommand, "", &made));
+  CHECK(!nsShortcutMake(0x0B, kNSHotKeyCommand, "a b", &made));
+  CHECK(!nsShortcutMake(0x0B, kNSHotKeyCommand, "\t", &made));
+  CHECK(!nsShortcutMake(0x0B, kNSHotKeyCommand, "TOOLONGKEY", &made));
+  CHECK(!nsShortcutMake(0x0B, kNSHotKeyCommand, NULL, &made));
+  CHECK(!nsShortcutMake(0x0B, 0, "B", &made));
+  CHECK(nsShortcutSame(&made, &kept));
+
+  // The saved file round-trips, and anything wrong keeps the default.
+  NSShortcut pair[2];
+  CHECK_EQ(nsShortcutsParse(NULL, pair), 0);
+  CHECK(nsShortcutSame(&pair[0], &lower) && nsShortcutSame(&pair[1], &raise));
+  CHECK(nsShortcutMake(0x7B, kNSHotKeyControl | kNSHotKeyCommand, NULL, &pair[0]));
+  CHECK(nsShortcutMake(0x0B, kNSHotKeyOption, "B", &pair[1]));
+  char text[128];
+  int n = nsShortcutsFormat(pair, text, sizeof text);
+  CHECK_EQ(n, (long)strlen(text));
+  CHECK(strcmp(text, "lower 123 4352 \u2190\nraise 11 2048 B\n") == 0);
+  NSShortcut back[2];
+  CHECK_EQ(nsShortcutsParse(text, back), 3);
+  CHECK(nsShortcutSame(&back[0], &pair[0]) && nsShortcutSame(&back[1], &pair[1]));
+  CHECK(strcmp(back[0].name, pair[0].name) == 0);
+  CHECK(strcmp(back[1].name, "\u2325B") == 0);
+  CHECK_EQ(nsShortcutsParse("raise 11 2048 B\n", back), 2);
+  CHECK(nsShortcutSame(&back[0], &lower));
+  CHECK_EQ(nsShortcutsParse("lower 11 0 B\nraise 11 2048 B extra\n", back), 0);
+  CHECK(nsShortcutSame(&back[0], &lower) && nsShortcutSame(&back[1], &raise));
+  CHECK_EQ(nsShortcutsParse("lower 999 256 B\nbogus\n\n", back), 0);
+  CHECK_EQ(nsShortcutsParse("lower 11 2048 B\nraise 11 2048 B\n", back), 0);
+  CHECK(nsShortcutSame(&back[0], &lower) && nsShortcutSame(&back[1], &raise));
+  CHECK_EQ(nsShortcutsParse("lower 11 2048 B\nlower 12 2048 Q\n", back), 1);
+  CHECK(strcmp(back[0].key, "B") == 0);
   char tiny[4];
-  n = nsWarmthShortcutFailure(2, tiny, sizeof tiny);
-  CHECK(n > 3);
-  CHECK(tiny[3] == '\0');
+  n = nsShortcutsFormat(pair, tiny, sizeof tiny);
+  CHECK(n > 3 && tiny[3] == '\0');
+
+  // Each failure says which key and why.
+  char buf[160];
+  CHECK_EQ(nsShortcutNotice(1, lower.name, kNSShortcutReady, buf, sizeof buf), 0);
+  CHECK(buf[0] == '\0');
+  nsShortcutNotice(1, lower.name, kNSShortcutTakenBySystem, buf, sizeof buf);
+  CHECK(strcmp(buf, "\u2303\u2325\u2318\u2212 (lower warmth) is a macOS shortcut. Pick "
+                    "another in Settings.") == 0);
+  nsShortcutNotice(2, raise.name, kNSShortcutTakenByApp, buf, sizeof buf);
+  CHECK(strcmp(buf, "\u2303\u2325\u2318= (raise warmth) is already used by another app.") == 0);
+  n = nsShortcutNotice(9, NULL, kNSShortcutFailed, buf, sizeof buf);
+  CHECK(strcmp(buf, "A warmth shortcut (warmth) couldn't be turned on.") == 0);
+  CHECK_EQ(n, (long)strlen(buf));
+  n = nsShortcutNotice(2, raise.name, kNSShortcutTakenByApp, tiny, sizeof tiny);
+  CHECK(n > 3 && tiny[3] == '\0');
+  CHECK(strcmp(nsShortcutStateLabel(kNSShortcutReady), "On") == 0);
+  CHECK(strcmp(nsShortcutStateLabel(kNSShortcutTakenBySystem), "Used by macOS") == 0);
+  CHECK(strcmp(nsShortcutStateLabel(kNSShortcutTakenByApp), "Used by another app") == 0);
+  CHECK(strcmp(nsShortcutStateLabel(kNSShortcutFailed), "Couldn't turn on") == 0);
 }
 
 // A pretend panel. sticky reads ignore writes (a cached brightness). echo
