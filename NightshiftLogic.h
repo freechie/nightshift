@@ -39,7 +39,7 @@ bool nsAheadOfTurnOn(int now, int start, int clock);
 // is shorter). -1 for an empty schedule.
 int nsDefaultFullAt(int start, int end, int rampClock, int rampMinutes);
 
-// ⌃⌥⌘− lowers Night Shift intensity (id 1), ⌃⌥⌘= raises it (id 2).
+// Hotkey id 1 lowers Night Shift intensity, id 2 raises it.
 // 0 is any other id. The chord is a Carbon hotkey, which does not repeat,
 // so a hold repeats on a timer. The value is the Current slider: whole
 // percents, clamped to 0...100, one step of nsCommandWarmthStep.
@@ -52,27 +52,62 @@ long nsCommandWarmthNext(long percent, int direction);
 double nsCommandWarmthRepeatGap(double seconds);
 
 // The warmth hotkeys, as RegisterEventHotKey takes them. The values are
-// Carbon's (kVK_ANSI_Minus / kVK_ANSI_Equal, cmdKey | optionKey |
+// Carbon's (kVK_ANSI_Minus / kVK_ANSI_Equal, cmdKey, shiftKey, optionKey,
 // controlKey); nightshiftd.m checks them against Carbon at compile time,
 // so this file stays plain C.
 enum {
   kNSKeyCodeMinus = 0x1B,
   kNSKeyCodeEqual = 0x18,
   kNSHotKeyCommand = 1 << 8,
+  kNSHotKeyShift = 1 << 9,
   kNSHotKeyOption = 1 << 11,
   kNSHotKeyControl = 1 << 12,
 };
+// One warmth shortcut. name is UTF-8 for Settings and notices: the modifier
+// glyphs in Apple's order (⌃⌥⇧⌘) and then the key's label.
 typedef struct {
   unsigned keyCode;
   unsigned modifiers;
-  const char *name;  // UTF-8, for messages and Settings
-} NSWarmthShortcut;
-// id 1 is ⌃⌥⌘− (lower), id 2 is ⌃⌥⌘= (raise). Any other id is all zero
-// with an empty name.
-NSWarmthShortcut nsWarmthShortcut(unsigned hotKeyID);
-// The notice shown when id could not be registered, NUL-terminated and
-// cut to fit. Returns the full length, like snprintf.
-int nsWarmthShortcutFailure(unsigned hotKeyID, char *buf, size_t size);
+  char key[12];   // the key's label alone, as saved
+  char name[40];  // modifiers and key, as shown
+} NSShortcut;
+// id 1 lowers warmth (default ⌃⌥⌘−), id 2 raises it (default ⌃⌥⌘=).
+// false and an all-zero shortcut for any other id.
+bool nsShortcutDefault(unsigned hotKeyID, NSShortcut *out);
+// A shortcut Nightshift will register: a key code below 128, only the four
+// modifiers above, and at least one of ⌃, ⌥ or ⌘ (⇧ alone would eat typing).
+// Without ⌃ it needs two modifiers, unless the key is F1...F12: a lone ⌘ or ⌥
+// with a letter would take ⌘Q, ⌘W and the like from every app.
+bool nsShortcutAllowed(unsigned keyCode, unsigned modifiers);
+// The label for keys whose typed character is not one (F1...F12, arrows,
+// Space, Return, Tab, Delete, Escape, and − for kNSKeyCodeMinus), else NULL.
+const char *nsShortcutKeyLabel(unsigned keyCode);
+// Builds out from a recorded key. key is the typed label for keys
+// nsShortcutKeyLabel does not name: 1...8 bytes, no spaces or control
+// characters. false, out untouched, when the shortcut or label is not allowed.
+bool nsShortcutMake(unsigned keyCode, unsigned modifiers, const char *key, NSShortcut *out);
+// The saved shortcuts file: one "lower" or "raise" line each,
+// "<word> <keyCode> <modifiers> <label>". A missing, broken or not allowed
+// line keeps that id's default; the same shortcut on both lines keeps both
+// defaults. Returns a bit per id (1 << (id - 1)) read from text.
+unsigned nsShortcutsParse(const char *text, NSShortcut out[2]);
+// The file text for shortcuts, NUL-terminated and cut to fit. Returns the
+// full length, like snprintf.
+int nsShortcutsFormat(const NSShortcut shortcuts[2], char *buf, size_t size);
+bool nsShortcutSame(const NSShortcut *a, const NSShortcut *b);
+
+typedef enum {
+  kNSShortcutReady = 0,
+  kNSShortcutTakenBySystem,  // a macOS shortcut (CopySymbolicHotKeys)
+  kNSShortcutTakenByApp,     // eventHotKeyExistsErr: another app has it
+  kNSShortcutFailed,         // any other registration error
+} NSShortcutState;
+// Short status for Settings: "On" when ready.
+const char *nsShortcutStateLabel(NSShortcutState state);
+// The notice for id's shortcut in state, NUL-terminated and cut to fit.
+// Returns the full length, like snprintf; 0 and "" for ready.
+int nsShortcutNotice(unsigned hotKeyID, const char *name, NSShortcutState state, char *buf,
+                     size_t size);
 
 // MARK: Daemon socket commands
 
