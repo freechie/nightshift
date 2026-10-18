@@ -5307,6 +5307,7 @@ static EventHandlerRef gCommandHotKeyHandler = NULL;
 // with GetEventTime of the held events, which are then dropped.
 static NSTimer *gMenuKeyTimer = nil;
 static BOOL gMenuKeyHeld[2];
+static BOOL gMenuKeyPolled[2];
 static EventTime gMenuKeysOpenedAt = -1;
 static EventTime gMenuKeysClosedAt = -1;
 static int gCommandHoldGeneration = 0;
@@ -5477,7 +5478,8 @@ static OSStatus commandWarmthHotKey(EventHandlerCallRef next, EventRef event, vo
   if (hotKey.signature != 'NScm') {
     return eventNotHandledErr;
   }
-  if (nsHotKeyDuringMenu(GetEventTime(event), gMenuKeysOpenedAt, gMenuKeysClosedAt)) {
+  BOOL polled = hotKey.id >= 1 && hotKey.id <= 2 && gMenuKeyPolled[hotKey.id - 1];
+  if (nsHotKeyDuringMenu(GetEventTime(event), gMenuKeysOpenedAt, gMenuKeysClosedAt, polled)) {
     return noErr;
   }
   UInt32 kind = GetEventKind(event);
@@ -5603,6 +5605,7 @@ static void pollMenuWarmthKeys(void) {
     if (gCommandHotKeys[i] == NULL) {
       continue;
     }
+    gMenuKeyPolled[i] = YES;
     EventHotKeyID hotKey = {'NScm', i + 1};
     commandWarmthHotKeyOnMain(down ? kEventHotKeyPressed : kEventHotKeyReleased, hotKey);
   }
@@ -5614,6 +5617,7 @@ static void startMenuWarmthKeys(void) {
   unsigned held = heldWarmthModifiers();
   for (unsigned i = 0; i < 2; i++) {
     gMenuKeyHeld[i] = menuWarmthKeyHeld(i, held);
+    gMenuKeyPolled[i] = NO;
   }
   gMenuKeyTimer = [NSTimer timerWithTimeInterval:0.008
                                          repeats:YES
