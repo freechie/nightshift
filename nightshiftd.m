@@ -5025,15 +5025,11 @@ static NSImage *sidebarTile(NSInteger pane, CGFloat size) {
       [self refresh];
       return;
     }
-    if (value == live) {
-      reportWarmth(live);
-    }
     [self refresh];
     return;
   }
   BOOL raise = maxv >= 1 && value > maxv;
   if (value == live && !raise) {
-    reportWarmth(live);
     [self refresh];
     return;
   }
