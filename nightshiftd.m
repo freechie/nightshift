@@ -3791,7 +3791,9 @@ static void hugControls(NSView *view) {
     return NO;
   }
   unsigned keyCode = event.keyCode;
-  NSString *key = event.charactersIgnoringModifiers.uppercaseString;
+  // charactersIgnoringModifiers keeps ⇧, so ⌃⌥⇧1 would read "!". Label the
+  // unshifted key, like macOS menus do.
+  NSString *key = [event charactersByApplyingModifiers:0].uppercaseString;
   const char *typed = key.UTF8String;
   if (!nsShortcutAllowed(keyCode, modifiers)) {
     char pressed[40];
