@@ -1177,18 +1177,6 @@ static BOOL handleControl(const char *buf, int fd) {
   self.needsDisplay = YES;
 }
 
-- (void)publish {
-  if (self.changed == nil || ![self isComplete]) {
-    return;
-  }
-  int minute = [self clockMinute];
-  if (minute < 0 || minute == self.published) {
-    return;
-  }
-  self.published = minute;
-  self.changed(self);
-}
-
 - (NSFont *)digitFont {
   return [NSFont monospacedDigitSystemFontOfSize:34 weight:NSFontWeightSemibold];
 }
@@ -2087,8 +2075,6 @@ static NSStackView *menuSection(NSArray<NSView *> *views, CGFloat spacing) {
 - (void)previewNow:(long)value;
 - (int)clockMinute;
 @end
-
-static BOOL gSettingsKeepsOpenForOtherApp = NO;
 
 static BOOL openWorkspaceURL(NSString *text) {
   NSURL *page = rampWorkspaceURL(text);
@@ -3071,9 +3057,6 @@ static const CGFloat kIconTileImage = 60;
 @property(nonatomic, copy) void (^needsSync)(void);
 @property(nonatomic, strong) NSTimer *syncTimer;
 @property(nonatomic) NSInteger page;
-@property(nonatomic) BOOL stayOpen;
-@property(nonatomic, strong) id outsideMonitor;
-@property(nonatomic, strong) id localOutsideMonitor;
 - (void)showPage:(NSInteger)index;
 - (void)syncPaid:(BOOL)paid soon:(BOOL)soon until:(NSString *)until buying:(BOOL)buying;
 - (void)paintSidebar;
@@ -3685,7 +3668,6 @@ static void hugControls(NSView *view) {
 
 - (void)openNightShiftSettings:(id)sender {
   (void)sender;
-  gSettingsKeepsOpenForOtherApp = YES;
   openWorkspaceURL(@"x-apple.systempreferences:com.apple.Displays-Settings."
                    @"extension?nightShift");
 }
@@ -4421,7 +4403,6 @@ static NSImage *sidebarTile(NSInteger pane, CGFloat size) {
 
 - (void)showPage:(NSInteger)index {
   [self applyPage:index];
-  self.stayOpen = YES;
   // A regular app while Settings is open, so it gets a Dock icon and a
   // Cmd-Tab entry and stays put when you click into another app.
   [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
@@ -4443,57 +4424,6 @@ static NSImage *sidebarTile(NSInteger pane, CGFloat size) {
   }
 }
 
-- (void)watchOutsideClicks {
-  if (self.outsideMonitor != nil) {
-    return;
-  }
-  __weak SettingsPanel *panel = self;
-  self.outsideMonitor = [NSEvent
-      addGlobalMonitorForEventsMatchingMask:NSEventMaskLeftMouseDown | NSEventMaskRightMouseDown
-                                     handler:^(NSEvent *event) {
-                                       (void)event;
-                                       [panel closeIfClickedAway];
-                                     }];
-  self.localOutsideMonitor = [NSEvent
-      addLocalMonitorForEventsMatchingMask:NSEventMaskLeftMouseDown | NSEventMaskRightMouseDown
-                                   handler:^NSEvent *(NSEvent *event) {
-                                     (void)event;
-                                     [panel closeIfClickedAway];
-                                     return event;
-                                   }];
-}
-
-- (void)stopOutsideClicks {
-  if (self.outsideMonitor != nil) {
-    [NSEvent removeMonitor:self.outsideMonitor];
-    self.outsideMonitor = nil;
-  }
-  if (self.localOutsideMonitor != nil) {
-    [NSEvent removeMonitor:self.localOutsideMonitor];
-    self.localOutsideMonitor = nil;
-  }
-}
-
-- (BOOL)frontAppIsSystemSettings {
-  NSString *bundle = NSWorkspace.sharedWorkspace.frontmostApplication.bundleIdentifier;
-  return [bundle isEqualToString:@"com.apple.systempreferences"] ||
-         [bundle isEqualToString:@"com.apple.SystemSettings"];
-}
-
-- (void)closeIfClickedAway {
-  if (!self.stayOpen || !self.window.isVisible) {
-    return;
-  }
-  if (NSPointInRect(NSEvent.mouseLocation, self.window.frame)) {
-    return;
-  }
-  if (gSettingsKeepsOpenForOtherApp && [self frontAppIsSystemSettings]) {
-    return;
-  }
-  gSettingsKeepsOpenForOtherApp = NO;
-  [self.window close];
-}
-
 - (void)appResigned:(NSNotification *)notification {
   (void)notification;
   [self stopRecording];
@@ -4501,10 +4431,7 @@ static NSImage *sidebarTile(NSInteger pane, CGFloat size) {
 
 - (void)windowWillClose:(NSNotification *)notification {
   (void)notification;
-  self.stayOpen = NO;
-  gSettingsKeepsOpenForOtherApp = NO;
   [self stopRecording];
-  [self stopOutsideClicks];
   [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
   [self.syncTimer invalidate];
   self.syncTimer = nil;
@@ -4537,7 +4464,6 @@ static NSImage *sidebarTile(NSInteger pane, CGFloat size) {
 
 - (void)openNotifications:(id)sender {
   (void)sender;
-  gSettingsKeepsOpenForOtherApp = YES;
   openWorkspaceURL(@"x-apple.systempreferences:com.apple.Notifications-Settings.extension");
 }
 @end

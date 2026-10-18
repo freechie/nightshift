@@ -700,5 +700,4 @@ int main(int argc, const char *argv[]) {
                              : "failed to set Night Shift\n");
     return 1;
   }
-  return 0;
 }
