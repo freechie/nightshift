@@ -154,8 +154,10 @@ bool nsShortcutAllowed(unsigned keyCode, unsigned modifiers) {
     return true;
   }
   // These hotkeys are global, so a lone ⌘ or ⌥ with a letter, digit or arrow
-  // would take ⌘Q, ⌘W, ⌥E and the like from every app. F-keys stay allowed.
-  bool oneModifier = (modifiers & (modifiers - 1)) == 0;
+  // would take ⌘Q, ⌘W, ⌥E and the like from every app. ⇧ doesn't help, since
+  // ⌘⇧Z and ⌘⇧T are app shortcuts too. F-keys stay allowed.
+  unsigned strong = modifiers & (kNSHotKeyCommand | kNSHotKeyOption);
+  bool oneModifier = (strong & (strong - 1)) == 0;
   return !oneModifier || isFunctionKey(keyCode);
 }
 

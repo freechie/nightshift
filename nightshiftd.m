@@ -191,11 +191,16 @@ static void sendBanner(NSString *body, BOOL controls) {
   if ([content respondsToSelector:@selector
                (setShouldPreventNotificationDismissalAfterDefaultAction:)]) {
     [content setShouldPreventNotificationDismissalAfterDefaultAction:YES];
-  }  UNNotificationRequest *request =
+  }
+  // Replacing a delivered request with the same id only updates it in
+  // Notification Center, with no banner. Remove it so the new one shows.
+  UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
+  [center removeDeliveredNotificationsWithIdentifiers:@[ @"ramp" ]];
+  UNNotificationRequest *request =
       [UNNotificationRequest requestWithIdentifier:@"ramp"
                                            content:content
                                            trigger:nil];
-  [[UNUserNotificationCenter currentNotificationCenter]
+  [center
       addNotificationRequest:request
        withCompletionHandler:^(NSError *error) {
          if (error != nil) {
@@ -205,7 +210,18 @@ static void sendBanner(NSString *body, BOOL controls) {
        }];
 }
 
+// While the warmth keys are saving a value, banners wait here and only the
+// last one is posted, once the keys have been let go for a moment.
+static BOOL gBannerHoldoff = NO;
+static NSString *gHeldBanner = nil;
+static BOOL gHeldBannerControls = NO;
+
 static void postBanner(NSString *body, BOOL controls) {
+  if (gBannerHoldoff) {
+    gHeldBanner = body;
+    gHeldBannerControls = controls;
+    return;
+  }
   fprintf(stderr, "%s\n", body.UTF8String);
   if (gBannerReady) {
     sendBanner(body, controls);
@@ -3729,8 +3745,8 @@ static void hugControls(NSView *view) {
   [self syncDisplays];
 }
 
-// YES when the key press was used for recording. A refused lone-⌘ chord
-// (⌘W, ⌘Q...) stops recording and goes on to the app as usual.
+// YES when the key press was used for recording. ⌘W and ⌘Q stop recording
+// and go on to the app as usual; other refused lone-⌘ chords say why.
 - (BOOL)recordKey:(NSEvent *)event {
   if (event.isARepeat) {
     return YES;
@@ -3753,7 +3769,7 @@ static void hugControls(NSView *view) {
     [self stopRecording];
     return YES;
   }
-  if (modifiers == cmdKey && !nsShortcutAllowed(event.keyCode, modifiers)) {
+  if (modifiers == cmdKey && (event.keyCode == kVK_ANSI_W || event.keyCode == kVK_ANSI_Q)) {
     [self stopRecording];
     return NO;
   }
@@ -3763,7 +3779,7 @@ static void hugControls(NSView *view) {
     if (nsShortcutAllowed(event.keyCode, modifiers)) {
       self.recordNote = @"Pick another key";
     } else if (modifiers & (cmdKey | optionKey | controlKey)) {
-      self.recordNote = @"Add ⌃ or a second modifier";
+      self.recordNote = @"Add ⌃, or use both ⌥ and ⌘";
     } else {
       self.recordNote = @"Add ⌃, ⌥ or ⌘";
     }
@@ -5241,6 +5257,12 @@ static int gCommandHoldGeneration = 0;
 static int gCommandHoldDirection = 0;
 static long gCommandHoldPercent = -1;
 static BOOL gCommandHoldDirty = NO;
+// The held key, and whether its physical state could be read when pressed.
+// If it could, a repeat that finds it up ends the hold (a lost key-up).
+static unsigned gCommandHoldKeyCode = 0;
+static BOOL gCommandHoldKeyReadable = NO;
+static int gHeldBannerGeneration = 0;
+static const double kHeldBannerDelay = 0.5;
 
 static long commandWarmthNow(void) {
   long now = 0;
@@ -5266,14 +5288,39 @@ static void commandWarmthClearHold(void) {
 
 static void commandWarmthTick(BOOL release);
 
+// Posts the last held banner once no warmth key is down, so quick taps and
+// a hold give one banner with the final value.
+static void scheduleHeldBanner(void) {
+  int generation = ++gHeldBannerGeneration;
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kHeldBannerDelay * NSEC_PER_SEC)),
+                 dispatch_get_main_queue(), ^{
+                   if (generation != gHeldBannerGeneration || gCommandHoldDirection != 0 ||
+                       gHeldBanner == nil) {
+                     return;
+                   }
+                   NSString *body = gHeldBanner;
+                   gHeldBanner = nil;
+                   postBanner(body, gHeldBannerControls);
+                 });
+}
+
+static BOOL commandWarmthKeyDown(unsigned keyCode) {
+  return CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, (CGKeyCode)keyCode);
+}
+
 // Main thread. A repeat previews the next Current value. release saves it
 // once, through the slider's mouse-up path, and does not take another step.
 static void commandWarmthTick(BOOL release) {
   if (release) {
     if (gCommandHoldDirty && gCommandHoldPercent >= 0 && gMenu != nil) {
+      gBannerHoldoff = YES;
       [gMenu commitCurrentIntensity:gCommandHoldPercent];
+      gBannerHoldoff = NO;
     }
     commandWarmthClearHold();
+    if (gHeldBanner != nil) {
+      scheduleHeldBanner();
+    }
     return;
   }
   if (gCommandHoldDirection == 0) {
@@ -5308,6 +5355,11 @@ static void scheduleCommandWarmthRepeat(int generation, BOOL first) {
                    if (generation != gCommandHoldGeneration || gCommandHoldDirection == 0) {
                      return;
                    }
+                   if (gCommandHoldKeyReadable && !commandWarmthKeyDown(gCommandHoldKeyCode)) {
+                     gCommandHoldGeneration++;
+                     commandWarmthTick(YES);
+                     return;
+                   }
                    commandWarmthTick(NO);
                    scheduleCommandWarmthRepeat(generation, NO);
                  });
@@ -5332,7 +5384,9 @@ static void commandWarmthHotKeyOnMain(UInt32 kind, EventHotKeyID hotKey) {
   if (gCommandHoldDirection == direction) {
     return;
   }
-  if (gMenu != nil && gMenu.tracking) {
+  // tracking is also set by this hold's own previews; only a slider drag,
+  // with no hold, keeps the keys out.
+  if (gCommandHoldDirection == 0 && gMenu != nil && gMenu.tracking) {
     return;
   }
   if (gCommandHoldDirection != 0) {
@@ -5340,6 +5394,8 @@ static void commandWarmthHotKeyOnMain(UInt32 kind, EventHotKeyID hotKey) {
     commandWarmthTick(YES);
   }
   gCommandHoldDirection = direction;
+  gCommandHoldKeyCode = warmthShortcut(hotKey.id).keyCode;
+  gCommandHoldKeyReadable = commandWarmthKeyDown(gCommandHoldKeyCode);
   gCommandHoldGeneration++;
   int generation = gCommandHoldGeneration;
   commandWarmthTick(NO);
