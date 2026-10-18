@@ -130,6 +130,17 @@ double nsCommandWarmthRepeatGap(double seconds) {
   return seconds;
 }
 
+bool nsShortcutHeld(unsigned modifiers, bool keyDown, unsigned heldModifiers) {
+  return keyDown && heldModifiers == modifiers;
+}
+
+bool nsHotKeyDuringMenu(double eventTime, double openedAt, double closedAt) {
+  if (openedAt < 0 || eventTime < openedAt) {
+    return false;
+  }
+  return closedAt < openedAt || eventTime <= closedAt;
+}
+
 static const unsigned kShortcutModifiers =
     kNSHotKeyCommand | kNSHotKeyShift | kNSHotKeyOption | kNSHotKeyControl;
 

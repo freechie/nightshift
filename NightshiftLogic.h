@@ -50,6 +50,15 @@ long nsCommandWarmthNext(long percent, int direction);
 // Seconds between hold repeats. Never faster than 0.02s, so a hold cannot
 // spin the run loop if the system repeat interval is tiny.
 double nsCommandWarmthRepeatGap(double seconds);
+// While the menu is open, macOS holds the warmth hotkeys' Carbon events and
+// delivers them all when it closes, so nightshiftd reads the keys itself.
+// true when keyDown and the held modifiers (the kNSHotKey bits below) are
+// exactly the shortcut's.
+bool nsShortcutHeld(unsigned modifiers, bool keyDown, unsigned heldModifiers);
+// true for a hotkey event pressed while the menu was open, which the menu's
+// own key reading already handled. Times share one clock; openedAt < 0 is
+// never opened, and closedAt < openedAt is still open.
+bool nsHotKeyDuringMenu(double eventTime, double openedAt, double closedAt);
 
 // The warmth hotkeys, as RegisterEventHotKey takes them. The values are
 // Carbon's (kVK_ANSI_Minus / kVK_ANSI_Equal, cmdKey, shiftKey, optionKey,

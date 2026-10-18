@@ -94,6 +94,24 @@ static void checkCommandWarmth(void) {
   CHECK(nsCommandWarmthRepeatGap(0) == 0.02);
   CHECK(nsCommandWarmthRepeatGap(-1) == 0.02);
 
+  const unsigned ctrlOptCmd = kNSHotKeyControl | kNSHotKeyOption | kNSHotKeyCommand;
+  CHECK(nsShortcutHeld(ctrlOptCmd, true, ctrlOptCmd));
+  CHECK(!nsShortcutHeld(ctrlOptCmd, false, ctrlOptCmd));
+  CHECK(!nsShortcutHeld(ctrlOptCmd, true, kNSHotKeyControl | kNSHotKeyCommand));
+  CHECK(!nsShortcutHeld(ctrlOptCmd, true, ctrlOptCmd | kNSHotKeyShift));
+  CHECK(nsShortcutHeld(kNSHotKeyCommand, true, kNSHotKeyCommand));
+
+  // Measured on John's Mac: menu open 100.0 to 108.5, presses held by macOS
+  // until close are dropped, and a release after close still counts.
+  CHECK(!nsHotKeyDuringMenu(101.7, -1, -1));
+  CHECK(nsHotKeyDuringMenu(101.7, 100.0, 108.5));
+  CHECK(nsHotKeyDuringMenu(108.5, 100.0, 108.5));
+  CHECK(nsHotKeyDuringMenu(100.0, 100.0, 108.5));
+  CHECK(!nsHotKeyDuringMenu(99.9, 100.0, 108.5));
+  CHECK(!nsHotKeyDuringMenu(108.6, 100.0, 108.5));
+  CHECK(nsHotKeyDuringMenu(101.7, 100.0, 50.0));
+  CHECK(!nsHotKeyDuringMenu(51.0, 100.0, 50.0));
+
   CHECK_EQ(nsCommandWarmthNext(50, 1), 55);
   CHECK_EQ(nsCommandWarmthNext(50, -1), 45);
   CHECK_EQ(nsCommandWarmthNext(0, -1), 0);
