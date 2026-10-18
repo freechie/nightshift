@@ -1192,17 +1192,6 @@ static NSString *checkoutOrPortal(NSInteger *statusOut) {
   return url;
 }
 
-NSString *rampCheckoutURL(void) {
-  NSInteger status = 0;
-  NSString *url = checkoutOrPortal(&status);
-  return status == 200 ? url : nil;
-}
-
-NSString *rampFetchLicenseToken(void) {
-  NSString *token = nil;
-  return fetchLicense(&token, NULL) == 200 ? token : nil;
-}
-
 int rampInstallReported(NSString *token, NSString **stdoutLine, NSString **stderrLine) {
   if (stdoutLine != NULL) {
     *stdoutLine = nil;
