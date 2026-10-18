@@ -2600,19 +2600,13 @@ static BOOL appearanceIsDark(NSAppearance *appearance) {
 
 // One icon the user can pick in Settings › General.
 //
-// Art drops in as bundle resources in Contents/Resources (phase 2):
-//   icon-<ident>.pdf (or .png)        the app icon tile, the full art with its
-//                                     transparent margin
-//   icon-<ident>-glyph.pdf (or .png)  the menu bar template glyph, black on
-//                                     clear, 1 unit = 1 pt
-// The design files are SVG (settings-mock/icons/<name>.svg and
-// <name>-glyph.svg); convert them on the Mac before bundling, for example
-// `rsvg-convert -f pdf -o icon-lamp-glyph.pdf lamp-glyph.svg`, and copy them
-// into Nightshift.app/Contents/Resources from the Makefile.
-// A choice with menuSymbol set shows that SF Symbol in the menu bar instead of
-// a bundled glyph: Horizon and Mono use sun.horizon, Thermometer uses
-// thermometer.medium. SF Symbols are fine in UI but not in app icons, so the
-// tile drawn here without bundled art is only a placeholder.
+// A choice with menuSymbol set shows that SF Symbol in the menu bar. The
+// others show icons/icon-<ident>-glyph.pdf, which the Makefile copies into
+// Contents/Resources: a template glyph, black on clear, 1 unit = 1 pt, made
+// from the design SVG with
+// `rsvg-convert -f pdf -d 72 -p 72 -o icons/icon-lamp-glyph.pdf lamp-glyph.svg`.
+// The Settings picker shows the menu bar image itself, larger and with no
+// background.
 @interface IconChoice : NSObject
 @property(nonatomic, copy) NSString *ident;
 @property(nonatomic, copy) NSString *name;
@@ -2645,15 +2639,11 @@ static BOOL appearanceIsDark(NSAppearance *appearance) {
     NSColor *indigo = [NSColor colorWithSRGBRed:0.16 green:0.17 blue:0.42 alpha:1];
     NSColor *violet = [NSColor colorWithSRGBRed:0.49 green:0.25 blue:0.53 alpha:1];
     NSColor *amber = [NSColor colorWithSRGBRed:1.00 green:0.62 blue:0.34 alpha:1];
-    // Phase 1 offers Horizon only. Phase 2 adds, in this order, once their
-    // resources are bundled: Mono (symbol sun.horizon), Thermometer (symbol
-    // thermometer.medium), Dusk Moon, Warm Dial and Lamp (bundled glyphs,
-    // symbol nil).
+    NSArray<NSColor *> *dusk = @[ indigo, violet, amber ];
     choices = @[
-      [IconChoice choice:@"horizon"
-                    name:@"Horizon"
-                  symbol:@"sun.horizon"
-                  colors:@[ indigo, violet, amber ]],
+      [IconChoice choice:@"horizon" name:@"Horizon" symbol:@"sun.horizon" colors:dusk],
+      [IconChoice choice:@"dusk-moon" name:@"Dusk Moon" symbol:nil colors:dusk],
+      [IconChoice choice:@"lamp" name:@"Lamp" symbol:nil colors:dusk],
     ];
   });
   return choices;
@@ -2910,8 +2900,9 @@ static NSString *const kSettingsWindowID = @"NightshiftSettings";
 - (instancetype)initWithChoice:(IconChoice *)choice;
 @end
 
-// The image includes the art's margin; the visible tile is 80% of it.
+// The square the glyph is centered in; the ring hugs 80% of it.
 static const CGFloat kIconTileImage = 60;
+static const CGFloat kIconTileGlyph = 28;
 
 @implementation IconTile
 - (instancetype)initWithChoice:(IconChoice *)choice {
@@ -2921,7 +2912,10 @@ static const CGFloat kIconTileImage = 60;
   }
   self.choice = choice;
   self.translatesAutoresizingMaskIntoConstraints = NO;
-  self.imageView = [NSImageView imageViewWithImage:[choice tileImageOfSize:kIconTileImage]];
+  NSImage *glyph = [choice menuImage] ?: [[IconChoice standard] menuImage];
+  CGFloat scale = kIconTileGlyph / MAX(glyph.size.width, glyph.size.height);
+  glyph.size = NSMakeSize(glyph.size.width * scale, glyph.size.height * scale);
+  self.imageView = [NSImageView imageViewWithImage:glyph];
   self.imageView.translatesAutoresizingMaskIntoConstraints = NO;
   self.nameField = [NSTextField labelWithString:choice.name];
   self.nameField.font = [NSFont systemFontOfSize:11];
@@ -3478,7 +3472,7 @@ static void hugControls(NSView *view) {
                                 caption:@"Shows the current warmth, like 64%, in the menu bar."
                                 control:self.warmthSwitch],
                           ]
-                        footer:@"Sets the menu bar icon. More icons are on the way."];
+                        footer:@"Sets the menu bar icon."];
   NSView *clock = [self section:@"Clock"
                       accessory:nil
                            rows:@[ [self row:@"24-hour time"
