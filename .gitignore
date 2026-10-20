@@ -14,3 +14,7 @@ server/data/
 server/.env
 .DS_Store
 .cursor/
+nightshift-swift
+swift-tests
+NightshiftSwift.app/
+build/

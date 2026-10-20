@@ -26,13 +26,21 @@ BUNDLED := $(APP)/Contents/MacOS/nightshiftd
 DIST := dist
 STAGE := $(DIST)/root
 ZIP := $(DIST)/Nightshift.zip
+# The Swift rewrite: its own app, bundle id and build folder, so it never
+# replaces Nightshift.app.
+SWIFT_APP := NightshiftSwift.app
+SWIFT_BUILD := build/swift
+SWIFT_SRC := swift/main.swift swift/App.swift swift/NightShiftClient.swift swift/Warmth.swift
+SWIFT_TARGET := -target arm64-apple-macos15.0
+SWIFTFLAGS := -swift-version 6 -warnings-as-errors $(SWIFT_TARGET)
 
 all: nightshift nightshiftd $(BUNDLED)
 
-test: socket-main-check secret-scan workspace-open-check nightshift nightshift-tests logic-tests server-test license-server-check
+test: socket-main-check secret-scan workspace-open-check nightshift nightshift-tests logic-tests server-test license-server-check nightshift-swift swift-tests
 	./socket-main-check --siblings nightshiftd.m
 	./nightshift-tests
 	./logic-tests
+	./swift-tests
 	sh tests/cli.sh
 	sh tests/license-server.sh
 
@@ -81,6 +89,24 @@ nightshift-testkey: main.m $(SHARED) $(LOGIC)
 license-server-check: scripts/license-server-check.m $(LOGIC)
 	clang $(CFLAGS) -I. -o $@ scripts/license-server-check.m NightshiftLogic.m
 
+swift: $(SWIFT_APP)/Contents/MacOS/nightshift-swift
+
+$(SWIFT_BUILD)/%.o: %.m $(SHARED) $(LOGIC)
+	mkdir -p $(SWIFT_BUILD)
+	clang $(CFLAGS) $(SWIFT_TARGET) -c -o $@ $<
+
+nightshift-swift: $(SWIFT_SRC) swift/CNightshift/module.modulemap $(SWIFT_BUILD)/NightShift.o $(SWIFT_BUILD)/NightshiftLogic.o
+	swiftc $(SWIFTFLAGS) -F$(SDK)/System/Library/PrivateFrameworks -I swift/CNightshift $(LDLIBS) -framework AppKit -Xlinker -dead_strip -o $@ $(SWIFT_SRC) $(SWIFT_BUILD)/NightShift.o $(SWIFT_BUILD)/NightshiftLogic.o
+
+swift-tests: swift/Tests/main.swift swift/Warmth.swift
+	swiftc $(SWIFTFLAGS) -o $@ swift/Tests/main.swift swift/Warmth.swift
+
+$(SWIFT_APP)/Contents/MacOS/nightshift-swift: nightshift-swift swift/Info.plist
+	mkdir -p $(dir $@)
+	cp swift/Info.plist $(SWIFT_APP)/Contents/
+	cp nightshift-swift $@
+	sh scripts/dev-sign.sh $(SWIFT_APP)
+
 GLYPHS := $(wildcard icons/*.pdf)
 
 $(BUNDLED): nightshiftd Info.plist $(GLYPHS)
@@ -113,10 +139,11 @@ package: license-server-check
 
 clean:
 	rm -rf nightshift nightshiftd nightshift-tests logic-tests nightshift-testkey \
-	    socket-main-check license-server-check $(LICENSE_STAMP) $(APP) $(DIST)
+	    socket-main-check license-server-check $(LICENSE_STAMP) $(APP) $(DIST) \
+	    nightshift-swift swift-tests $(SWIFT_APP) build
 
 # Turns on scripts/hooks (the pre-commit secret scan) for this clone.
 hooks:
 	git config core.hooksPath scripts/hooks
 
-.PHONY: all test server-test install package clean hooks secret-scan workspace-open-check
+.PHONY: all swift test server-test install package clean hooks secret-scan workspace-open-check
