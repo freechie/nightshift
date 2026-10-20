@@ -1,0 +1,4 @@
+module CNightshift {
+  header "../../NightShift.h"
+  export *
+}
