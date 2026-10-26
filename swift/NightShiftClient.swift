@@ -1,7 +1,10 @@
 import CNightshift
+import os
+
+private let log = Logger(subsystem: "io.github.freechie.nightshift.swift", category: "warmth")
 
 @MainActor
-final class NightShiftClient {
+final class NightShiftClient: WarmthSource {
   private let client: CBBlueLightClient
 
   init?() {
@@ -19,7 +22,9 @@ final class NightShiftClient {
 
   func apply(_ warmth: Warmth) -> WarmthReading {
     var stored = 0
-    guard applyStrength(client, warmth.percent, &stored) else { return read() }
+    if !applyStrength(client, warmth.percent, &stored) {
+      log.error("applyStrength failed for \(warmth.percent, privacy: .public)%")
+    }
     return read()
   }
 }

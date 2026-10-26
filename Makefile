@@ -31,6 +31,8 @@ ZIP := $(DIST)/Nightshift.zip
 SWIFT_APP := NightshiftSwift.app
 SWIFT_BUILD := build/swift
 SWIFT_SRC := swift/main.swift swift/App.swift swift/NightShiftClient.swift swift/Warmth.swift
+# Needs Swift 6 (Xcode 16 or later) and an Apple silicon Mac: it builds
+# for arm64 only, and swift-tests runs on the build machine.
 SWIFT_TARGET := -target arm64-apple-macos15.0
 SWIFTFLAGS := -swift-version 6 -warnings-as-errors $(SWIFT_TARGET)
 
