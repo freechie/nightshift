@@ -34,6 +34,8 @@ func reading(strength: Int?, enabled: Bool?) -> WarmthReading {
 protocol WarmthSource {
   func read() -> WarmthReading
   func apply(_ warmth: Warmth) -> WarmthReading
+  // Live drag: set strength only, no readback. Release still goes through apply.
+  func stage(_ warmth: Warmth)
 }
 
 // What the menu shows for a source, or for none at all.
