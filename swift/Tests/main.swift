@@ -276,6 +276,30 @@ check(snapTrace([48, 47, 48, 47, 48]) == [true, true, true, true, true], "wobbli
 check(snapTrace([40, 48, 52, 53, 54, 53]) == [false, true, true, true, false, false], "crossing mid sticks once, then lets go cleanly")
 check(shouldStaySnapped(raw: 11, snapped: false, mid: 10, enter: 1, exit: 2) && !shouldStaySnapped(raw: 12, snapped: true, mid: 10, enter: 1, exit: 2), "mid, enter and exit are parameters")
 
+// WarmthHold: press steps once, release commits dirty percent.
+do {
+  var hold = WarmthHold()
+  let first = hold.press(direction: 1, startingPercent: 40, keyCode: 0x18, keyReadable: false)
+  check(first == 45, "raise from 40 -> 45")
+  let second = hold.tick()
+  check(second == 50, "hold tick 45 -> 50")
+  let commit = hold.release()
+  check(commit == 50, "release commits 50")
+  check(!hold.isHolding, "hold cleared")
+}
+
+do {
+  var hold = WarmthHold()
+  _ = hold.press(direction: -1, startingPercent: 3, keyCode: 0x1B, keyReadable: false)
+  check(hold.percent == 0, "lower from 3 clamps to 0")
+  let commit = hold.release()
+  check(commit == 0, "release commits clamped 0")
+}
+
+check(WarmthHold.stepped(from: 98, direction: 1) == 100, "98 + 5 clamps to 100")
+check(WarmthHold.stepped(from: 100, direction: 1) == 100, "100 raise stays 100")
+check(WarmthHold.stepped(from: 2, direction: -1) == 0, "2 - 5 clamps to 0")
+
 if failures > 0 {
   exit(1)
 }
