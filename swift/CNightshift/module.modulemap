@@ -1,4 +1,5 @@
 module CNightshift {
   header "../../NightShift.h"
+  header "MenuBridge.h"
   export *
 }

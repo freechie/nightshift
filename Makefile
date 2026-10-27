@@ -30,7 +30,7 @@ ZIP := $(DIST)/Nightshift.zip
 # replaces Nightshift.app.
 SWIFT_APP := NightshiftSwift.app
 SWIFT_BUILD := build/swift
-SWIFT_SRC := swift/main.swift swift/App.swift swift/NightShiftClient.swift swift/Warmth.swift
+SWIFT_SRC := swift/main.swift swift/App.swift swift/NightShiftClient.swift swift/Warmth.swift swift/MenuModel.swift swift/MenuPanel.swift
 # Needs Swift 6 (Xcode 16 or later) and an Apple silicon Mac: it builds
 # for arm64 only, and swift-tests runs on the build machine.
 SWIFT_TARGET := -target arm64-apple-macos15.0
@@ -97,11 +97,15 @@ $(SWIFT_BUILD)/%.o: %.m $(SHARED) $(LOGIC)
 	mkdir -p $(SWIFT_BUILD)
 	clang $(CFLAGS) $(SWIFT_TARGET) -c -o $@ $<
 
-nightshift-swift: $(SWIFT_SRC) swift/CNightshift/module.modulemap $(SWIFT_BUILD)/NightShift.o $(SWIFT_BUILD)/NightshiftLogic.o
-	swiftc $(SWIFTFLAGS) -F$(SDK)/System/Library/PrivateFrameworks -I swift/CNightshift $(LDLIBS) -framework AppKit -Xlinker -dead_strip -o $@ $(SWIFT_SRC) $(SWIFT_BUILD)/NightShift.o $(SWIFT_BUILD)/NightshiftLogic.o
+$(SWIFT_BUILD)/menu_bridge.o: swift/menu_bridge.m swift/CNightshift/MenuBridge.h $(SHARED)
+	mkdir -p $(SWIFT_BUILD)
+	clang $(CFLAGS) $(SWIFT_TARGET) -c -o $@ swift/menu_bridge.m
 
-swift-tests: swift/Tests/main.swift swift/Warmth.swift
-	swiftc $(SWIFTFLAGS) -o $@ swift/Tests/main.swift swift/Warmth.swift
+nightshift-swift: $(SWIFT_SRC) swift/CNightshift/module.modulemap swift/CNightshift/MenuBridge.h $(SWIFT_BUILD)/NightShift.o $(SWIFT_BUILD)/NightshiftLogic.o $(SWIFT_BUILD)/menu_bridge.o
+	swiftc $(SWIFTFLAGS) -F$(SDK)/System/Library/PrivateFrameworks -I swift/CNightshift $(LDLIBS) -framework AppKit -framework SkyLight -Xlinker -dead_strip -o $@ $(SWIFT_SRC) $(SWIFT_BUILD)/NightShift.o $(SWIFT_BUILD)/NightshiftLogic.o $(SWIFT_BUILD)/menu_bridge.o
+
+swift-tests: swift/Tests/main.swift swift/Warmth.swift swift/MenuModel.swift
+	swiftc $(SWIFTFLAGS) -o $@ swift/Tests/main.swift swift/Warmth.swift swift/MenuModel.swift
 
 $(SWIFT_APP)/Contents/MacOS/nightshift-swift: nightshift-swift swift/Info.plist
 	mkdir -p $(dir $@)

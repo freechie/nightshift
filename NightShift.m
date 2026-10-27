@@ -68,8 +68,9 @@ BOOL applyStrength(CBBlueLightClient *client, long value, long *stored) {
   return readStrength(client, stored);
 }
 
+// Strength only, no setEnabled and no readback: the cheap live-drag path.
 BOOL stageStrength(CBBlueLightClient *client, long value) {
-  if (value < 1 || value > 100) {
+  if (value < 0 || value > 100) {
     return NO;
   }
   return [client setStrength:(float)value / 100.0f commit:YES];

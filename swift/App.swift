@@ -2,56 +2,86 @@ import AppKit
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
-  private let nightShift: (any WarmthSource)?
+  private let menuFacade: MenuFacade?
   private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-  private let titleItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
-  private let slider = NSSlider(value: 0, minValue: 0, maxValue: 100, target: nil, action: nil)
+  private var panel: MenuPanel?
 
-  init(nightShift: (any WarmthSource)?) {
-    self.nightShift = nightShift
+  init(menu: MenuFacade?) {
+    menuFacade = menu
     super.init()
   }
 
   func applicationDidFinishLaunching(_ notification: Notification) {
     statusItem.autosaveName = "nightshift-swift"
     statusItem.button?.toolTip = "Nightshift Swift"
-    statusItem.button?.imagePosition = .imageLeading
-    let image = menuImage()
-    statusItem.button?.image = image
-    // No symbol: a text title instead, as the old app does (d:4765-4766).
-    if image == nil {
-      statusItem.button?.title = "NS"
-    }
+    statusItem.button?.image = menuImage()
 
-    slider.target = self
-    slider.action = #selector(sliderReleased)
-    slider.isContinuous = false
-    slider.frame = NSRect(x: 16, y: 2, width: 200, height: 24)
-    let sliderRow = NSView(frame: NSRect(x: 0, y: 0, width: 232, height: 28))
-    sliderRow.addSubview(slider)
-    let sliderItem = NSMenuItem()
-    sliderItem.view = sliderRow
+    let panel = MenuPanel()
+    panel.onIntent = { [weak self] intent in
+      self?.perform(intent)
+    }
+    self.panel = panel
 
     let menu = NSMenu()
-    // Items with no action stay enabled, so the slider gets drags (d:4561).
+    // Items with no action stay enabled, so the sliders get drags (d:4561).
     menu.autoenablesItems = false
-    titleItem.isEnabled = false
     menu.delegate = self
-    menu.addItem(titleItem)
-    menu.addItem(sliderItem)
+    let content = NSMenuItem()
+    content.view = panel
+    menu.addItem(content)
     menu.addItem(.separator())
-    menu.addItem(NSMenuItem(title: "Quit Nightshift Swift", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+    let settings = NSMenuItem(title: "Settings…", action: #selector(showSettings(_:)), keyEquivalent: "")
+    settings.target = self
+    menu.addItem(settings)
+    menu.addItem(
+      NSMenuItem(
+        title: "Quit Nightshift Swift",
+        action: #selector(NSApplication.terminate(_:)),
+        keyEquivalent: "q"
+      )
+    )
     statusItem.menu = menu
-    show(currentReading(nightShift))
+    show(menuFacade?.snapshot() ?? .unavailable)
   }
 
   func menuWillOpen(_ menu: NSMenu) {
-    show(currentReading(nightShift))
+    show(menuFacade?.snapshot() ?? .unavailable)
   }
 
-  @objc private func sliderReleased() {
-    guard let reading = applyReleased(slider.integerValue, to: nightShift) else { return }
-    show(reading)
+  // Settings is a stub in this pass. The item stays in the menu.
+  @objc private func showSettings(_ sender: Any?) {}
+
+  private func perform(_ intent: MenuIntent) {
+    guard let menuFacade else { return }
+    // Live drag skips snapshot, render, and bar title; the bar updates on release.
+    if case .stageWarmth(let warmth) = intent {
+      menuFacade.stageWarmth(warmth)
+      return
+    }
+    show(menuFacade.apply(intent))
+  }
+
+  private func show(_ snapshot: MenuSnapshot) {
+    panel?.render(snapshot)
+    guard let button = statusItem.button else { return }
+    let title = statusItemTitle(for: snapshot.warmth, showWarmthInBar: snapshot.showWarmthInBar)
+    applyBarTitle(title, to: button)
+  }
+
+  private func applyBarTitle(_ title: String, to button: NSStatusBarButton) {
+    if title.isEmpty {
+      button.title = button.image == nil ? "NS" : ""
+      button.imagePosition = button.image == nil ? .imageLeading : .imageOnly
+      return
+    }
+    let size = NSFont.systemFontSize(for: NSControl.ControlSize.regular)
+    button.attributedTitle = NSAttributedString(
+      string: title,
+      attributes: [
+        .font: NSFont.monospacedDigitSystemFont(ofSize: size, weight: .regular),
+      ]
+    )
+    button.imagePosition = .imageLeading
   }
 
   // The status bar fits a symbol to its alignment rect without scaling,
@@ -67,14 +97,5 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     image.accessibilityDescription = "Nightshift"
     image.isTemplate = true
     return image
-  }
-
-  private func show(_ reading: WarmthReading) {
-    titleItem.title = menuTitle(for: reading)
-    let state = sliderState(for: reading)
-    slider.isEnabled = state.isEnabled
-    if let value = state.value {
-      slider.integerValue = value
-    }
   }
 }
