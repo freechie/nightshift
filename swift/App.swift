@@ -5,6 +5,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
   private let menuFacade: MenuFacade?
   private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
   private var panel: MenuPanel?
+  // §3 rampTick hook. Filled by RampController; stub lands first so §2 can layer hotkeys.
+  private var rampTimer: Timer?
+  // True while Color temp is mid-drag (stageWarmth). Blocks hotkey holds.
+  private var warmthDragging = false
 
   init(menu: MenuFacade?) {
     menuFacade = menu
@@ -42,22 +46,86 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     )
     statusItem.menu = menu
     show(menuFacade?.snapshot() ?? .unavailable)
+    wireHotKeys()
+    WarmthHotKeys.shared.start()
+    startRampTimer()
+  }
+
+  func applicationWillTerminate(_ notification: Notification) {
+    WarmthHotKeys.shared.stop()
+  }
+
+  // 60s wall clock, fires once at launch (matches ObjC dispatch_walltime(NULL,0)).
+  // .default mode: does not tick while the menu is tracking (avoids mid-drag retarget).
+  private func startRampTimer() {
+    let timer = Timer(
+      timeInterval: 60,
+      target: self,
+      selector: #selector(rampTickTimerFired(_:)),
+      userInfo: nil,
+      repeats: true
+    )
+    RunLoop.main.add(timer, forMode: .default)
+    rampTimer = timer
+    timer.fire()
+  }
+
+  @objc private func rampTickTimerFired(_ timer: Timer) {
+    rampTick()
+  }
+
+  private func rampTick() {
+    // Stub: RampController.tick goes here in the rest of §3.
   }
 
   func menuWillOpen(_ menu: NSMenu) {
     show(menuFacade?.snapshot() ?? .unavailable)
+    WarmthHotKeys.shared.menuWillOpen()
+  }
+
+  func menuDidClose(_ menu: NSMenu) {
+    WarmthHotKeys.shared.menuDidClose()
   }
 
   // Settings is a stub in this pass. The item stays in the menu.
   @objc private func showSettings(_ sender: Any?) {}
 
+  private func wireHotKeys() {
+    let keys = WarmthHotKeys.shared
+    keys.currentPercent = { [weak self] in
+      guard let reading = self?.menuFacade?.snapshot().warmth else { return nil }
+      switch reading {
+      case .on(let warmth): return warmth.percent
+      case .off: return 0
+      case .unreadable, .unavailable: return nil
+      }
+    }
+    keys.isSliderTracking = { [weak self] in
+      self?.warmthDragging == true
+    }
+    keys.onPreview = { [weak self] percent in
+      guard let self, let warmth = Warmth(percent) else { return }
+      self.menuFacade?.stageWarmth(warmth)
+      if let button = self.statusItem.button {
+        self.applyBarTitle("\(percent)%", to: button)
+      }
+    }
+    keys.onCommit = { [weak self] percent in
+      guard let self, let warmth = Warmth(percent) else { return }
+      self.warmthDragging = false
+      self.show(self.menuFacade?.apply(.setWarmth(warmth)) ?? .unavailable)
+    }
+  }
+
   private func perform(_ intent: MenuIntent) {
     guard let menuFacade else { return }
     // Live drag skips snapshot, render, and bar title; the bar updates on release.
     if case .stageWarmth(let warmth) = intent {
+      warmthDragging = true
       menuFacade.stageWarmth(warmth)
       return
     }
+    warmthDragging = false
     show(menuFacade.apply(intent))
   }
 
