@@ -19,6 +19,7 @@ CBBlueLightClient *makeClient(void);
 BOOL readStrength(CBBlueLightClient *client, long *stored);
 BOOL applyStrength(CBBlueLightClient *client, long value, long *stored);
 BOOL stageStrength(CBBlueLightClient *client, long value);
+BOOL previewStrength(CBBlueLightClient *client, long value);
 BOOL readStatus(CBBlueLightClient *client, BLStatus *status);
 BOOL parseNumber(const char *s, long min, long max, long *out);
 BOOL parseMaxText(NSString *text, long *out);

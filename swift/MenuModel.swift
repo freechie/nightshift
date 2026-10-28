@@ -248,11 +248,13 @@ struct MenuFiles {
 }
 
 // Applies one intent and returns the snapshot the menu should show.
-// Max and Full at write their files. Warmth goes through WarmthSource.
-// Schedule, Dark mode, and True Tone go through the closures. No glide.
+// Warmth, Max, and Full at go through RampEngine, the only writer of the
+// max and full files. A live drag stages through WarmthSource. Schedule,
+// Dark mode, and True Tone go through the closures. Sections use MenuFiles.
 @MainActor
 final class MenuFacade {
   private let warmth: any WarmthSource
+  private let ramp: RampEngine
   private let files: MenuFiles
   let showWarmthInBar: Bool
   private let schedule: @MainActor () -> ScheduleMode
@@ -261,10 +263,10 @@ final class MenuFacade {
   private let changeDarkMode: @MainActor (Bool) -> Void
   private let trueTone: @MainActor () -> Bool?
   private let changeTrueTone: @MainActor (Bool) -> Bool
-  private let licensed: @MainActor () -> Bool
 
   init(
     warmth: any WarmthSource,
+    ramp: RampEngine,
     files: MenuFiles,
     schedule: @escaping @MainActor () -> ScheduleMode,
     changeSchedule: @escaping @MainActor (ScheduleMode) -> Bool,
@@ -272,10 +274,10 @@ final class MenuFacade {
     changeDarkMode: @escaping @MainActor (Bool) -> Void,
     trueTone: @escaping @MainActor () -> Bool?,
     changeTrueTone: @escaping @MainActor (Bool) -> Bool,
-    licensed: @escaping @MainActor () -> Bool,
     showWarmthInBar: Bool = true
   ) {
     self.warmth = warmth
+    self.ramp = ramp
     self.files = files
     self.schedule = schedule
     self.changeSchedule = changeSchedule
@@ -283,7 +285,6 @@ final class MenuFacade {
     self.changeDarkMode = changeDarkMode
     self.trueTone = trueTone
     self.changeTrueTone = changeTrueTone
-    self.licensed = licensed
     self.showWarmthInBar = showWarmthInBar
   }
 
@@ -293,12 +294,18 @@ final class MenuFacade {
       schedule: schedule(),
       darkModeOn: darkMode(),
       trueTone: trueTone(),
-      rampLicensed: licensed(),
-      maxPercent: files.readMax() ?? 0,
-      fullAtMinute: files.readFullAt(),
+      rampLicensed: ramp.isLicensed,
+      maxPercent: ramp.settings.max?.percent ?? 0,
+      fullAtMinute: ramp.settings.fullAtClock?.value,
       collapsed: files.readCollapsed(),
       showWarmthInBar: showWarmthInBar
     )
+  }
+
+  // The 60s timer: one ramp step, then what the menu and bar should show.
+  func rampTick() -> MenuSnapshot {
+    ramp.tick()
+    return snapshot()
   }
 
   // Live drag: no snapshot, so each tick costs only the strength write.
@@ -309,15 +316,15 @@ final class MenuFacade {
   func apply(_ intent: MenuIntent) -> MenuSnapshot {
     switch intent {
     case .setWarmth(let warmth):
-      _ = self.warmth.apply(warmth)
+      ramp.applyWarmth(warmth)
     case .stageWarmth(let warmth):
       stageWarmth(warmth)
     case .setSchedule(let mode):
       _ = changeSchedule(mode)
     case .setMax(let percent):
-      applyMax(percent)
+      ramp.setMax(percent)
     case .setFullAt(let minute):
-      applyFullAt(minute)
+      ramp.setFullAt(minute)
     case .toggle(let section):
       toggle(section)
     case .setDarkMode(let on):
@@ -328,19 +335,6 @@ final class MenuFacade {
       }
     }
     return snapshot()
-  }
-
-  private func applyMax(_ percent: Int) {
-    guard licensed(), (1...100).contains(percent), files.writeMax(percent) else { return }
-    if case .on(let warmth) = self.warmth.read(), warmth.percent > percent, let capped = Warmth(percent) {
-      _ = self.warmth.apply(capped)
-    }
-  }
-
-  private func applyFullAt(_ minute: Int) {
-    let current = snapshot()
-    guard current.rampLicensed, current.schedule == .custom, (0..<1440).contains(minute) else { return }
-    _ = files.writeFullAt(minute)
   }
 
   private func toggle(_ section: MenuSection) {

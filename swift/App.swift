@@ -5,7 +5,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
   private let menuFacade: MenuFacade?
   private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
   private var panel: MenuPanel?
-  // §3 rampTick hook. Filled by RampController; stub lands first so §2 can layer hotkeys.
   private var rampTimer: Timer?
   // True while Color temp is mid-drag (stageWarmth). Blocks hotkey holds.
   private var warmthDragging = false
@@ -75,7 +74,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
   }
 
   private func rampTick() {
-    // Stub: RampController.tick goes here in the rest of §3.
+    guard let menuFacade else { return }
+    show(menuFacade.rampTick())
   }
 
   func menuWillOpen(_ menu: NSMenu) {
