@@ -30,11 +30,11 @@ func reading(strength: Int?, enabled: Bool?) -> WarmthReading {
 }
 
 // Where readings come from: NightShiftClient in the app, a fake in the tests.
+// Committing warmth goes through RampEngine.applyWarmth, never here.
 @MainActor
 protocol WarmthSource {
   func read() -> WarmthReading
-  func apply(_ warmth: Warmth) -> WarmthReading
-  // Live drag: set strength only, no readback. Release still goes through apply.
+  // Live drag: set strength only, no readback. Release goes through the ramp.
   func stage(_ warmth: Warmth)
 }
 
@@ -42,13 +42,6 @@ protocol WarmthSource {
 @MainActor
 func currentReading(_ source: (any WarmthSource)?) -> WarmthReading {
   source?.read() ?? .unavailable
-}
-
-// A released slider applies its value; nil when there is nothing to apply.
-@MainActor
-func applyReleased(_ percent: Int, to source: (any WarmthSource)?) -> WarmthReading? {
-  guard let source, let warmth = Warmth(percent) else { return nil }
-  return source.apply(warmth)
 }
 
 // The slider for a reading. A nil value leaves the slider where it is.

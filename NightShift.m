@@ -76,6 +76,15 @@ BOOL stageStrength(CBBlueLightClient *client, long value) {
   return [client setStrength:(float)value / 100.0f commit:YES];
 }
 
+// Uncommitted strength: the screen follows it while a mouse button is held,
+// which a committed write does not. A later applyStrength saves the value.
+BOOL previewStrength(CBBlueLightClient *client, long value) {
+  if (value < 0 || value > 100) {
+    return NO;
+  }
+  return [client setStrength:(float)value / 100.0f commit:NO];
+}
+
 BOOL readStatus(CBBlueLightClient *client, BLStatus *status) {
   if (!methodMatches(client, @selector(getBlueLightStatus:),
                      "B24@0:8^{?=BBBi{?={?=ii}{?=ii}}QB}16")) {

@@ -33,14 +33,18 @@ check(sliderState(for: .off) == SliderState(isEnabled: true, value: 0), "off mov
 check(sliderState(for: .unreadable) == SliderState(isEnabled: false, value: nil), "a failed read disables the slider and leaves it")
 check(sliderState(for: .unavailable) == SliderState(isEnabled: false, value: nil), "a missing client disables the slider and leaves it")
 
-// Stands in for NightShiftClient: reads what it holds, and an apply that
-// fails leaves it unchanged, as a failed applyStrength does.
+// Stands in for NightShiftClient on the menu side: one object that the menu
+// reads and stages through and the ramp writes through, as in the app. A write
+// that fails leaves it unchanged, as a failed applyStrength does. Schedule and
+// license come from FakeControls so the menu and the ramp agree. The Custom
+// window is 9:00-12:00 and it is 13:00, outside it.
 @MainActor
-final class FakeSource: WarmthSource {
+final class FakeSource: WarmthSource, RampHardware {
   var held: WarmthReading
   var applyWorks = true
   var applied: [Int] = []
   var staged: [Int] = []
+  weak var controls: FakeControls?
 
   init(_ held: WarmthReading) {
     self.held = held
@@ -50,32 +54,40 @@ final class FakeSource: WarmthSource {
     held
   }
 
-  func apply(_ warmth: Warmth) -> WarmthReading {
-    applied.append(warmth.percent)
-    if applyWorks {
-      held = .on(warmth)
-    }
-    return read()
-  }
-
   func stage(_ warmth: Warmth) {
     staged.append(warmth.percent)
     held = .on(warmth)
   }
+
+  func nightShift() -> NightShiftStatus? {
+    let mode = controls?.schedule ?? .off
+    let window = mode == .custom ? ScheduleWindow(start: Minute(9 * 60)!, end: Minute(12 * 60)!) : nil
+    if case .on = held { return NightShiftStatus(mode: mode, window: window, enabled: true) }
+    return NightShiftStatus(mode: mode, window: window, enabled: false)
+  }
+
+  func strength() -> Int? {
+    switch held {
+    case .on(let warmth): warmth.percent
+    case .off: 0
+    case .unreadable, .unavailable: nil
+    }
+  }
+
+  func write(_ warmth: Warmth) -> Int? {
+    applied.append(warmth.percent)
+    guard applyWorks else { return nil }
+    held = warmth.percent >= 1 ? .on(warmth) : .off
+    return warmth.percent
+  }
+
+  func arm() -> Bool { true }
+  func licensed() -> Bool { controls?.licensed ?? false }
+  func minuteNow() -> Minute? { Minute(13 * 60) }
 }
 
 check(currentReading(nil) == .unavailable, "no client reads as unavailable")
 check(currentReading(FakeSource(.off)) == .off, "a client's reading is shown as it is")
-check(applyReleased(50, to: nil) == nil, "a release with no client does nothing")
-let outOfRange = FakeSource(.off)
-check(applyReleased(101, to: outOfRange) == nil && outOfRange.applied.isEmpty, "a value outside 0...100 is never applied")
-let works = FakeSource(.off)
-check(applyReleased(60, to: works) == .on(Warmth(60)!) && works.applied == [60], "a release applies once and shows the new warmth")
-let fails = FakeSource(.on(Warmth(30)!))
-fails.applyWorks = false
-let afterFail = applyReleased(60, to: fails)
-check(afterFail == .on(Warmth(30)!) && fails.applied == [60], "a failed apply shows the warmth actually held")
-check(afterFail.map { sliderState(for: $0) } == SliderState(isEnabled: true, value: 30), "a failed apply moves the slider back")
 
 check(statusItemTitle(for: .on(Warmth(12)!), showWarmthInBar: true) == "12%", "the bar shows 12%")
 check(statusItemTitle(for: .off, showWarmthInBar: true) == "Off", "the bar shows Off")
@@ -133,8 +145,10 @@ final class FakeControls {
   var tones: [Bool] = []
 
   func facade(files: MenuFiles, warmth: FakeSource, showWarmthInBar: Bool = true) -> MenuFacade {
-    MenuFacade(
+    warmth.controls = self
+    return MenuFacade(
       warmth: warmth,
+      ramp: RampEngine(hardware: warmth, files: files, notify: { _ in }),
       files: files,
       schedule: { self.schedule },
       changeSchedule: { mode in
@@ -154,7 +168,6 @@ final class FakeControls {
         self.tone = on
         return true
       },
-      licensed: { self.licensed },
       showWarmthInBar: showWarmthInBar
     )
   }
@@ -194,7 +207,7 @@ func menuTests() {
   check(controls.facade(files: files, warmth: source, showWarmthInBar: false).snapshot().showWarmthInBar == false, "warmth in the bar can be off")
 
   let warmed = facade.apply(.setWarmth(Warmth(60)!))
-  check(warmed.warmth == .on(Warmth(60)!) && source.applied == [60], "the warmth slider applies through WarmthSource")
+  check(warmed.warmth == .on(Warmth(60)!) && source.applied == [60], "a release applies once through the ramp and shows the new warmth")
   facade.stageWarmth(Warmth(55)!)
   facade.stageWarmth(Warmth(58)!)
   check(source.staged == [55, 58] && source.applied == [60], "a live drag stages without a full apply")
@@ -250,6 +263,13 @@ func menuTests() {
   check(both.collapsed == [.ramp, .appearance], "appearance collapses too")
   let opened = facade.apply(.toggle(.ramp))
   check(opened.collapsed == [.appearance], "ramp opens again")
+
+  let fails = FakeSource(.on(Warmth(30)!))
+  fails.applyWorks = false
+  let afterFail = controls.facade(files: files, warmth: fails).apply(.setWarmth(Warmth(60)!))
+  check(afterFail.warmth == .on(Warmth(30)!) && fails.applied == [60], "a failed apply shows the warmth actually held")
+  check(sliderState(for: afterFail.warmth) == SliderState(isEnabled: true, value: 30), "a failed apply moves the slider back")
+
   let reread = controls.facade(files: files, warmth: source).snapshot()
   check(reread.collapsed == [.appearance], "collapse is read back from the Swift folder")
   check(!reread.collapsed.contains(.ramp), "an open ramp is not listed")
@@ -299,6 +319,146 @@ do {
 check(WarmthHold.stepped(from: 98, direction: 1) == 100, "98 + 5 clamps to 100")
 check(WarmthHold.stepped(from: 100, direction: 1) == 100, "100 raise stays 100")
 check(WarmthHold.stepped(from: 2, direction: -1) == 0, "2 - 5 clamps to 0")
+
+// Stands in for NightShiftClient. A failed write leaves strength and enabled
+// as they were, as a failed applyStrength does.
+@MainActor
+final class FakeHardware: RampHardware {
+  var mode = ScheduleMode.custom
+  var start = 21 * 60
+  var end = 7 * 60
+  var enabled = true
+  var current: Int? = 1
+  var now = 21 * 60
+  var isLicensed = true
+  var writeWorks = true
+  var writes: [Int] = []
+  var arms = 0
+
+  func nightShift() -> NightShiftStatus? {
+    let window = mode == .custom ? ScheduleWindow(start: Minute(start)!, end: Minute(end)!) : nil
+    return NightShiftStatus(mode: mode, window: window, enabled: enabled)
+  }
+
+  func strength() -> Int? { current }
+
+  func write(_ warmth: Warmth) -> Int? {
+    guard writeWorks else { return nil }
+    writes.append(warmth.percent)
+    current = warmth.percent
+    enabled = warmth.percent >= 1
+    return warmth.percent
+  }
+
+  func arm() -> Bool {
+    arms += 1
+    current = 1
+    return true
+  }
+
+  func licensed() -> Bool { isLicensed }
+  func minuteNow() -> Minute? { Minute(now) }
+}
+
+@MainActor
+func rampTests() {
+  let root = FileManager.default.temporaryDirectory
+    .appendingPathComponent("nightshift-swift-ramp-\(UUID().uuidString)", isDirectory: true)
+  defer { try? FileManager.default.removeItem(at: root) }
+  let files = MenuFiles(
+    maxURL: root.appendingPathComponent("max"),
+    fullURL: root.appendingPathComponent("full"),
+    sectionsURL: root.appendingPathComponent("sections")
+  )
+
+  let hw = FakeHardware()
+  var notices: [RampNotice] = []
+  let ramp = RampEngine(hardware: hw, files: files, notify: { notices.append($0) })
+
+  hw.enabled = false
+  hw.current = 0
+  hw.now = 20 * 60 + 57
+  ramp.tick()
+  check(hw.arms == 0, "3 minutes before turn-on does not arm")
+  hw.now = 20 * 60 + 58
+  ramp.tick()
+  check(hw.arms == 1 && hw.current == 1, "2 minutes before turn-on arms 1%")
+  check(!hw.enabled && hw.writes.isEmpty, "arming stages strength only, Night Shift stays off")
+  hw.now = 20 * 60 + 59
+  ramp.tick()
+  check(hw.arms == 1, "arming runs once per turn-on")
+
+  check(ramp.setMax(60) == .saved && files.readMax() == 60, "max 60 outside the window is saved")
+  check(hw.writes.isEmpty, "a max outside the window with Night Shift off writes no warmth")
+
+  hw.enabled = true
+  hw.now = 21 * 60 + 5
+  ramp.tick()
+  let evening = ramp.phase.glide
+  check(evening?.fromMinute == Minute(21 * 60) && evening?.fromValue == 1, "the evening glide starts at turn-on from 1%")
+  check(evening?.toMinute == Minute(23 * 60), "default Full at is start + 120")
+  check(hw.writes == [3], "21:05 writes 1 + 59*5/120 = 3")
+  hw.now = 22 * 60
+  ramp.tick()
+  check(hw.writes == [3, 30], "the 22:00 midpoint writes 1 + 59*60/120 = 30")
+
+  hw.current = 45
+  hw.now = 22 * 60 + 1
+  ramp.tick()
+  let drifted = ramp.phase.glide
+  check(drifted?.fromMinute == Minute(22 * 60 + 1) && drifted?.fromValue == 45, "a manual 45% retargets from now at 45")
+  check(drifted?.toMinute == Minute(23 * 60), "the retargeted glide still arrives at Full at")
+  check(hw.writes == [3, 30], "a drift tick writes nothing")
+  check(ramp.settings.max == Warmth(60), "a manual warmth below max leaves max")
+
+  let beforeFailedApply = ramp.phase
+  hw.writeWorks = false
+  check(!ramp.applyWarmth(Warmth(70)!), "a failed user write reports failure")
+  check(ramp.phase == beforeFailedApply && ramp.settings.max == Warmth(60), "a failed user write leaves phase and max")
+  hw.writeWorks = true
+  hw.now = 22 * 60 + 2
+  ramp.tick()
+  check(ramp.phase.glide?.fromMinute == Minute(22 * 60 + 1), "a failed user write leaves applied, so the next tick is no drift")
+  check(hw.writes == [3, 30], "22:02 is still 45 + 15*1/59 = 45, so nothing is written")
+
+  hw.writeWorks = false
+  hw.now = 22 * 60 + 31
+  let beforeFailedTick = hw.writes
+  ramp.tick()
+  check(hw.writes == beforeFailedTick, "a failed tick write records nothing")
+  hw.writeWorks = true
+  hw.now = 22 * 60 + 32
+  ramp.tick()
+  check(ramp.phase.glide?.fromMinute == Minute(22 * 60 + 1), "a failed tick write does not drift-retarget")
+  check(hw.writes == [3, 30, 52], "the tick after a failed write glides on: 45 + 15*31/59 = 52")
+
+  hw.current = 80
+  hw.now = 22 * 60 + 33
+  ramp.tick()
+  check(ramp.settings.max == Warmth(80) && files.readMax() == 80, "a manual warmth above max raises max")
+  check(ramp.phase.glide?.toMinute == Minute(22 * 60 + 33), "drift to max holds at max")
+
+  hw.enabled = false
+  hw.current = 0
+  hw.now = 8 * 60
+  ramp.tick()
+  check(ramp.phase == .idle, "leaving the window clears the glide")
+  try? FileManager.default.removeItem(at: files.fullURL)
+  notices = []
+  check(ramp.setFullAt(7 * 60 + 30) == .refusedOutsideSchedule, "7:30 at 8:00 is outside 21:00-7:00 and refused")
+  check(files.readFullAt() == nil && ramp.settings.fullAtClock == nil, "a refused Full at writes no file")
+  check(notices == [.outsideSchedule], "a refused Full at says why")
+  check(ramp.setFullAt(23 * 60) == .saved && files.readFullAt() == 23 * 60, "23:00 at 8:00 is inside the schedule and saved")
+  check(ramp.setFullAt(20 * 60) == .early && files.readFullAt() == 20 * 60, "20:00 at 8:00 comes before turn-on: early glide")
+  if case .early = ramp.phase {} else { check(false, "Full at before turn-on is an early phase") }
+  hw.mode = .sunsetToSunrise
+  check(ramp.setFullAt(22 * 60) == .needsCustomSchedule && files.readFullAt() == 20 * 60, "Full at needs a Custom schedule")
+  hw.mode = .custom
+  hw.isLicensed = false
+  check(ramp.setFullAt(22 * 60) == .locked && ramp.setMax(30) == .locked, "an unlicensed ramp changes nothing")
+}
+
+rampTests()
 
 if failures > 0 {
   exit(1)
