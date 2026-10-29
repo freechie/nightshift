@@ -49,8 +49,25 @@ final class NightShiftClient: WarmthSource {
       darkMode: { nsSwiftDarkMode() },
       changeDarkMode: { nsSwiftSetDarkMode($0) },
       trueTone: { self.readTrueTone() },
-      changeTrueTone: { nsSwiftSetTrueTone($0) }
+      changeTrueTone: { nsSwiftSetTrueTone($0) },
+      hours: { self.scheduleHoursText() }
     )
+  }
+
+  func scheduleHoursText() -> String {
+    var status = BLStatus()
+    guard readStatus(client, &status), let mode = ScheduleMode(rawValue: Int(status.mode)) else {
+      return "—"
+    }
+    if mode == .custom {
+      let from = Int(status.schedule.from.hour) * 60 + Int(status.schedule.from.minute)
+      let to = Int(status.schedule.to.hour) * 60 + Int(status.schedule.to.minute)
+      return "\(clockString(Int32(from)) ?? "") – \(clockString(Int32(to)) ?? "")"
+    }
+    if mode == .sunsetToSunrise {
+      return "Sunset – Sunrise"
+    }
+    return "—"
   }
 
   private func readScheduleMode() -> ScheduleMode {

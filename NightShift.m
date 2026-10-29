@@ -1383,6 +1383,135 @@ int rampBeginPurchase(NSString **openURL, BOOL *portal, NSString **stdoutLine,
   return 1;
 }
 
+static NSString *seatError(NSInteger status, NSData *body, NSString *fallback) {
+  id parsed = body != nil ? [NSJSONSerialization JSONObjectWithData:body options:0 error:NULL] : nil;
+  NSString *error = nil;
+  if ([parsed isKindOfClass:[NSDictionary class]]) {
+    id value = ((NSDictionary *)parsed)[@"error"];
+    if ([value isKindOfClass:[NSString class]]) {
+      error = value;
+    }
+  }
+  if ([error isEqual:@"full"]) {
+    return @"This purchase covers 3 Macs.";
+  }
+  if ([error isEqual:@"grant"]) {
+    return @"This license can't add a Mac.";
+  }
+  if ([error isEqual:@"code"]) {
+    return @"That code was not accepted.";
+  }
+  if ([error isEqual:@"claimed"]) {
+    return @"This Mac already has a license. Contact support.";
+  }
+  if ([error isEqual:@"licensed"]) {
+    return @"This Mac already has a license.";
+  }
+  if ([error isEqual:@"unlicensed"]) {
+    return @"This Mac has no active purchase.";
+  }
+  if (status < 0 || status == 0 || status == 503) {
+    return @"could not reach the license server";
+  }
+  return fallback;
+}
+
+int rampMintSeatCode(NSString **codeOut, NSString **stderrLine) {
+  if (codeOut != NULL) {
+    *codeOut = nil;
+  }
+  if (stderrLine != NULL) {
+    *stderrLine = nil;
+  }
+  NSString *installID = rampInstallID();
+  NSString *origin = rampServerOrigin();
+  if (installID == nil || origin == nil) {
+    if (stderrLine != NULL) {
+      *stderrLine = @"could not reach the license server";
+    }
+    return 2;
+  }
+  NSData *json = [NSJSONSerialization dataWithJSONObject:@{@"install_id" : installID}
+                                                 options:0
+                                                   error:NULL];
+  NSInteger status = 0;
+  NSData *received = httpJSON(@"POST", [origin stringByAppendingString:@"/seats/code"], json,
+                              rampInstallSecret(), &status, NULL);
+  if (status == 200 && received != nil) {
+    id parsed = [NSJSONSerialization JSONObjectWithData:received options:0 error:NULL];
+    NSString *code = [parsed isKindOfClass:[NSDictionary class]] ? ((NSDictionary *)parsed)[@"code"] : nil;
+    if ([code isKindOfClass:[NSString class]] && code.length > 0) {
+      if (codeOut != NULL) {
+        *codeOut = code;
+      }
+      return 0;
+    }
+  }
+  if (stderrLine != NULL) {
+    *stderrLine = seatError(status, received, @"could not add a Mac");
+  }
+  return 2;
+}
+
+int rampRedeemSeatCode(NSString *code, NSString **stdoutLine, NSString **stderrLine) {
+  if (stdoutLine != NULL) {
+    *stdoutLine = nil;
+  }
+  if (stderrLine != NULL) {
+    *stderrLine = nil;
+  }
+  NSString *trimmed = [[code stringByTrimmingCharactersInSet:
+                                 [NSCharacterSet whitespaceAndNewlineCharacterSet]] lowercaseString];
+  NSString *installID = rampInstallID();
+  NSString *origin = rampServerOrigin();
+  if (installID == nil || origin == nil || trimmed.length == 0) {
+    if (stderrLine != NULL) {
+      *stderrLine = trimmed.length == 0 ? @"That code was not accepted."
+                                        : @"could not reach the license server";
+    }
+    return 2;
+  }
+  NSData *json = [NSJSONSerialization dataWithJSONObject:@{
+    @"install_id" : installID,
+    @"code" : trimmed,
+  }
+                                                 options:0
+                                                   error:NULL];
+  NSInteger status = 0;
+  NSData *received = httpJSON(@"POST", [origin stringByAppendingString:@"/seats"], json,
+                              rampInstallSecret(), &status, NULL);
+  if (status != 200 || received == nil) {
+    if (stderrLine != NULL) {
+      *stderrLine = seatError(status, received, @"That code was not accepted.");
+    }
+    return 2;
+  }
+  id parsed = [NSJSONSerialization JSONObjectWithData:received options:0 error:NULL];
+  NSString *token = [parsed isKindOfClass:[NSDictionary class]] ? ((NSDictionary *)parsed)[@"token"] : nil;
+  if (![token isKindOfClass:[NSString class]] || !rampLicenseAllows(token)) {
+    if (stderrLine != NULL) {
+      *stderrLine = @"that license was rejected";
+    }
+    return 2;
+  }
+  if (tokenOlderThanSaved(token)) {
+    if (stderrLine != NULL) {
+      *stderrLine = [NSString stringWithFormat:@"kept the license through %@", rampLicenseUntil()];
+    }
+    return 2;
+  }
+  if (!rampSaveNewerLicense(token)) {
+    if (stderrLine != NULL) {
+      *stderrLine = @"could not save the license";
+    }
+    return 2;
+  }
+  if (stdoutLine != NULL) {
+    *stdoutLine = unlockedLine();
+  }
+  return 0;
+}
+
 NSString *clockString(int minute) {
   if (minute < 0 || minute >= 1440) {
     return @"";

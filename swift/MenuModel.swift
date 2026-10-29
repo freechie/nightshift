@@ -49,7 +49,7 @@ struct MenuSnapshot: Equatable {
     rampLicensed: false,
     maxPercent: 0,
     fullAtMinute: nil,
-    collapsed: [],
+    collapsed: [.appearance],
     showWarmthInBar: true
   )
 }
@@ -77,6 +77,120 @@ func shouldStaySnapped(raw: Int, snapped: Bool, mid: Int = 50, enter: Int = 2, e
 
 // The status item next to the icon. N% or Off, and nothing when the reading
 // cannot be one of those. showWarmthInBar defaults on; off leaves the title empty.
+// The shared menubar file. A missing warmth line stays shown, which is this
+// app's default. An explicit "warmth off" hides the percent.
+func menuBarWarmthShown() -> Bool {
+  let url = URL(fileURLWithPath: NSHomeDirectory() + "/Library/Application Support/nightshift/menubar")
+  let text = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+  return menuBarWarmthShown(in: text)
+}
+
+func menuBarSetWarmthShown(_ shown: Bool) -> Bool {
+  menuBarSet("warmth", shown ? "on" : "off")
+}
+
+func barTint() -> BarTint {
+  let url = URL(fileURLWithPath: NSHomeDirectory() + "/Library/Application Support/nightshift/menubar")
+  let text = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+  return barTint(in: text)
+}
+
+func menuBarSetTint(_ tint: BarTint) -> Bool {
+  menuBarSet("tint", barTintText(tint))
+}
+
+private func menuBarSet(_ key: String, _ value: String) -> Bool {
+  let url = URL(fileURLWithPath: NSHomeDirectory() + "/Library/Application Support/nightshift/menubar")
+  let existing = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+  let text = menuBarText(setting: key, value: value, in: existing)
+  do {
+    try FileManager.default.createDirectory(
+      at: url.deletingLastPathComponent(),
+      withIntermediateDirectories: true
+    )
+    try Data(text.utf8).write(to: url, options: .atomic)
+    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+    return true
+  } catch {
+    return false
+  }
+}
+
+func menuBarWarmthShown(in text: String) -> Bool {
+  guard let value = menuBarPrefs(in: text)["warmth"] else { return true }
+  return value == "on"
+}
+
+func menuBarText(settingWarmth shown: Bool, in existing: String) -> String {
+  menuBarText(setting: "warmth", value: shown ? "on" : "off", in: existing)
+}
+
+// Accent follows System Settings. A primary is one of the system colors.
+// Custom is the color from the macOS color picker, stored as rrggbb.
+enum BarPrimary: String, Equatable, CaseIterable {
+  case blue, purple, pink, red, orange, yellow, green, graphite
+}
+
+enum BarTint: Equatable {
+  case accent
+  case primary(BarPrimary)
+  case custom(red: Int, green: Int, blue: Int)
+}
+
+func barTint(in text: String) -> BarTint {
+  guard let value = menuBarPrefs(in: text)["tint"] else { return .accent }
+  return barTint(parsing: value)
+}
+
+func rgb(hex: String) -> (Int, Int, Int)? {
+  guard hex.count == 6, let value = Int(hex, radix: 16), value >= 0, value <= 0xFFFFFF else { return nil }
+  return ((value >> 16) & 0xFF, (value >> 8) & 0xFF, value & 0xFF)
+}
+
+func barTint(parsing value: String) -> BarTint {
+  let text = value.trimmingCharacters(in: .whitespaces).lowercased()
+  if text == "accent" { return .accent }
+  if let primary = BarPrimary(rawValue: text) { return .primary(primary) }
+  let parts = text.split(separator: " ").map(String.init)
+  if parts.count == 2, parts[0] == "custom", let color = rgb(hex: parts[1]) {
+    return .custom(red: color.0, green: color.1, blue: color.2)
+  }
+  return .accent
+}
+
+func barTintText(_ tint: BarTint) -> String {
+  switch tint {
+  case .accent:
+    "accent"
+  case .primary(let primary):
+    primary.rawValue
+  case .custom(let red, let green, let blue):
+    String(format: "custom %02x%02x%02x", red, green, blue)
+  }
+}
+
+func menuBarText(settingTint tint: BarTint, in existing: String) -> String {
+  menuBarText(setting: "tint", value: barTintText(tint), in: existing)
+}
+
+func menuBarPrefs(in text: String) -> [String: String] {
+  var prefs: [String: String] = [:]
+  for line in text.split(separator: "\n") {
+    let parts = line.split(separator: " ", maxSplits: 1).map(String.init)
+    guard parts.count == 2 else { continue }
+    let value = parts[1].trimmingCharacters(in: .whitespaces)
+    guard !parts[0].isEmpty, !value.isEmpty else { continue }
+    prefs[parts[0]] = value
+  }
+  return prefs
+}
+
+func menuBarText(setting key: String, value: String, in existing: String) -> String {
+  var prefs = menuBarPrefs(in: existing)
+  prefs[key] = value
+  return prefs.keys.sorted().map { "\($0) \(prefs[$0]!)\n" }.joined()
+}
+
 func statusItemTitle(for reading: WarmthReading, showWarmthInBar: Bool) -> String {
   guard showWarmthInBar else { return "" }
   switch reading {
@@ -219,7 +333,9 @@ struct MenuFiles {
   }
 
   func readCollapsed() -> Set<MenuSection> {
-    guard let text = try? String(contentsOf: sectionsURL, encoding: .utf8) else { return [] }
+    guard let text = try? String(contentsOf: sectionsURL, encoding: .utf8) else {
+      return FileManager.default.fileExists(atPath: sectionsURL.path) ? [] : [.appearance]
+    }
     return collapsedSections(in: text)
   }
 
@@ -256,13 +372,14 @@ final class MenuFacade {
   private let warmth: any WarmthSource
   private let ramp: RampEngine
   private let files: MenuFiles
-  let showWarmthInBar: Bool
+  var showWarmthInBar: Bool
   private let schedule: @MainActor () -> ScheduleMode
   private let changeSchedule: @MainActor (ScheduleMode) -> Bool
   private let darkMode: @MainActor () -> Bool
   private let changeDarkMode: @MainActor (Bool) -> Void
   private let trueTone: @MainActor () -> Bool?
   private let changeTrueTone: @MainActor (Bool) -> Bool
+  private let hours: @MainActor () -> String
 
   init(
     warmth: any WarmthSource,
@@ -274,6 +391,7 @@ final class MenuFacade {
     changeDarkMode: @escaping @MainActor (Bool) -> Void,
     trueTone: @escaping @MainActor () -> Bool?,
     changeTrueTone: @escaping @MainActor (Bool) -> Bool,
+    hours: @escaping @MainActor () -> String = { "—" },
     showWarmthInBar: Bool = true
   ) {
     self.warmth = warmth
@@ -285,8 +403,11 @@ final class MenuFacade {
     self.changeDarkMode = changeDarkMode
     self.trueTone = trueTone
     self.changeTrueTone = changeTrueTone
+    self.hours = hours
     self.showWarmthInBar = showWarmthInBar
   }
+
+  func scheduleHours() -> String { hours() }
 
   func snapshot() -> MenuSnapshot {
     MenuSnapshot(
@@ -346,4 +467,33 @@ final class MenuFacade {
     }
     _ = files.writeCollapsed(collapsed)
   }
+}
+
+func updateNotice(local: String, remoteTag: String) -> String {
+  let remote = updateVersion(remoteTag)
+  if remote.isEmpty { return "Couldn't check for updates." }
+  if updateVersionIsNewer(remote, than: updateVersion(local)) {
+    return "Version \(remote) is available."
+  }
+  return "You're up to date."
+}
+
+private func updateVersion(_ text: String) -> String {
+  var value = text.trimmingCharacters(in: .whitespacesAndNewlines)
+  if value.first == "v" || value.first == "V" {
+    value.removeFirst()
+  }
+  return value
+}
+
+private func updateVersionIsNewer(_ remote: String, than local: String) -> Bool {
+  let left = remote.split(separator: ".").map { Int($0) ?? 0 }
+  let right = local.split(separator: ".").map { Int($0) ?? 0 }
+  let count = max(left.count, right.count)
+  for index in 0..<count {
+    let newer = index < left.count ? left[index] : 0
+    let here = index < right.count ? right[index] : 0
+    if newer != here { return newer > here }
+  }
+  return false
 }

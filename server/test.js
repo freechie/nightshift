@@ -1530,5 +1530,95 @@ await check(".env.example carries no secrets", () => {
   assert.ok(found.length === 0, `.env.example: ${found.join("; ")}`);
 });
 
+// One purchase covers 3 Macs. The paying install stays the subscription
+// index. Other Macs redeem a single-use code and get their own token.
+const S1 = "51111111-1111-4111-8111-111111111111";
+const S2 = "52222222-2222-4222-8222-222222222222";
+const S3 = "53333333-3333-4333-8333-333333333333";
+const CX = "55555555-5555-4555-8555-555555555555";
+const GX = "56666666-6666-4666-8666-666666666666";
+async function seats(path, installId, headerSecret, extra = {}) {
+  const headers = { "Content-Type": "application/json" };
+  if (headerSecret) {
+    headers["X-Nightshift-Secret"] = headerSecret;
+  }
+  const response = await fetch(`${base}${path}`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ install_id: installId, ...extra }),
+  });
+  const text = await response.text();
+  let body = null;
+  if (text) {
+    body = JSON.parse(text);
+  }
+  return { status: response.status, body };
+}
+await check("a second Mac rides the paying Mac's purchase", async () => {
+  subscriptions.sub_s1 = {
+    status: "active",
+    metadata: { install_id: S1, secret_hash: sha(secretFor(S1)) },
+    customer: "cus_5111",
+  };
+  await webhook(paid(S1, "sub_s1", unix(2028, 6, 1)));
+  assert.equal((await license(S1)).status, 200);
+
+  const granted = app.grantLicense(GX, "2028-01-01");
+  const grantMint = await seats("/seats/code", GX, granted.secret);
+  assert.equal(grantMint.status, 409);
+  assert.equal(grantMint.body.error, "grant");
+
+  assert.equal((await seats("/seats/code", S1, null)).status, 204);
+  assert.equal((await seats("/seats/code", S1, "0".repeat(64))).status, 204);
+
+  const minted = await seats("/seats/code", S1, secretFor(S1));
+  assert.equal(minted.status, 200);
+  assert.match(minted.body.code, /^[0-9a-f]{10}$/);
+  assert.equal(minted.body.cap, 3);
+  const code = minted.body.code;
+  const stored = JSON.parse(readFileSync(process.env.NIGHTSHIFT_LICENSE_STORE, "utf8"));
+  assert.equal(stored.subscriptions.sub_s1, S1);
+  assert.ok(!JSON.stringify(stored.seat_codes).includes(code));
+
+  saveLicense(CX, { secret_hash: sha("ab".repeat(32)), secret_source: "purchase" });
+  const claimed = await seats("/seats", CX, secretFor(CX), { code });
+  assert.equal(claimed.status, 409);
+  assert.equal(claimed.body.error, "claimed");
+
+  assert.equal((await seats("/seats", S2, secretFor(S2), { code: "nope" })).status, 404);
+  const joined = await seats("/seats", S2, secretFor(S2), { code });
+  assert.equal(joined.status, 200);
+  assert.equal(joined.body.until, "2028-06-01");
+  assert.ok(verifies(joined.body.token, `ramp:${S2}:2028-06-01`));
+  assert.equal((await seats("/seats", S3, secretFor(S3), { code })).status, 404);
+  assert.equal((await license(S2)).status, 200);
+  assert.equal((await license(S2, secretFor(S1))).status, 204);
+
+  const again = await seats("/seats/code", S1, secretFor(S1));
+  const third = await seats("/seats", S3, secretFor(S3), { code: again.body.code });
+  assert.equal(third.status, 200);
+  assert.ok(verifies(third.body.token, `ramp:${S3}:2028-06-01`));
+  const full = await seats("/seats/code", S2, secretFor(S2));
+  assert.equal(full.status, 409);
+  assert.equal(full.body.error, "full");
+  assert.equal(full.body.cap, 3);
+
+  const after = JSON.parse(readFileSync(process.env.NIGHTSHIFT_LICENSE_STORE, "utf8"));
+  assert.equal(after.subscriptions.sub_s1, S1);
+  assert.equal(after.installs[S2].seat, "cus_5111");
+  assert.equal(after.installs[S2].subscription, undefined);
+
+  await webhook(paid(S1, "sub_s1", unix(2029, 6, 1)));
+  const renewed = await license(S2);
+  assert.equal(renewed.body.until, "2029-06-01");
+  assert.ok(verifies(renewed.body.token, `ramp:${S2}:2029-06-01`));
+  assert.equal((await license(S3)).body.until, "2029-06-01");
+
+  await webhook(deleted(S1, "sub_s1"));
+  assert.equal((await license(S1)).status, 204);
+  assert.equal((await license(S2)).status, 204);
+  assert.equal((await license(S3)).status, 204);
+});
+
 server.close();
 console.log(`server ok (${passed} checks)`);
