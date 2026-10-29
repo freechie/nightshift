@@ -385,6 +385,10 @@ static void checkWorkspaceOpens(void) {
   CHECK(workspaceOK("https://github.com/freechie/nightshift", false));
   CHECK(workspaceOK("https://github.com/freechie/nightshift/issues", false));
   CHECK(!workspaceOK("https://github.com/freechie/nightshift/issues/1", false));
+  CHECK(workspaceOK("https://freechie.github.io/nightshift/acknowledgements.html", false));
+  CHECK(workspaceOK("https://freechie.github.io/nightshift/privacy.html", false));
+  CHECK(workspaceOK("https://freechie.github.io/nightshift/terms.html", false));
+  CHECK(!workspaceOK("https://freechie.github.io/nightshift/privacy", false));
   CHECK(!workspaceOK("https://github.com/freechie/nightshift/", false));
   CHECK(!workspaceOK("https://GitHub.com/freechie/nightshift", false));
   // Accessibility settings are no longer opened: the hotkeys need no tap.

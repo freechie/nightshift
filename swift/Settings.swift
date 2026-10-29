@@ -1090,9 +1090,9 @@ final class SettingsController: NSObject, NSWindowDelegate, NSToolbarDelegate {
       name,
       versionLabel,
       variant,
-      aboutPlaceholder("Acknowledgements"),
-      aboutPlaceholder("Privacy Policy"),
-      aboutPlaceholder("Terms of Service"),
+      aboutLink("Acknowledgements", "https://freechie.github.io/nightshift/acknowledgements.html"),
+      aboutLink("Privacy Policy", "https://freechie.github.io/nightshift/privacy.html"),
+      aboutLink("Terms of Service", "https://freechie.github.io/nightshift/terms.html"),
     ])
     words.orientation = .vertical
     words.alignment = .leading
@@ -1374,8 +1374,9 @@ final class SettingsController: NSObject, NSWindowDelegate, NSToolbarDelegate {
     return box
   }
 
-  private func aboutPlaceholder(_ title: String) -> NSButton {
-    let button = NSButton(title: title, target: self, action: #selector(aboutNowhere(_:)))
+  private func aboutLink(_ title: String, _ url: String) -> NSButton {
+    let button = NSButton(title: title, target: self, action: #selector(openLink(_:)))
+    button.identifier = NSUserInterfaceItemIdentifier(url)
     button.isBordered = false
     button.attributedTitle = NSAttributedString(
       string: title,
