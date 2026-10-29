@@ -839,6 +839,9 @@ bool nsWorkspaceOpenAllowed(const char *url, size_t length, bool allowLoopbackHT
       "x-apple.systempreferences:com.apple.Notifications-Settings.extension",
       "https://github.com/freechie/nightshift",
       "https://github.com/freechie/nightshift/issues",
+      "https://freechie.github.io/nightshift/acknowledgements.html",
+      "https://freechie.github.io/nightshift/privacy.html",
+      "https://freechie.github.io/nightshift/terms.html",
   };
   for (size_t i = 0; i < sizeof pages / sizeof pages[0]; i++) {
     size_t n = strlen(pages[i]);
