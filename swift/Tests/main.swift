@@ -95,6 +95,28 @@ check(statusItemTitle(for: .on(Warmth(0)!), showWarmthInBar: true) == "0%", "the
 check(statusItemTitle(for: .unreadable, showWarmthInBar: true) == "", "a failed read leaves the bar untitled")
 check(statusItemTitle(for: .unavailable, showWarmthInBar: true) == "", "a missing client leaves the bar untitled")
 check(statusItemTitle(for: .on(Warmth(12)!), showWarmthInBar: false) == "", "the bar title stays empty when warmth in the bar is off")
+check(menuBarWarmthShown(in: "") && menuBarWarmthShown(in: "icon horizon\n"), "a menubar file without warmth stays shown")
+check(menuBarWarmthShown(in: "warmth off\n") == false, "warmth off hides the bar percent")
+check(menuBarText(settingWarmth: false, in: "icon horizon\n") == "icon horizon\nwarmth off\n", "warmth off keeps the other menubar lines")
+check(barTint(in: "") == .accent && barTint(in: "icon horizon\n") == .accent, "a menubar file without tint follows the accent")
+check(barTint(in: "tint accent\n") == .accent, "tint accent follows the accent")
+check(barTint(in: "tint blue\n") == .primary(.blue), "tint blue is the blue primary")
+check(barTint(in: "tint graphite\n") == .primary(.graphite), "tint graphite is the graphite primary")
+check(barTint(in: "tint custom ff8000\n") == .custom(red: 255, green: 128, blue: 0), "a custom tint stores the picked color")
+check(barTint(in: "tint custom FF00AA\n") == .custom(red: 255, green: 0, blue: 170), "a custom tint accepts uppercase hex")
+check(barTint(in: "tint nope\n") == .accent && barTint(in: "tint custom zz\n") == .accent, "a bad tint line follows the accent")
+check(
+  menuBarText(settingTint: .primary(.red), in: "icon horizon\nwarmth on\n") == "icon horizon\ntint red\nwarmth on\n",
+  "a primary tint keeps the other menubar lines"
+)
+check(
+  menuBarText(settingTint: .custom(red: 1, green: 2, blue: 3), in: "warmth off\n") == "tint custom 010203\nwarmth off\n",
+  "a custom tint is saved as hex"
+)
+check(
+  menuBarText(settingWarmth: false, in: "tint blue\n") == "tint blue\nwarmth off\n",
+  "warmth off keeps the tint line"
+)
 
 check(ScheduleMode.off.segment == 0 && ScheduleMode.off.rawValue == 0, "Off is the first segment and mode 0")
 check(ScheduleMode.custom.segment == 1 && ScheduleMode.custom.rawValue == 2, "Custom is the second segment and mode 2")
@@ -183,7 +205,8 @@ func menuTests() {
     fullURL: root.appendingPathComponent("full"),
     sectionsURL: root.appendingPathComponent("sections")
   )
-  check(files.readMax() == nil && files.readFullAt() == nil && files.readCollapsed().isEmpty, "missing menu files read as unset")
+  check(files.readMax() == nil && files.readFullAt() == nil, "missing menu files read as unset")
+  check(files.readCollapsed() == [.appearance], "a missing section list starts with appearance collapsed")
   check(files.writeMax(0) == false && files.readMax() == nil, "max rejects 0")
   check(files.writeMax(101) == false && files.readMax() == nil, "max rejects 101")
   check(files.writeMax(40) && files.readMax() == 40, "max 40 round-trips")
@@ -457,6 +480,12 @@ func rampTests() {
   hw.isLicensed = false
   check(ramp.setFullAt(22 * 60) == .locked && ramp.setMax(30) == .locked, "an unlicensed ramp changes nothing")
 }
+
+check(updateNotice(local: "0.3.0", remoteTag: "v0.3.0") == "You're up to date.", "the same release is current")
+check(updateNotice(local: "0.3.0", remoteTag: "0.3") == "You're up to date.", "0.3 and 0.3.0 are the same release")
+check(updateNotice(local: "0.3.0", remoteTag: "v0.4.0") == "Version 0.4.0 is available.", "a newer tag is available")
+check(updateNotice(local: "0.3.0", remoteTag: "0.3.1") == "Version 0.3.1 is available.", "a newer patch is available")
+check(updateNotice(local: "0.3.0", remoteTag: " ") == "Couldn't check for updates.", "a blank tag is not a release")
 
 rampTests()
 

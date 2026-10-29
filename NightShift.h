@@ -84,6 +84,12 @@ NSURL *rampWorkspaceURL(NSString *text);
 int rampInstallReported(NSString *token, NSString **stdoutLine, NSString **stderrLine);
 int rampBeginPurchase(NSString **openURL, BOOL *portal, NSString **stdoutLine,
                       NSString **stderrLine);
+// A code another Mac can redeem onto this purchase. 0 and *codeOut on
+// success. 2 and *stderrLine when this Mac can't add one.
+int rampMintSeatCode(NSString **codeOut, NSString **stderrLine);
+// Redeems a code from a Mac that already holds the purchase. Saves the
+// token for this Mac. 0 on success, 2 and *stderrLine otherwise.
+int rampRedeemSeatCode(NSString *code, NSString **stdoutLine, NSString **stderrLine);
 int rampTakeLicenseUpdate(NSString **stdoutLine, NSString **stderrLine);
 // What to tell this Mac when the server answered a license fetch with its
 // held-purchase reply (status 409): "This purchase is being reversed;

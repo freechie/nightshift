@@ -76,6 +76,66 @@ final class WarmthHotKeys {
     stopMenuPoll()
   }
 
+  func shortcutPair() -> (NSShortcut, NSShortcut) {
+    (lower, raise)
+  }
+
+  func keyStatuses() -> [(name: String, ready: Bool)] {
+    (0..<2).map { index in
+      let shortcut = shortcut(at: index)
+      let ready = hotKeyRefs[index] != nil
+      return (shortcutLabel(shortcut), ready)
+    }
+  }
+
+  func pauseForRecording() {
+    paused = true
+    unregisterKeys()
+  }
+
+  func resumeAfterRecording() {
+    paused = false
+    registerKeys(notify: false)
+  }
+
+  func saveShortcuts(lower: NSShortcut, raise: NSShortcut) -> Bool {
+    var pair = [lower, raise]
+    var buf = [CChar](repeating: 0, count: 256)
+    let written = buf.withUnsafeMutableBufferPointer { buffer in
+      pair.withUnsafeMutableBufferPointer { shortcuts in
+        nsShortcutsFormat(shortcuts.baseAddress, buffer.baseAddress, buffer.count)
+      }
+    }
+    guard written > 0, written < buf.count else { return false }
+    let url = URL(fileURLWithPath: Self.shortcutsPath)
+    do {
+      try FileManager.default.createDirectory(
+        at: url.deletingLastPathComponent(),
+        withIntermediateDirectories: true
+      )
+      try Data(bytes: buf, count: Int(written)).write(to: url, options: .atomic)
+      try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+    } catch {
+      return false
+    }
+    paused = false
+    self.lower = lower
+    self.raise = raise
+    unregisterKeys()
+    registerKeys(notify: true)
+    return true
+  }
+
+  func restoreDefaultShortcuts() -> Bool {
+    var lower = NSShortcut()
+    var raise = NSShortcut()
+    guard nsShortcutDefault(1, &lower), nsShortcutDefault(2, &raise) else { return false }
+    return saveShortcuts(lower: lower, raise: raise)
+  }
+
+  private static let shortcutsPath =
+    NSHomeDirectory() + "/Library/Application Support/nightshift/shortcuts"
+
   fileprivate func handle(kind: UInt32, hotKey: EventHotKeyID, eventTime: EventTime) {
     let id = Int(hotKey.id)
     guard hotKey.signature == kWarmthHotKeySignature, id == 1 || id == 2 else { return }
@@ -163,7 +223,7 @@ final class WarmthHotKeys {
 
   private func loadShortcuts() {
     var pair = [NSShortcut(), NSShortcut()]
-    let path = NSHomeDirectory() + "/Library/Application Support/nightshift/shortcuts"
+    let path = Self.shortcutsPath
     let text = (try? String(contentsOfFile: path, encoding: .utf8)) ?? ""
     text.withCString { cstr in
       _ = nsShortcutsParse(cstr, &pair)
@@ -272,6 +332,14 @@ final class WarmthHotKeys {
           onReleased(id: UInt32(i + 1))
         }
       }
+    }
+  }
+}
+
+func shortcutLabel(_ shortcut: NSShortcut) -> String {
+  withUnsafePointer(to: shortcut.name) {
+    $0.withMemoryRebound(to: CChar.self, capacity: 40) {
+      String(cString: $0)
     }
   }
 }

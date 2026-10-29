@@ -538,7 +538,190 @@ export function revokeLicense(installId) {
     }
     row.revoked = true;
     row.active = false;
+    refreshSeats(store, row.seat || row.customer);
     return row;
+  });
+}
+
+// One Stripe customer covers up to 3 Macs. The subscription index still
+// names the Mac that paid, so renewals, cancellations, and held purchases
+// stay on that path. Each other Mac is a seat row: its own secret, and a
+// token signed for its own install id, riding the paying row's day.
+const seatCap = 3;
+const seatCodeMs = 15 * 60 * 1000;
+
+function seatCodeList(store) {
+  if (!Array.isArray(store.seat_codes)) {
+    store.seat_codes = [];
+  }
+  return store.seat_codes;
+}
+
+function codeHash(code) {
+  if (typeof code !== "string") {
+    return null;
+  }
+  const trimmed = code.replace(/\s+/g, "").toLowerCase();
+  if (!/^[0-9a-f]{10}$/.test(trimmed)) {
+    return null;
+  }
+  return createHash("sha256").update(trimmed).digest("hex");
+}
+
+function pruneSeatCodes(store) {
+  const now = Date.now();
+  const list = seatCodeList(store);
+  store.seat_codes = list.filter((entry) => entry && typeof entry.exp === "number" && entry.exp > now);
+  return store.seat_codes;
+}
+
+// The paying Mac for this customer: a live row that is not itself a seat.
+function bestPayer(store, customer) {
+  let found = null;
+  for (const [id, row] of Object.entries(store.installs || {})) {
+    if (!row || row.seat || row.customer !== customer || !liveLicense(row, id)) {
+      continue;
+    }
+    if (!found || row.until > found.row.until) {
+      found = { id, row };
+    }
+  }
+  return found;
+}
+
+function liveCustomerInstalls(store, customer) {
+  const ids = [];
+  for (const [id, row] of Object.entries(store.installs || {})) {
+    if (!row || row.revoked || !liveLicense(row, id)) {
+      continue;
+    }
+    if (row.seat === customer || (!row.seat && row.customer === customer)) {
+      ids.push(id);
+    }
+  }
+  return ids;
+}
+
+// Copies the paying Mac's day onto every seat of that customer. A customer
+// with no live paying Mac loses the seats' active flag. Saved tokens on
+// those Macs still run to the day they already have, same as the payer.
+function refreshSeats(store, customer) {
+  if (typeof customer !== "string" || customer === "") {
+    return;
+  }
+  const payer = bestPayer(store, customer);
+  for (const [id, row] of Object.entries(store.installs || {})) {
+    if (!row || row.revoked || row.seat !== customer) {
+      continue;
+    }
+    if (!payer) {
+      row.active = false;
+      continue;
+    }
+    row.until = payer.row.until;
+    row.customer = customer;
+    if (!tokenBoundTo(row.token, id, payer.row.until)) {
+      row.token = signRamp(id, payer.row.until);
+    }
+    row.active = true;
+  }
+}
+
+export function mintSeatCode(installId, presentedHash) {
+  if (!idPattern.test(installId || "") || !presentedHash) {
+    return { error: "install_id" };
+  }
+  return withStore((store) => {
+    const id = installId.toLowerCase();
+    const row = store.installs[id];
+    if (!row || !sameHash(presentedHash, row.secret_hash)) {
+      return { error: "secret" };
+    }
+    if (!liveLicense(row, id)) {
+      return { error: "unlicensed" };
+    }
+    const customer = row.seat || row.customer;
+    if (!customer) {
+      return { error: "grant" };
+    }
+    if (!bestPayer(store, customer)) {
+      return { error: "unlicensed" };
+    }
+    pruneSeatCodes(store);
+    const seats = liveCustomerInstalls(store, customer);
+    if (seats.length >= seatCap) {
+      return { error: "full", seats: seats.length, cap: seatCap };
+    }
+    const code = randomBytes(5).toString("hex");
+    seatCodeList(store).push({
+      hash: createHash("sha256").update(code).digest("hex"),
+      customer,
+      exp: Date.now() + seatCodeMs,
+    });
+    return { code, seats: seats.length, cap: seatCap };
+  });
+}
+
+export function redeemSeat(installId, presentedHash, code) {
+  if (!idPattern.test(installId || "") || !presentedHash) {
+    return { error: "install_id" };
+  }
+  const hash = codeHash(code);
+  if (!hash) {
+    return { error: "code" };
+  }
+  return withStore((store) => {
+    const id = installId.toLowerCase();
+    pruneSeatCodes(store);
+    const list = seatCodeList(store);
+    const index = list.findIndex((entry) => sameHash(entry.hash, hash));
+    if (index < 0) {
+      return { error: "code" };
+    }
+    const entry = list[index];
+    const payer = bestPayer(store, entry.customer);
+    if (!payer) {
+      return { error: "unlicensed" };
+    }
+    const row = store.installs[id];
+    if (row && row.revoked) {
+      return { error: "claimed" };
+    }
+    if (row && row.secret_hash && !sameHash(presentedHash, row.secret_hash)) {
+      return { error: "claimed" };
+    }
+    if (row && liveLicense(row, id)) {
+      const onCustomer = row.seat === entry.customer || (!row.seat && row.customer === entry.customer);
+      if (!onCustomer) {
+        return { error: "licensed" };
+      }
+      list.splice(index, 1);
+      return { token: row.token, until: row.until };
+    }
+    // A row that still has a live subscription is a paying Mac. Joining
+    // would take it off the subscription index's path.
+    if (row && liveSubscriptions(row).length > 0) {
+      return { error: "licensed" };
+    }
+    const seats = liveCustomerInstalls(store, entry.customer);
+    if (!seats.includes(id) && seats.length >= seatCap) {
+      return { error: "full", cap: seatCap };
+    }
+    list.splice(index, 1);
+    const seat = row || {};
+    if (!seat.secret_hash) {
+      seat.secret_hash = presentedHash;
+      seat.secret_source = "seat";
+      seat.secret_at = new Date().toISOString();
+    }
+    seat.customer = entry.customer;
+    seat.seat = entry.customer;
+    seat.until = payer.row.until;
+    seat.token = signRamp(id, payer.row.until);
+    seat.active = true;
+    seat.revoked = false;
+    store.installs[id] = seat;
+    return { token: seat.token, until: seat.until };
   });
 }
 
@@ -723,7 +906,12 @@ export async function rememberPaid(installId, untilUnix, details = {}) {
       row.secret_source = "purchase";
       row.secret_at = new Date().toISOString();
     }
+    // Buying a subscription of its own takes this Mac off someone else's seats.
+    if (firstAttach && subscription) {
+      delete row.seat;
+    }
     store.installs[installId] = row;
+    refreshSeats(store, row.customer);
     return row;
   });
 }
@@ -795,6 +983,7 @@ export function rememberCanceled(installId, subscription) {
     }
     if (!subscription) {
       row.active = false;
+      refreshSeats(store, row.customer);
       return row;
     }
     const canceled = Array.isArray(row.canceled) ? row.canceled : [];
@@ -804,9 +993,12 @@ export function rememberCanceled(installId, subscription) {
     row.canceled = canceled;
     row.periods = periodsOf(row);
     if (row.active === false) {
+      refreshSeats(store, row.customer);
       return row;
     }
-    return settleRow(row, id);
+    const settled = settleRow(row, id);
+    refreshSeats(store, settled.customer);
+    return settled;
   });
 }
 
@@ -1352,6 +1544,49 @@ export function createApp(stripe = stripeClient()) {
         const token = encodeURIComponent(row.token);
         res.writeHead(302, { Location: `nightshift://license?token=${token}` });
         res.end();
+        return;
+      }
+
+      // A code from a Mac that already holds the purchase. The new Mac
+      // redeems it and gets its own token. The code is single-use and is
+      // stored only as a hash.
+      if (req.method === "POST" && (url.pathname === "/seats/code" || url.pathname === "/seats")) {
+        const body = JSON.parse((await collect(req)).toString("utf8") || "{}");
+        const installId = body.install_id || "";
+        if (typeof installId !== "string" || !idPattern.test(installId)) {
+          send(res, 400, { error: "install_id" });
+          return;
+        }
+        const presented = secretHash(req.headers["x-nightshift-secret"]);
+        if (!presented) {
+          send(res, 204, "");
+          return;
+        }
+        const result =
+          url.pathname === "/seats/code"
+            ? mintSeatCode(installId, presented)
+            : redeemSeat(installId, presented, body.code);
+        if (!result || result.error === "secret" || result.error === "install_id") {
+          send(res, 204, "");
+          return;
+        }
+        if (result.error === "code") {
+          send(res, 404, { error: "code" });
+          return;
+        }
+        if (result.error) {
+          const reply = { error: result.error };
+          if (typeof result.cap === "number") {
+            reply.cap = result.cap;
+          }
+          send(res, 409, reply);
+          return;
+        }
+        if (result.code) {
+          send(res, 200, { code: result.code, seats: result.seats, cap: result.cap });
+          return;
+        }
+        send(res, 200, { token: result.token, until: result.until });
         return;
       }
 

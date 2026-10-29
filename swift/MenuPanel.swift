@@ -20,15 +20,73 @@ func textOnAccent() -> NSColor {
   return luma > 0.7 ? NSColor(white: 0, alpha: 0.85) : .white
 }
 
-// Accent fill tracks the user's system accent (Sound-menu style). End and mid
-// ticks are drawn by hand under the bar (System Settings Night Shift style) so
-// numberOfTickMarks stays 0 and the accent path runs. Bar and knob ride up by
-// tickRoom / 2 inside a slider that is tickRoom taller, leaving the strip below
-// the track for the ticks (with a small gap under the bar). End ticks sit at
-// the knob travel ends (a little in from the track tips); mid sits at 50.
+func barFillColor(_ tint: BarTint) -> NSColor {
+  switch tint {
+  case .accent:
+    .controlAccentColor
+  case .primary(let primary):
+    primary.systemColor
+  case .custom(let red, let green, let blue):
+    NSColor(srgbRed: CGFloat(red) / 255, green: CGFloat(green) / 255, blue: CGFloat(blue) / 255, alpha: 1)
+  }
+}
+
+extension BarPrimary {
+  var systemColor: NSColor {
+    switch self {
+    case .blue: .systemBlue
+    case .purple: .systemPurple
+    case .pink: .systemPink
+    case .red: .systemRed
+    case .orange: .systemOrange
+    case .yellow: .systemYellow
+    case .green: .systemGreen
+    case .graphite: .systemGray
+    }
+  }
+
+  var title: String {
+    switch self {
+    case .blue: "Blue"
+    case .purple: "Purple"
+    case .pink: "Pink"
+    case .red: "Red"
+    case .orange: "Orange"
+    case .yellow: "Yellow"
+    case .green: "Green"
+    case .graphite: "Graphite"
+    }
+  }
+}
+
+func barTintTitle(_ tint: BarTint) -> String {
+  switch tint {
+  case .accent: "Accent"
+  case .primary(let primary): primary.title
+  case .custom: "Custom"
+  }
+}
+
+func menuBarImage(for tint: BarTint) -> NSImage? {
+  let config = NSImage.SymbolConfiguration(pointSize: 16, weight: .regular)
+    .applying(NSImage.SymbolConfiguration(paletteColors: [barFillColor(tint)]))
+  guard let glyph = NSImage(systemSymbolName: "sun.horizon", accessibilityDescription: nil)?
+    .withSymbolConfiguration(config) else { return nil }
+  let image = NSImage(size: glyph.size, flipped: false) { rect in
+    glyph.draw(in: rect)
+    return true
+  }
+  image.accessibilityDescription = "Nightshift"
+  image.isTemplate = false
+  return image
+}
+
+// Hand-drawn track for macOS before 26. Tick marks would drop the accent fill,
+// so the bar and knob ride up inside a taller slider and the ticks sit below.
+// macOS 26 and later use the system slider instead, which has the liquid-glass knob.
 final class AccentSliderCell: NSSliderCell {
   static let tickRoom: CGFloat = 8
-  static let mid: Double = 50
+  var fillColor: NSColor = .controlAccentColor
 
   override func barRect(flipped: Bool) -> NSRect {
     raised(super.barRect(flipped: flipped), flipped: flipped)
@@ -66,7 +124,7 @@ final class AccentSliderCell: NSSliderCell {
     var filled = track
     filled.size.width = end - track.minX
     if filled.width > 0 {
-      let fill: NSColor = isEnabled ? .controlAccentColor : .tertiaryLabelColor
+      let fill: NSColor = isEnabled ? fillColor : .tertiaryLabelColor
       NSGraphicsContext.saveGraphicsState()
       trackPath.addClip()
       fill.setFill()
@@ -111,16 +169,66 @@ final class AccentSliderCell: NSSliderCell {
 final class ReleaseSlider: NSSlider {
   var commitsOnRelease = false
   private var releasing = false
+  private var snapped = false
+  private static let mid = 50
 
-  override class var cellClass: AnyClass? {
-    get { AccentSliderCell.self }
-    set { /* AppKit requires a setter; accent cell is fixed. */ }
+  override init(frame frameRect: NSRect) {
+    super.init(frame: frameRect)
+    useSystemTrack()
   }
 
-  private var snapped = false
+  required init?(coder: NSCoder) {
+    super.init(coder: coder)
+    useSystemTrack()
+  }
+
+  override var minValue: Double {
+    didSet { syncNeutral() }
+  }
+
+  // Tick marks would leave the track untinted. Primary prominence keeps the accent fill.
+  private func useSystemTrack() {
+    if #available(macOS 26.0, *) {
+      numberOfTickMarks = 3
+      tickMarkPosition = .below
+      allowsTickMarkValuesOnly = false
+      tintProminence = .primary
+      syncNeutral()
+    } else {
+      cell = AccentSliderCell()
+    }
+    applyBarFill()
+  }
+
+  var barFill: NSColor = .controlAccentColor {
+    didSet { applyBarFill() }
+  }
+
+  override var isEnabled: Bool {
+    didSet { applyBarFill() }
+  }
+
+  // A disabled bar stays gray. An enabled bar uses the Settings color.
+  private func applyBarFill() {
+    if #available(macOS 26.0, *) {
+      trackFillColor = isEnabled ? barFill : .tertiaryLabelColor
+    } else if let accent = cell as? AccentSliderCell {
+      accent.fillColor = barFill
+    }
+    needsDisplay = true
+  }
+
+  private func syncNeutral() {
+    if #available(macOS 26.0, *) {
+      neutralValue = minValue
+    }
+  }
 
   override var intrinsicContentSize: NSSize {
     var size = super.intrinsicContentSize
+    if #available(macOS 26.0, *) {
+      return size
+    }
     if !isVertical {
       size.height += AccentSliderCell.tickRoom
     }
@@ -150,7 +258,7 @@ final class ReleaseSlider: NSSlider {
   // Continuous commit (Color temperature) applies each action; release-only
   // sliders fire once on mouse up. Arrow keys step freely so they can leave mid.
   func snapToMid() -> Int {
-    let mid = Int(AccentSliderCell.mid)
+    let mid = ReleaseSlider.mid
     if NSApp.currentEvent?.type == .keyDown {
       snapped = false
       return integerValue
@@ -250,7 +358,7 @@ final class SectionHeader: NSView {
   var onToggle: @MainActor () -> Void = {}
   private(set) var isCollapsed = false
 
-  init(title: String, badge: NSView?) {
+  init(title: String, badge: NSView?, value: NSTextField? = nil) {
     titleField = NSTextField(labelWithString: title)
     super.init(frame: .zero)
     translatesAutoresizingMaskIntoConstraints = false
@@ -284,6 +392,12 @@ final class SectionHeader: NSView {
       views.append(badge)
     }
     views.append(spacer)
+    if let value {
+      value.font = .monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
+      value.alignment = .right
+      value.setContentHuggingPriority(.required, for: .horizontal)
+      views.append(value)
+    }
     views.append(box)
     let row = NSStackView(views: views)
     row.orientation = .horizontal
@@ -345,7 +459,6 @@ final class MenuPanel: NSView {
     action: nil
   )
   private let maxSlider = ReleaseSlider(value: 50, minValue: 1, maxValue: 100, target: nil, action: nil)
-  private let maxName = NSTextField(labelWithString: "Max")
   private let maxValue = NSTextField(labelWithString: "—")
   private let proBadge = ProBadge(frame: .zero)
   private let rampHeader: SectionHeader
@@ -361,7 +474,7 @@ final class MenuPanel: NSView {
   private var stack: NSStackView?
 
   override init(frame frameRect: NSRect) {
-    rampHeader = SectionHeader(title: "Ramp", badge: proBadge)
+    rampHeader = SectionHeader(title: "Max", badge: proBadge, value: maxValue)
     appearanceHeader = SectionHeader(title: "Appearance", badge: nil)
     rampBody = NSStackView()
     appearanceBody = NSStackView()
@@ -371,7 +484,7 @@ final class MenuPanel: NSView {
   }
 
   required init?(coder: NSCoder) {
-    rampHeader = SectionHeader(title: "Ramp", badge: proBadge)
+    rampHeader = SectionHeader(title: "Max", badge: proBadge, value: maxValue)
     appearanceHeader = SectionHeader(title: "Appearance", badge: nil)
     rampBody = NSStackView()
     appearanceBody = NSStackView()
@@ -385,6 +498,9 @@ final class MenuPanel: NSView {
       rendering = false
     }
     self.snapshot = snapshot
+    let fill = barFillColor(barTint())
+    currentSlider.barFill = fill
+    maxSlider.barFill = fill
     showWarmth(snapshot.warmth)
     let segment = snapshot.schedule.segment
     if scheduleControl.selectedSegment != segment {
@@ -458,9 +574,7 @@ final class MenuPanel: NSView {
     night.setCustomSpacing(14, after: currentRow)
     scheduleControl.widthAnchor.constraint(equalToConstant: MenuLayout.content).isActive = true
 
-    maxName.font = .systemFont(ofSize: NSFont.systemFontSize)
-    maxName.lineBreakMode = .byTruncatingTail
-    let maxRow = sliderRow(name: "Max", nameField: maxName, slider: maxSlider, value: maxValue)
+    maxSlider.widthAnchor.constraint(equalToConstant: MenuLayout.content).isActive = true
     fullName.font = .systemFont(ofSize: NSFont.systemFontSize, weight: .semibold)
     fullName.setContentHuggingPriority(.required, for: .horizontal)
     let fullRow = NSStackView(views: [fullName, fullPicker])
@@ -469,8 +583,8 @@ final class MenuPanel: NSView {
     fullRow.spacing = 8
     fullRow.translatesAutoresizingMaskIntoConstraints = false
     fullRow.widthAnchor.constraint(equalToConstant: MenuLayout.content).isActive = true
-    fillStack(rampBody, views: [maxRow, fullRow], spacing: 10)
-    rampBody.setCustomSpacing(14, after: maxRow)
+    fillStack(rampBody, views: [maxSlider, fullRow], spacing: 10)
+    rampBody.setCustomSpacing(14, after: maxSlider)
     let ramp = verticalStack([rampHeader, rampBody], spacing: 10)
 
     fillStack(appearanceBody, views: [darkButton, toneButton], spacing: 8)
@@ -525,9 +639,7 @@ final class MenuPanel: NSView {
       maxSlider.integerValue = display.value
     }
     maxValue.stringValue = display.text
-    let maxColor: NSColor = controls.maxEnabled ? .labelColor : .tertiaryLabelColor
-    maxName.textColor = maxColor
-    maxValue.textColor = maxColor
+    maxValue.textColor = controls.maxEnabled ? .labelColor : .tertiaryLabelColor
 
     fullPicker.isEnabled = controls.fullAtEnabled
     fullPicker.alphaValue = controls.fullAtEnabled ? 1 : 0.4
@@ -652,32 +764,6 @@ final class MenuPanel: NSView {
     slider.widthAnchor.constraint(equalTo: column.widthAnchor).isActive = true
     under.widthAnchor.constraint(equalTo: column.widthAnchor).isActive = true
     return column
-  }
-
-  private func sliderRow(name: String, nameField: NSTextField?, slider: NSSlider, value: NSTextField) -> NSStackView {
-    let title = nameField ?? NSTextField(labelWithString: name)
-    if nameField == nil {
-      title.stringValue = name
-      title.font = .systemFont(ofSize: NSFont.systemFontSize)
-      title.lineBreakMode = .byTruncatingTail
-    }
-    title.maximumNumberOfLines = 1
-    title.setContentHuggingPriority(.required, for: .horizontal)
-    title.widthAnchor.constraint(equalToConstant: 62).isActive = true
-    slider.setContentHuggingPriority(.defaultLow, for: .horizontal)
-    value.font = .monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
-    value.alignment = .right
-    value.setContentHuggingPriority(.required, for: .horizontal)
-    value.widthAnchor.constraint(equalToConstant: 40).isActive = true
-    let row = NSStackView(views: [title, slider, value])
-    row.orientation = .horizontal
-    row.spacing = 8
-    row.setCustomSpacing(4, after: slider)
-    row.alignment = .centerY
-    row.translatesAutoresizingMaskIntoConstraints = false
-    row.widthAnchor.constraint(equalToConstant: MenuLayout.content).isActive = true
-    row.heightAnchor.constraint(greaterThanOrEqualToConstant: 24).isActive = true
-    return row
   }
 
   private func verticalStack(_ views: [NSView], spacing: CGFloat) -> NSStackView {

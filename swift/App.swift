@@ -8,6 +8,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
   private var rampTimer: Timer?
   // True while Color temp is mid-drag (stageWarmth). Blocks hotkey holds.
   private var warmthDragging = false
+  private let settings = SettingsController()
 
   init(menu: MenuFacade?) {
     menuFacade = menu
@@ -17,7 +18,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
   func applicationDidFinishLaunching(_ notification: Notification) {
     statusItem.autosaveName = "nightshift-swift"
     statusItem.button?.toolTip = "Nightshift Swift"
-    statusItem.button?.image = menuImage()
+    NotificationCenter.default.addObserver(
+      self,
+      selector: #selector(systemColorsChanged(_:)),
+      name: NSColor.systemColorsDidChangeNotification,
+      object: nil
+    )
+    let distributed = DistributedNotificationCenter.default()
+    distributed.addObserver(
+      self,
+      selector: #selector(systemColorsChanged(_:)),
+      name: Notification.Name("AppleColorPreferencesChangedNotification"),
+      object: nil
+    )
+    distributed.addObserver(
+      self,
+      selector: #selector(systemColorsChanged(_:)),
+      name: Notification.Name("AppleInterfaceThemeChangedNotification"),
+      object: nil
+    )
 
     let panel = MenuPanel()
     panel.onIntent = { [weak self] intent in
@@ -33,9 +52,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     content.view = panel
     menu.addItem(content)
     menu.addItem(.separator())
-    let settings = NSMenuItem(title: "Settings…", action: #selector(showSettings(_:)), keyEquivalent: "")
-    settings.target = self
-    menu.addItem(settings)
+    let settingsItem = NSMenuItem(title: "Settings…", action: #selector(showSettings(_:)), keyEquivalent: "")
+    settingsItem.target = self
+    menu.addItem(settingsItem)
     menu.addItem(
       NSMenuItem(
         title: "Quit Nightshift Swift",
@@ -43,7 +62,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         keyEquivalent: "q"
       )
     )
+    settings.onRefresh = { [weak self] in
+      guard let self else { return }
+      self.show(self.menuFacade?.snapshot() ?? .unavailable)
+    }
     statusItem.menu = menu
+    if let menuFacade {
+      menuFacade.showWarmthInBar = menuBarWarmthShown()
+    }
     show(menuFacade?.snapshot() ?? .unavailable)
     wireHotKeys()
     WarmthHotKeys.shared.start()
@@ -87,8 +113,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     WarmthHotKeys.shared.menuDidClose()
   }
 
-  // Settings is a stub in this pass. The item stays in the menu.
-  @objc private func showSettings(_ sender: Any?) {}
+  @objc private func showSettings(_ sender: Any?) {
+    settings.show(facade: menuFacade) { [weak self] intent in
+      self?.perform(intent)
+    }
+  }
 
   private func wireHotKeys() {
     let keys = WarmthHotKeys.shared
@@ -107,7 +136,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
       guard let self, let warmth = Warmth(percent) else { return }
       self.menuFacade?.stageWarmth(warmth)
       if let button = self.statusItem.button {
-        self.applyBarTitle("\(percent)%", to: button)
+        let shown = self.menuFacade?.snapshot().showWarmthInBar ?? true
+        self.applyBarTitle(shown ? "\(percent)%" : "", to: button)
       }
     }
     keys.onCommit = { [weak self] percent in
@@ -137,6 +167,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
   }
 
   private func applyBarTitle(_ title: String, to button: NSStatusBarButton) {
+    if let image = menuBarImage(for: barTint()) {
+      button.image = image
+    }
     if title.isEmpty {
       button.title = button.image == nil ? "NS" : ""
       button.imagePosition = button.image == nil ? .imageLeading : .imageOnly
@@ -152,18 +185,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     button.imagePosition = .imageLeading
   }
 
-  // The status bar fits a symbol to its alignment rect without scaling,
-  // which cuts off the top ray. A plain image is drawn whole (d:2709-2732).
-  private func menuImage() -> NSImage? {
-    let config = NSImage.SymbolConfiguration(pointSize: 16, weight: .regular)
-    guard let glyph = NSImage(systemSymbolName: "sun.horizon", accessibilityDescription: nil)?
-      .withSymbolConfiguration(config) else { return nil }
-    let image = NSImage(size: glyph.size, flipped: false) { rect in
-      glyph.draw(in: rect)
-      return true
-    }
-    image.accessibilityDescription = "Nightshift"
-    image.isTemplate = true
-    return image
+  @objc private func systemColorsChanged(_ notification: Notification) {
+    show(menuFacade?.snapshot() ?? .unavailable)
   }
 }
