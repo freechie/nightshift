@@ -1,4 +1,6 @@
 import AppKit
+import CNightshift
+import ServiceManagement
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
@@ -9,6 +11,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
   // True while Color temp is mid-drag (stageWarmth). Blocks hotkey holds.
   private var warmthDragging = false
   private let settings = SettingsController()
+  private let commands = CommandListener()
 
   init(menu: MenuFacade?) {
     menuFacade = menu
@@ -18,6 +21,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
   func applicationDidFinishLaunching(_ notification: Notification) {
     statusItem.autosaveName = "nightshift-swift"
     statusItem.button?.toolTip = "Nightshift Swift"
+    readHourCycle()
+    startCommandListener()
     NotificationCenter.default.addObserver(
       self,
       selector: #selector(systemColorsChanged(_:)),
@@ -77,7 +82,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
   }
 
   func applicationWillTerminate(_ notification: Notification) {
+    commands.stop()
     WarmthHotKeys.shared.stop()
+  }
+
+  // After max/full are loaded into RampEngine, before the first tick owns the
+  // evening. A held lock leaves the menu running; the CLI keeps the other process.
+  private func startCommandListener() {
+    _ = commands.start { [weak self] line in
+      MainActor.assumeIsolated {
+        self?.handleCommand(line) ?? "failed"
+      }
+    }
+  }
+
+  private func handleCommand(_ line: String) -> String {
+    guard let menuFacade else { return "failed" }
+    let reply = menuFacade.reply(
+      to: line,
+      loginOn: { SMAppService.mainApp.status == .enabled },
+      setLogin: { on in
+        let service = SMAppService.mainApp
+        do {
+          if on { try service.register() } else { try service.unregister() }
+        } catch {}
+        if service.status == .requiresApproval { return "approval" }
+        if (service.status == .enabled) != on { return "failed" }
+        return on ? "on" : "off"
+      }
+    )
+    show(menuFacade.snapshot())
+    return reply
   }
 
   // 60s wall clock, fires once at launch (matches ObjC dispatch_walltime(NULL,0)).

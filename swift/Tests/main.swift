@@ -231,6 +231,12 @@ func menuTests() {
 
   let warmed = facade.apply(.setWarmth(Warmth(60)!))
   check(warmed.warmth == .on(Warmth(60)!) && source.applied == [60], "a release applies once through the ramp and shows the new warmth")
+  check(facade.reply(to: "brightness", loginOn: { false }, setLogin: { _ in "failed" }) == "failed", "unknown socket lines reply failed")
+  let status = facade.reply(to: "status", loginOn: { false }, setLogin: { _ in "failed" })
+  check(status.split(separator: " ").count == 4 && status.hasPrefix("60 "), "status is four fields starting with current warmth")
+  controls.licensed = false
+  check(facade.reply(to: "max 70", loginOn: { false }, setLogin: { _ in "failed" }) == "locked", "unlicensed max replies locked")
+  controls.licensed = true
   facade.stageWarmth(Warmth(55)!)
   facade.stageWarmth(Warmth(58)!)
   check(source.staged == [55, 58] && source.applied == [60], "a live drag stages without a full apply")
@@ -477,8 +483,20 @@ func rampTests() {
   hw.mode = .sunsetToSunrise
   check(ramp.setFullAt(22 * 60) == .needsCustomSchedule && files.readFullAt() == 20 * 60, "Full at needs a Custom schedule")
   hw.mode = .custom
+  hw.now = 8 * 60
+  hw.enabled = true
+  hw.current = 80
+  let writesBeforeSocketMax = hw.writes
+  check(ramp.setMaxFromCommand(40) == .saved && files.readMax() == 40, "socket max outside the window saves")
+  check(hw.current == 80 && hw.writes == writesBeforeSocketMax, "socket max outside the window leaves strength alone")
+  hw.mode = .off
+  let writesBeforeSocketRamp = hw.writes
+  check(ramp.setFullAtFromCommand(10 * 60) == .saved && files.readFullAt() == 10 * 60, "socket ramp saves Full at when Off")
+  check(hw.writes == writesBeforeSocketRamp, "socket ramp when Off leaves strength alone")
+  hw.mode = .custom
   hw.isLicensed = false
   check(ramp.setFullAt(22 * 60) == .locked && ramp.setMax(30) == .locked, "an unlicensed ramp changes nothing")
+  check(ramp.setMaxFromCommand(30) == .locked && ramp.setFullAtFromCommand(22 * 60) == .locked, "socket max and ramp stay locked when unlicensed")
 }
 
 check(updateNotice(local: "0.3.0", remoteTag: "v0.3.0") == "You're up to date.", "the same release is current")
@@ -486,6 +504,13 @@ check(updateNotice(local: "0.3.0", remoteTag: "0.3") == "You're up to date.", "0
 check(updateNotice(local: "0.3.0", remoteTag: "v0.4.0") == "Version 0.4.0 is available.", "a newer tag is available")
 check(updateNotice(local: "0.3.0", remoteTag: "0.3.1") == "Version 0.3.1 is available.", "a newer patch is available")
 check(updateNotice(local: "0.3.0", remoteTag: " ") == "Couldn't check for updates.", "a blank tag is not a release")
+
+check(statusWireLine(now: 40, max: -1, state: "idle", full: -1) == "40 -1 idle -1", "unset max is -1 on the wire")
+check(statusWireState(enabled: false, phase: .idle, now: Minute(0)) == "off", "disabled Night Shift is off on the wire")
+check(statusWireState(enabled: true, phase: .idle, now: Minute(0)) == "idle", "enabled with no glide is idle")
+check(scheduleWireName(.sunsetToSunrise) == "sunset" && scheduleMode(wire: "sunset") == .sunsetToSunrise, "sunset is the schedule wire word")
+check(onOffWire("on") == true && onOffWire("no") == nil && onOffReply(false) == "off", "on/off wire words")
+check(parseCommandNumber("60", lo: 1, hi: 100) == 60 && parseCommandNumber("101", lo: 1, hi: 100) == nil, "command numbers match parseNumber")
 
 let current = UpdateLine.notice("You're up to date.")
 check(updateLineWhileFetching(manual: false, standing: .notCheckedYet) == .checking, "a first automatic check says Checking")

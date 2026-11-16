@@ -30,7 +30,7 @@ ZIP := $(DIST)/Nightshift.zip
 # replaces Nightshift.app.
 SWIFT_APP := NightshiftSwift.app
 SWIFT_BUILD := build/swift
-SWIFT_SRC := swift/main.swift swift/App.swift swift/NightShiftClient.swift swift/Warmth.swift swift/WarmthHold.swift swift/HotKeys.swift swift/Ramp.swift swift/MenuModel.swift swift/MenuPanel.swift swift/Settings.swift
+SWIFT_SRC := swift/main.swift swift/App.swift swift/NightShiftClient.swift swift/Warmth.swift swift/WarmthHold.swift swift/HotKeys.swift swift/Ramp.swift swift/MenuModel.swift swift/MenuPanel.swift swift/Settings.swift swift/CommandWire.swift swift/CommandListener.swift
 # Needs Swift 6 (Xcode 16 or later) and an Apple silicon Mac: it builds
 # for arm64 only, and swift-tests runs on the build machine.
 SWIFT_TARGET := -target arm64-apple-macos15.0
@@ -105,8 +105,8 @@ nightshift-swift: $(SWIFT_SRC) swift/CNightshift/module.modulemap swift/CNightsh
 	swiftc $(SWIFTFLAGS) -F$(SDK)/System/Library/PrivateFrameworks -I swift/CNightshift $(LDLIBS) -framework AppKit -framework Carbon -framework SkyLight -framework ServiceManagement -Xlinker -dead_strip -o $@ $(SWIFT_SRC) $(SWIFT_BUILD)/NightShift.o $(SWIFT_BUILD)/NightshiftLogic.o $(SWIFT_BUILD)/menu_bridge.o
 
 # Links the C ramp math the app uses, so the tests check the same glide.
-swift-tests: swift/Tests/main.swift swift/Warmth.swift swift/WarmthHold.swift swift/Ramp.swift swift/MenuModel.swift swift/CNightshift/module.modulemap $(SWIFT_BUILD)/NightShift.o $(SWIFT_BUILD)/NightshiftLogic.o
-	swiftc $(SWIFTFLAGS) -F$(SDK)/System/Library/PrivateFrameworks -I swift/CNightshift $(LDLIBS) -o $@ swift/Tests/main.swift swift/Warmth.swift swift/WarmthHold.swift swift/Ramp.swift swift/MenuModel.swift $(SWIFT_BUILD)/NightShift.o $(SWIFT_BUILD)/NightshiftLogic.o
+swift-tests: swift/Tests/main.swift swift/Warmth.swift swift/WarmthHold.swift swift/Ramp.swift swift/MenuModel.swift swift/CommandWire.swift swift/CNightshift/module.modulemap $(SWIFT_BUILD)/NightShift.o $(SWIFT_BUILD)/NightshiftLogic.o
+	swiftc $(SWIFTFLAGS) -F$(SDK)/System/Library/PrivateFrameworks -I swift/CNightshift $(LDLIBS) -o $@ swift/Tests/main.swift swift/Warmth.swift swift/WarmthHold.swift swift/Ramp.swift swift/MenuModel.swift swift/CommandWire.swift $(SWIFT_BUILD)/NightShift.o $(SWIFT_BUILD)/NightshiftLogic.o
 
 $(SWIFT_APP)/Contents/MacOS/nightshift-swift: nightshift-swift swift/Info.plist
 	mkdir -p $(dir $@)

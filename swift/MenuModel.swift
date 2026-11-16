@@ -1,3 +1,4 @@
+import CNightshift
 import Foundation
 
 // Off, Sunset to Sunrise, Custom. The menu shows them as Off, Custom, Sunset.
@@ -495,6 +496,105 @@ final class MenuFacade {
   // Live drag: no snapshot, so each tick costs only the strength write.
   func stageWarmth(_ warmth: Warmth) {
     self.warmth.stage(warmth)
+  }
+
+  // One nightshiftd.sock line → one token reply. English stays in the CLI.
+  func reply(
+    to line: String,
+    loginOn: @MainActor () -> Bool,
+    setLogin: @MainActor (Bool) -> String
+  ) -> String {
+    let command = line.withCString { nsDaemonCommand($0) }
+    switch command {
+    case kNSCommandUnknown:
+      return "failed"
+    case kNSCommandStatus:
+      guard let wire = ramp.statusWire() else { return "failed" }
+      return statusWireLine(now: wire.now, max: wire.max, state: wire.state, full: wire.full)
+    case kNSCommandMax:
+      guard line.hasPrefix("max "),
+        let value = parseCommandNumber(String(line.dropFirst(4)), lo: 1, hi: 100)
+      else { return "failed" }
+      switch ramp.setMaxFromCommand(value) {
+      case .locked: return "locked"
+      case .invalid, .saveFailed: return "failed"
+      case .saved, .retargeted, .capped:
+        return "\(ramp.settings.max?.percent ?? value)"
+      }
+    case kNSCommandRamp:
+      guard line.hasPrefix("ramp "),
+        let minute = parseCommandNumber(String(line.dropFirst(5)), lo: 0, hi: 1439)
+      else { return "failed" }
+      switch ramp.setFullAtFromCommand(minute) {
+      case .locked: return "locked"
+      case .invalid, .needsCustomSchedule, .saveFailed, .refusedOutsideSchedule:
+        return "failed"
+      case .early, .saved, .retargeted, .heldAtMax:
+        return "\(minute)"
+      }
+    case kNSCommandWarmth:
+      guard let value = parseCommandNumber(line, lo: 0, hi: 100), let warmth = Warmth(value)
+      else { return "failed" }
+      guard ramp.applyWarmth(warmth) else { return "failed" }
+      switch self.warmth.read() {
+      case .on(let held): return "\(held.percent)"
+      case .off: return "0"
+      case .unreadable, .unavailable: return "failed"
+      }
+    case kNSCommandSchedule:
+      if line == "schedule" {
+        return scheduleWireName(schedule())
+      }
+      guard line.hasPrefix("schedule "),
+        let mode = scheduleMode(wire: String(line.dropFirst(9))),
+        changeSchedule(mode)
+      else { return "failed" }
+      return scheduleWireName(schedule())
+    case kNSCommandClock:
+      if line == "clock" {
+        return hourCycleIs24() ? "24" : "12"
+      }
+      guard line.hasPrefix("clock ") else { return "failed" }
+      let cycleText = String(line.dropFirst(6))
+      let cycle: Int32
+      if cycleText == "24" { cycle = 24 }
+      else if cycleText == "12" { cycle = 12 }
+      else { return "failed" }
+      guard writeHourCycle(cycle) else { return "failed" }
+      return "\(cycle)"
+    case kNSCommandLogin:
+      if line == "login" {
+        return onOffReply(loginOn())
+      }
+      guard line.hasPrefix("login "), let on = onOffWire(String(line.dropFirst(6))) else {
+        return "failed"
+      }
+      if loginOn() == on { return onOffReply(on) }
+      return setLogin(on)
+    case kNSCommandDark:
+      if line == "dark" {
+        return onOffReply(darkMode())
+      }
+      guard line.hasPrefix("dark "), let on = onOffWire(String(line.dropFirst(5))) else {
+        return "failed"
+      }
+      changeDarkMode(on)
+      guard darkMode() == on else { return "failed" }
+      return onOffReply(on)
+    case kNSCommandTone:
+      if line == "tone" {
+        guard let on = trueTone() else { return "unsupported" }
+        return onOffReply(on)
+      }
+      guard line.hasPrefix("tone "), let on = onOffWire(String(line.dropFirst(5))) else {
+        return "failed"
+      }
+      guard trueTone() != nil else { return "unsupported" }
+      guard changeTrueTone(on), trueTone() == on else { return "failed" }
+      return onOffReply(on)
+    default:
+      return "failed"
+    }
   }
 
   func apply(_ intent: MenuIntent) -> MenuSnapshot {
