@@ -487,6 +487,36 @@ check(updateNotice(local: "0.3.0", remoteTag: "v0.4.0") == "Version 0.4.0 is ava
 check(updateNotice(local: "0.3.0", remoteTag: "0.3.1") == "Version 0.3.1 is available.", "a newer patch is available")
 check(updateNotice(local: "0.3.0", remoteTag: " ") == "Couldn't check for updates.", "a blank tag is not a release")
 
+let current = UpdateLine.notice("You're up to date.")
+check(updateLineWhileFetching(manual: false, standing: .notCheckedYet) == .checking, "a first automatic check says Checking")
+check(updateLineWhileFetching(manual: false, standing: current) == current, "an automatic recheck keeps the saved result on screen")
+check(updateLineWhileFetching(manual: true, standing: current) == .checking, "Check Now says Checking")
+let failedAuto = updateLineAfterFetch(manual: false, standing: .notCheckedYet, notice: nil)
+check(failedAuto == .notCheckedYet && updateLineText(failedAuto) == "Not checked yet.", "a failed first check restores Not checked yet")
+let failedManual = updateLineAfterFetch(manual: true, standing: current, notice: nil)
+check(failedManual == .notice("Couldn't check for updates.") && updateLineText(failedManual) == "Couldn't check for updates.", "Check Now says when the fetch fails")
+let fetched = updateLineAfterFetch(manual: false, standing: .notCheckedYet, notice: "Version 0.4.0 is available.")
+check(fetched == .notice("Version 0.4.0 is available."), "a finished check shows the release line")
+
+let endsOn = "Jan 1, 2027"
+let quiet = licenseLineToShow(licensed: false, until: nil, renewingSoon: false, held: nil)
+check(quiet == .notActive && licenseLineText(quiet) == "Not active" && licenseLineTone(quiet) == .secondary, "an unlicensed Mac with nothing in flight reads Not active")
+let waiting = licenseLineToShow(licensed: false, until: nil, renewingSoon: false, held: .waitingForCheckout)
+check(waiting == .waitingForCheckout && licenseLineText(waiting) == "Waiting for checkout…", "checkout waiting survives a refresh while unlicensed")
+let licensedLine = licenseLineToShow(licensed: true, until: endsOn, renewingSoon: false, held: .waitingForCheckout)
+check(licensedLine == .activeThrough(endsOn) && licenseLineText(licensedLine) == "Active through \(endsOn)" && licenseLineTone(licensedLine) == .green, "a license replaces checkout waiting")
+let ending = licenseLineToShow(licensed: true, until: endsOn, renewingSoon: true, held: nil)
+check(ending == .ends(endsOn) && licenseLineText(ending) == "Ends \(endsOn)" && licenseLineTone(ending) == .orange, "a license renewing soon reads Ends")
+let undated = licenseLineToShow(licensed: true, until: nil, renewingSoon: true, held: nil)
+check(undated == .active && licenseLineText(undated) == "Active" && licenseLineTone(undated) == .green, "a license with no day reads Active")
+let server = LicenseLine.notice("could not reach the license server", .orange)
+let afterFailure = licenseLineToShow(licensed: false, until: nil, renewingSoon: false, held: nil)
+check(afterFailure == .notActive, "a failed purchase clears checkout waiting before refresh")
+check(licenseLineText(server) == "could not reach the license server" && licenseLineTone(server) == .orange, "the purchase error is the line painted after that refresh")
+check(licenseLineToShow(licensed: false, until: nil, renewingSoon: false, held: server) == .notActive, "the next refresh restores Not active")
+let seat = LicenseLine.notice("Use this code on the other Mac.", .secondary)
+check(licenseLineText(seat) == "Use this code on the other Mac." && licenseLineTone(seat) == .secondary, "a seat code tells the user to use it on the other Mac")
+
 rampTests()
 
 if failures > 0 {
