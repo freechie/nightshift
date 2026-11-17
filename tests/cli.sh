@@ -153,13 +153,13 @@ rm -f "$out" "$err"
 # Plain nightshift only reports: with no app reachable it says so and
 # starts nothing. A fresh home (CFFIXED_USER_HOME) has no socket.
 home=$(mktemp -d)
-before_procs=$(pgrep -x nightshiftd | wc -l)
+before_procs=$(pgrep -x nightshift-swift | wc -l)
 out=$(mktemp)
 err=$(mktemp)
 CFFIXED_USER_HOME="$home" "$BIN" >"$out" 2>"$err"
 code=$?
 sleep 1
-after_procs=$(pgrep -x nightshiftd | wc -l)
+after_procs=$(pgrep -x nightshift-swift | wc -l)
 if [ "$code" -ne 1 ] || ! grep -F -q "Nightshift isn't running" "$err" ||
   ! grep -F -q "nightshift <0-100>" "$err" || [ -s "$out" ]; then
   echo "fail status not running: exit $code"

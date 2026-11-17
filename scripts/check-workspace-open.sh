@@ -1,23 +1,34 @@
 #!/bin/sh
-# One NSWorkspace openURL: in the sources, and it calls both verdicts.
+# Settings opens URLs only through rampWorkspaceURL, which calls both verdicts.
 set -eu
 
 root=$(git rev-parse --show-toplevel)
 cd "$root"
 
-hits=$(git grep -n -I 'openURL:' -- '*.m' '*.h' || true)
+# No Objective-C NSWorkspace openURL: left in the tree.
+hits=$(git grep -n -I '\[\[NSWorkspace sharedWorkspace\] openURL:' -- '*.m' '*.h' || true)
 count=$(printf '%s\n' "$hits" | awk 'NF { n++ } END { print n + 0 }')
-if [ "$count" -ne 1 ]; then
-  printf 'workspace open: expected 1 openURL:, found %s\n' "$count" >&2
+if [ "$count" -ne 0 ]; then
+  printf 'workspace open: expected 0 ObjC NSWorkspace openURL:, found %s\n' "$count" >&2
+  printf '%s\n' "$hits" >&2
   exit 1
 fi
-printf '%s\n' "$hits" | grep -q '^nightshiftd.m:.*\[\[NSWorkspace sharedWorkspace\] openURL:' || {
-  printf 'workspace open: the one openURL: is not an NSWorkspace open in nightshiftd.m\n' >&2
+
+# Exactly one Swift NSWorkspace.shared.open, in Settings.openAllowed.
+swift_hits=$(git grep -n -I 'NSWorkspace.shared.open' -- '*.swift' || true)
+swift_count=$(printf '%s\n' "$swift_hits" | awk 'NF { n++ } END { print n + 0 }')
+if [ "$swift_count" -ne 1 ]; then
+  printf 'workspace open: expected 1 NSWorkspace.shared.open, found %s\n' "$swift_count" >&2
+  printf '%s\n' "$swift_hits" >&2
+  exit 1
+fi
+printf '%s\n' "$swift_hits" | grep -q '^swift/Settings.swift:.*NSWorkspace.shared.open' || {
+  printf 'workspace open: the one NSWorkspace.shared.open is not in Settings.swift\n' >&2
   exit 1
 }
 
 awk '
-function grab(src, name,    line, body, depth, i, c, grabbing) {
+function grab_c(src, name,    line, body, depth, i, c, grabbing) {
   grabbing = 0
   depth = 0
   body = ""
@@ -48,18 +59,28 @@ function fail(msg) {
 }
 
 BEGIN {
-  opener = grab("nightshiftd.m", "openWorkspaceURL")
-  if (opener == "") fail("openWorkspaceURL is missing")
-  n = gsub(/openURL:/, "&", opener)
-  if (n != 1) fail("openWorkspaceURL must contain the only openURL:")
-  if (index(opener, "rampWorkspaceURL(") == 0) fail("openWorkspaceURL does not call rampWorkspaceURL")
+  opener = ""
+  while ((getline line < "swift/Settings.swift") > 0) {
+    if (index(line, "func openAllowed") > 0) {
+      opener = line
+      while ((getline line < "swift/Settings.swift") > 0) {
+        opener = opener "\n" line
+        if (index(line, "NSWorkspace.shared.open") > 0) break
+      }
+      break
+    }
+  }
+  close("swift/Settings.swift")
+  if (opener == "") fail("openAllowed is missing")
+  if (index(opener, "rampWorkspaceURL") == 0) fail("openAllowed does not call rampWorkspaceURL")
+  if (index(opener, "NSWorkspace.shared.open") == 0) fail("openAllowed does not open")
 
-  page = grab("NightShift.m", "rampWorkspaceURL")
+  page = grab_c("NightShift.m", "rampWorkspaceURL")
   if (index(page, "nsWorkspaceOpenAllowed(") == 0) {
     fail("rampWorkspaceURL does not call nsWorkspaceOpenAllowed")
   }
 
-  allowed = grab("NightshiftLogic.m", "nsWorkspaceOpenAllowed")
+  allowed = grab_c("NightshiftLogic.m", "nsWorkspaceOpenAllowed")
   if (allowed == "") fail("nsWorkspaceOpenAllowed is missing")
   purchase = index(allowed, "nsPurchaseURLVerdict(")
   origin = index(allowed, "nsLicenseOriginVerdict(")
@@ -72,7 +93,6 @@ BEGIN {
     fail("a license origin must not be opened")
   }
 
-  # Built-in pages are the quoted strings in that function.
   rest = allowed
   pages = 0
   while (match(rest, /"[^"]+"/)) {
@@ -83,34 +103,7 @@ BEGIN {
       page_url[pages] = literal
     }
   }
-  if (pages != 4) fail("expected 4 built-in pages, found " pages)
-
-  daemon = ""
-  while ((getline line < "nightshiftd.m") > 0) daemon = daemon line "\n"
-  close("nightshiftd.m")
-  # Join adjacent Objective-C string literals so a split URL is one string.
-  do {
-    before = daemon
-    while (match(daemon, /@"[^"]*"[[:space:]]*@"[^"]*"/)) {
-      chunk = substr(daemon, RSTART, RLENGTH)
-      split_at = index(chunk, "\"")
-      # chunk is @"AAA" <space> @"BBB"
-      sub(/^@"/, "", chunk)
-      a = chunk
-      sub(/".*/, "", a)
-      sub(/.*@"/, "", chunk)
-      b = chunk
-      sub(/"$/, "", b)
-      daemon = substr(before, 1, RSTART - 1) "\"" a b "\"" substr(before, RSTART + RLENGTH)
-      before = daemon
-    }
-  } while (0)
-
-  for (i = 1; i <= pages; i++) {
-    if (index(daemon, page_url[i]) == 0) {
-      fail("built-in page is not opened from nightshiftd.m: " page_url[i])
-    }
-  }
-  print "workspace open: 1 NSWorkspace openURL:, both verdicts"
+  if (pages < 4) fail("expected built-in pages in nsWorkspaceOpenAllowed, found " pages)
+  print "workspace open: Settings openAllowed → rampWorkspaceURL, both verdicts"
 }
 '
