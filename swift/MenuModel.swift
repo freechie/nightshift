@@ -1,3 +1,4 @@
+import CNightshift
 import Foundation
 
 // Off, Sunset to Sunrise, Custom. The menu shows them as Off, Custom, Sunset.
@@ -212,6 +213,69 @@ func rampControls(licensed: Bool, schedule: ScheduleMode) -> RampControls {
     fullAtEnabled: licensed && schedule == .custom,
     showsPro: !licensed
   )
+}
+
+// The License status line. Waiting for checkout is the only line a refresh
+// keeps, and only while this Mac is unlicensed. A notice is painted after
+// that refresh and does not come back from `held`.
+enum LicenseTone: Equatable {
+  case secondary
+  case orange
+  case green
+}
+
+enum LicenseLine: Equatable {
+  case notActive
+  case waitingForCheckout
+  case active
+  case activeThrough(String)
+  case ends(String)
+  case notice(String, LicenseTone)
+}
+
+func licenseLineToShow(licensed: Bool, until: String?, renewingSoon: Bool, held: LicenseLine?) -> LicenseLine {
+  if !licensed, held == .waitingForCheckout {
+    return .waitingForCheckout
+  }
+  if licensed, let until {
+    return renewingSoon ? .ends(until) : .activeThrough(until)
+  }
+  if licensed {
+    return .active
+  }
+  return .notActive
+}
+
+func licenseLineText(_ line: LicenseLine) -> String {
+  switch line {
+  case .notActive:
+    "Not active"
+  case .waitingForCheckout:
+    "Waiting for checkout…"
+  case .active:
+    "Active"
+  case .activeThrough(let day):
+    "Active through \(day)"
+  case .ends(let day):
+    "Ends \(day)"
+  case .notice(let text, _):
+    text
+  }
+}
+
+func licenseLineTone(_ line: LicenseLine) -> LicenseTone {
+  switch line {
+  case .notActive:
+    .secondary
+  case .waitingForCheckout:
+    .orange
+  case .active, .activeThrough:
+    .green
+  case .ends:
+    .orange
+  case .notice(_, let tone):
+    tone
+  }
 }
 
 // A saved max is 1...100. Anything else is unset: the slider shows a
@@ -434,6 +498,105 @@ final class MenuFacade {
     self.warmth.stage(warmth)
   }
 
+  // One nightshiftd.sock line → one token reply. English stays in the CLI.
+  func reply(
+    to line: String,
+    loginOn: @MainActor () -> Bool,
+    setLogin: @MainActor (Bool) -> String
+  ) -> String {
+    let command = line.withCString { nsDaemonCommand($0) }
+    switch command {
+    case kNSCommandUnknown:
+      return "failed"
+    case kNSCommandStatus:
+      guard let wire = ramp.statusWire() else { return "failed" }
+      return statusWireLine(now: wire.now, max: wire.max, state: wire.state, full: wire.full)
+    case kNSCommandMax:
+      guard line.hasPrefix("max "),
+        let value = parseCommandNumber(String(line.dropFirst(4)), lo: 1, hi: 100)
+      else { return "failed" }
+      switch ramp.setMaxFromCommand(value) {
+      case .locked: return "locked"
+      case .invalid, .saveFailed: return "failed"
+      case .saved, .retargeted, .capped:
+        return "\(ramp.settings.max?.percent ?? value)"
+      }
+    case kNSCommandRamp:
+      guard line.hasPrefix("ramp "),
+        let minute = parseCommandNumber(String(line.dropFirst(5)), lo: 0, hi: 1439)
+      else { return "failed" }
+      switch ramp.setFullAtFromCommand(minute) {
+      case .locked: return "locked"
+      case .invalid, .needsCustomSchedule, .saveFailed, .refusedOutsideSchedule:
+        return "failed"
+      case .early, .saved, .retargeted, .heldAtMax:
+        return "\(minute)"
+      }
+    case kNSCommandWarmth:
+      guard let value = parseCommandNumber(line, lo: 0, hi: 100), let warmth = Warmth(value)
+      else { return "failed" }
+      guard ramp.applyWarmth(warmth) else { return "failed" }
+      switch self.warmth.read() {
+      case .on(let held): return "\(held.percent)"
+      case .off: return "0"
+      case .unreadable, .unavailable: return "failed"
+      }
+    case kNSCommandSchedule:
+      if line == "schedule" {
+        return scheduleWireName(schedule())
+      }
+      guard line.hasPrefix("schedule "),
+        let mode = scheduleMode(wire: String(line.dropFirst(9))),
+        changeSchedule(mode)
+      else { return "failed" }
+      return scheduleWireName(schedule())
+    case kNSCommandClock:
+      if line == "clock" {
+        return hourCycleIs24() ? "24" : "12"
+      }
+      guard line.hasPrefix("clock ") else { return "failed" }
+      let cycleText = String(line.dropFirst(6))
+      let cycle: Int32
+      if cycleText == "24" { cycle = 24 }
+      else if cycleText == "12" { cycle = 12 }
+      else { return "failed" }
+      guard writeHourCycle(cycle) else { return "failed" }
+      return "\(cycle)"
+    case kNSCommandLogin:
+      if line == "login" {
+        return onOffReply(loginOn())
+      }
+      guard line.hasPrefix("login "), let on = onOffWire(String(line.dropFirst(6))) else {
+        return "failed"
+      }
+      if loginOn() == on { return onOffReply(on) }
+      return setLogin(on)
+    case kNSCommandDark:
+      if line == "dark" {
+        return onOffReply(darkMode())
+      }
+      guard line.hasPrefix("dark "), let on = onOffWire(String(line.dropFirst(5))) else {
+        return "failed"
+      }
+      changeDarkMode(on)
+      guard darkMode() == on else { return "failed" }
+      return onOffReply(on)
+    case kNSCommandTone:
+      if line == "tone" {
+        guard let on = trueTone() else { return "unsupported" }
+        return onOffReply(on)
+      }
+      guard line.hasPrefix("tone "), let on = onOffWire(String(line.dropFirst(5))) else {
+        return "failed"
+      }
+      guard trueTone() != nil else { return "unsupported" }
+      guard changeTrueTone(on), trueTone() == on else { return "failed" }
+      return onOffReply(on)
+    default:
+      return "failed"
+    }
+  }
+
   func apply(_ intent: MenuIntent) -> MenuSnapshot {
     switch intent {
     case .setWarmth(let warmth):
@@ -466,6 +629,47 @@ final class MenuFacade {
       collapsed.insert(section)
     }
     _ = files.writeCollapsed(collapsed)
+  }
+}
+
+// The update status line. Checking is only the fetch in flight. A failed
+// automatic check restores the standing line. Check Now says the fetch failed.
+enum UpdateLine: Equatable {
+  case notCheckedYet
+  case checking
+  case notice(String)
+}
+
+func updateLineText(_ line: UpdateLine) -> String {
+  switch line {
+  case .notCheckedYet:
+    "Not checked yet."
+  case .checking:
+    "Checking…"
+  case .notice(let text):
+    text
+  }
+}
+
+func updateLineWhileFetching(manual: Bool, standing: UpdateLine) -> UpdateLine {
+  if manual || standing == .notCheckedYet {
+    return .checking
+  }
+  return standing
+}
+
+func updateLineAfterFetch(manual: Bool, standing: UpdateLine, notice: String?) -> UpdateLine {
+  if let notice {
+    return .notice(notice)
+  }
+  if manual {
+    return .notice("Couldn't check for updates.")
+  }
+  switch standing {
+  case .checking:
+    return .notCheckedYet
+  case .notCheckedYet, .notice:
+    return standing
   }
 }
 

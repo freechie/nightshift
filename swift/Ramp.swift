@@ -167,6 +167,50 @@ final class RampEngine {
 
   private var maxValue: Int { settings.max?.percent ?? Self.unsetMax }
 
+  /// Four-field status for nightshiftd.sock. Unset max is -1.
+  func statusWire() -> (now: Int, max: Int, state: String, full: Int)? {
+    guard let nowStrength = hardware.strength(), let status = hardware.nightShift() else {
+      return nil
+    }
+    let max = settings.max?.percent ?? -1
+    let minute = hardware.minuteNow()
+    let state = statusWireState(enabled: status.enabled, phase: phase, now: minute)
+    let full = phase.glide?.toMinute.value ?? -1
+    return (nowStrength, max, state, full)
+  }
+
+  /// Socket `max`: save always; retarget only inside an enabled Custom window.
+  /// Unlike the menu Max slider, a lower max outside the evening does not cap warmth.
+  @discardableResult
+  func setMaxFromCommand(_ percent: Int) -> MaxOutcome {
+    guard isLicensed else { return .locked }
+    guard (1...100).contains(percent) else { return .invalid }
+    guard rememberMax(percent) else { return .saveFailed }
+    if let scheduled = customNow(), scheduled.window.contains(scheduled.now), scheduled.status.enabled {
+      ensureFullAt(scheduled.window)
+      retarget(scheduled.now, from: hardware.strength() ?? applied ?? percent, end: scheduled.window.end)
+      return .retargeted
+    }
+    return .saved
+  }
+
+  /// Socket `ramp`: save Full at even when the schedule is Off or Sunset, and
+  /// leave strength alone then. Custom paths match setFullAt.
+  @discardableResult
+  func setFullAtFromCommand(_ minute: Int) -> FullAtOutcome {
+    guard isLicensed else { return .locked }
+    guard let clock = Minute(minute) else { return .invalid }
+    if customNow() == nil {
+      guard rememberFullAt(clock) else {
+        notify(.couldNotSaveTime)
+        return .saveFailed
+      }
+      tonight.fullAt = nil
+      return .saved
+    }
+    return setFullAt(minute)
+  }
+
   /// Slider release and hotkeys. False, with nothing changed, when the write fails.
   @discardableResult
   func applyWarmth(_ warmth: Warmth) -> Bool {

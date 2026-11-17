@@ -272,10 +272,13 @@ final class SettingsController: NSObject, NSWindowDelegate, NSToolbarDelegate {
   private let updateStatus = NSTextField(labelWithString: "Not checked yet.")
   private var updateCheckButton: NSButton?
   private var updateChecking = false
+  private var updateStanding: UpdateLine = .notCheckedYet
   private var variantPopover: NSPopover?
   private var recordingIndex: Int?
   private var recordNote: String?
   private var keyMonitor: Any?
+  // Checkout in flight. Refresh keeps "Waiting for checkout…" while unlicensed.
+  private var licenseHeld: LicenseLine?
 
   func show(facade: MenuFacade?, onIntent: @escaping (MenuIntent) -> Void) {
     self.facade = facade
@@ -607,9 +610,8 @@ final class SettingsController: NSObject, NSWindowDelegate, NSToolbarDelegate {
 
   @objc private func buy(_ sender: NSButton) {
     sender.isEnabled = false
-    licenseStatus.stringValue = "Waiting for checkout…"
-    licenseStatus.textColor = .systemOrange
-    licenseDot?.color = .systemOrange
+    licenseHeld = .waitingForCheckout
+    applyLicenseLine(.waitingForCheckout)
     DispatchQueue.global(qos: .userInitiated).async {
       var openURL: NSString?
       var portal = ObjCBool(false)
@@ -753,32 +755,48 @@ final class SettingsController: NSObject, NSWindowDelegate, NSToolbarDelegate {
     if code == 1, let url {
       openAllowed(url)
     }
-    if code == 2, let message, !message.isEmpty {
-      licenseStatus.stringValue = message
+    if code == 2 {
+      licenseHeld = nil
     }
     buyButton.isEnabled = true
     if let snapshot = facade?.snapshot() {
       refresh(snapshot)
     }
+    if code == 2, let message, !message.isEmpty {
+      applyLicenseLine(.notice(message, .orange))
+    }
+  }
+
+  private func applyLicenseLine(_ line: LicenseLine) {
+    licenseStatus.stringValue = licenseLineText(line)
+    licenseStatus.textColor = licenseLineColor(line)
+    licenseDot?.color = licenseStatus.textColor ?? .secondaryLabelColor
+  }
+
+  private func licenseLineColor(_ line: LicenseLine) -> NSColor {
+    switch licenseLineTone(line) {
+    case .secondary:
+      .secondaryLabelColor
+    case .orange:
+      .systemOrange
+    case .green:
+      .systemGreen
+    }
   }
 
   private func showLicense(_ snapshot: MenuSnapshot) {
-    let until = rampLicenseUntil() as String?
+    let until = (rampLicenseUntil() as String?).map(licenseDay)
     let soon = rampLicenseRenewingSoon()
-    if snapshot.rampLicensed, let until, soon {
-      licenseStatus.stringValue = "Ends \(licenseDay(until))"
-      licenseStatus.textColor = .systemOrange
-    } else if snapshot.rampLicensed, let until {
-      licenseStatus.stringValue = "Active through \(licenseDay(until))"
-      licenseStatus.textColor = .systemGreen
-    } else if snapshot.rampLicensed {
-      licenseStatus.stringValue = "Active"
-      licenseStatus.textColor = .systemGreen
-    } else if licenseStatus.stringValue != "Waiting for checkout…" {
-      licenseStatus.stringValue = "Not active"
-      licenseStatus.textColor = .secondaryLabelColor
+    if snapshot.rampLicensed {
+      licenseHeld = nil
     }
-    licenseDot?.color = licenseStatus.textColor ?? .secondaryLabelColor
+    let line = licenseLineToShow(
+      licensed: snapshot.rampLicensed,
+      until: until,
+      renewingSoon: soon,
+      held: licenseHeld
+    )
+    applyLicenseLine(line)
     licensePitch?.isHidden = snapshot.rampLicensed
     buySection?.isHidden = snapshot.rampLicensed && !soon
     buyButton.title = soon ? "Renew…" : "Buy…"
@@ -1001,15 +1019,11 @@ final class SettingsController: NSObject, NSWindowDelegate, NSToolbarDelegate {
     if ok, let code, !code.isEmpty {
       seatCode.stringValue = code
       seatCode.isHidden = false
-      licenseStatus.stringValue = "Use this code on the other Mac."
-      licenseStatus.textColor = .secondaryLabelColor
-      licenseDot?.color = .secondaryLabelColor
+      applyLicenseLine(.notice("Use this code on the other Mac.", .secondary))
       return
     }
     if let message, !message.isEmpty {
-      licenseStatus.stringValue = message
-      licenseStatus.textColor = .systemOrange
-      licenseDot?.color = .systemOrange
+      applyLicenseLine(.notice(message, .orange))
     }
   }
 
@@ -1023,9 +1037,7 @@ final class SettingsController: NSObject, NSWindowDelegate, NSToolbarDelegate {
       refresh(snapshot)
     }
     if !ok, let message, !message.isEmpty {
-      licenseStatus.stringValue = message
-      licenseStatus.textColor = .systemOrange
-      licenseDot?.color = .systemOrange
+      applyLicenseLine(.notice(message, .orange))
     }
   }
 
@@ -1238,24 +1250,27 @@ final class SettingsController: NSObject, NSWindowDelegate, NSToolbarDelegate {
     if !manual && !updateIsStale() { return }
     updateChecking = true
     updateCheckButton?.isEnabled = false
-    if manual || updateStatus.stringValue == "Not checked yet." {
-      updateStatus.stringValue = "Checking…"
-    }
+    applyUpdateLine(updateLineWhileFetching(manual: manual, standing: updateStanding))
     let local = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""
     Task {
       let notice = await Self.fetchUpdateNotice(local: local)
       self.updateChecking = false
       self.updateCheckButton?.isEnabled = true
       guard let notice else {
-        if manual { self.updateStatus.stringValue = "Couldn't check for updates." }
+        self.applyUpdateLine(updateLineAfterFetch(manual: manual, standing: self.updateStanding, notice: nil))
         return
       }
       let now = Date()
       UserDefaults.standard.set(now, forKey: Self.updateCheckedKey)
       UserDefaults.standard.set(notice, forKey: Self.updateMessageKey)
       self.updateLast.stringValue = "Last check: \(self.updateDate(now))"
-      self.updateStatus.stringValue = notice
+      self.updateStanding = .notice(notice)
+      self.applyUpdateLine(self.updateStanding)
     }
+  }
+
+  private func applyUpdateLine(_ line: UpdateLine) {
+    updateStatus.stringValue = updateLineText(line)
   }
 
   private func showSavedUpdate() {
@@ -1265,7 +1280,9 @@ final class SettingsController: NSObject, NSWindowDelegate, NSToolbarDelegate {
     } else {
       updateLast.stringValue = "Last check: Never"
     }
-    updateStatus.stringValue = UserDefaults.standard.string(forKey: Self.updateMessageKey) ?? "Not checked yet."
+    let saved = UserDefaults.standard.string(forKey: Self.updateMessageKey)
+    updateStanding = saved.map { .notice($0) } ?? .notCheckedYet
+    applyUpdateLine(updateStanding)
   }
 
   private func updateAutoOn() -> Bool {

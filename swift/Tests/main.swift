@@ -231,6 +231,12 @@ func menuTests() {
 
   let warmed = facade.apply(.setWarmth(Warmth(60)!))
   check(warmed.warmth == .on(Warmth(60)!) && source.applied == [60], "a release applies once through the ramp and shows the new warmth")
+  check(facade.reply(to: "brightness", loginOn: { false }, setLogin: { _ in "failed" }) == "failed", "unknown socket lines reply failed")
+  let status = facade.reply(to: "status", loginOn: { false }, setLogin: { _ in "failed" })
+  check(status.split(separator: " ").count == 4 && status.hasPrefix("60 "), "status is four fields starting with current warmth")
+  controls.licensed = false
+  check(facade.reply(to: "max 70", loginOn: { false }, setLogin: { _ in "failed" }) == "locked", "unlicensed max replies locked")
+  controls.licensed = true
   facade.stageWarmth(Warmth(55)!)
   facade.stageWarmth(Warmth(58)!)
   check(source.staged == [55, 58] && source.applied == [60], "a live drag stages without a full apply")
@@ -477,8 +483,20 @@ func rampTests() {
   hw.mode = .sunsetToSunrise
   check(ramp.setFullAt(22 * 60) == .needsCustomSchedule && files.readFullAt() == 20 * 60, "Full at needs a Custom schedule")
   hw.mode = .custom
+  hw.now = 8 * 60
+  hw.enabled = true
+  hw.current = 80
+  let writesBeforeSocketMax = hw.writes
+  check(ramp.setMaxFromCommand(40) == .saved && files.readMax() == 40, "socket max outside the window saves")
+  check(hw.current == 80 && hw.writes == writesBeforeSocketMax, "socket max outside the window leaves strength alone")
+  hw.mode = .off
+  let writesBeforeSocketRamp = hw.writes
+  check(ramp.setFullAtFromCommand(10 * 60) == .saved && files.readFullAt() == 10 * 60, "socket ramp saves Full at when Off")
+  check(hw.writes == writesBeforeSocketRamp, "socket ramp when Off leaves strength alone")
+  hw.mode = .custom
   hw.isLicensed = false
   check(ramp.setFullAt(22 * 60) == .locked && ramp.setMax(30) == .locked, "an unlicensed ramp changes nothing")
+  check(ramp.setMaxFromCommand(30) == .locked && ramp.setFullAtFromCommand(22 * 60) == .locked, "socket max and ramp stay locked when unlicensed")
 }
 
 check(updateNotice(local: "0.3.0", remoteTag: "v0.3.0") == "You're up to date.", "the same release is current")
@@ -486,6 +504,43 @@ check(updateNotice(local: "0.3.0", remoteTag: "0.3") == "You're up to date.", "0
 check(updateNotice(local: "0.3.0", remoteTag: "v0.4.0") == "Version 0.4.0 is available.", "a newer tag is available")
 check(updateNotice(local: "0.3.0", remoteTag: "0.3.1") == "Version 0.3.1 is available.", "a newer patch is available")
 check(updateNotice(local: "0.3.0", remoteTag: " ") == "Couldn't check for updates.", "a blank tag is not a release")
+
+check(statusWireLine(now: 40, max: -1, state: "idle", full: -1) == "40 -1 idle -1", "unset max is -1 on the wire")
+check(statusWireState(enabled: false, phase: .idle, now: Minute(0)) == "off", "disabled Night Shift is off on the wire")
+check(statusWireState(enabled: true, phase: .idle, now: Minute(0)) == "idle", "enabled with no glide is idle")
+check(scheduleWireName(.sunsetToSunrise) == "sunset" && scheduleMode(wire: "sunset") == .sunsetToSunrise, "sunset is the schedule wire word")
+check(onOffWire("on") == true && onOffWire("no") == nil && onOffReply(false) == "off", "on/off wire words")
+check(parseCommandNumber("60", lo: 1, hi: 100) == 60 && parseCommandNumber("101", lo: 1, hi: 100) == nil, "command numbers match parseNumber")
+
+let current = UpdateLine.notice("You're up to date.")
+check(updateLineWhileFetching(manual: false, standing: .notCheckedYet) == .checking, "a first automatic check says Checking")
+check(updateLineWhileFetching(manual: false, standing: current) == current, "an automatic recheck keeps the saved result on screen")
+check(updateLineWhileFetching(manual: true, standing: current) == .checking, "Check Now says Checking")
+let failedAuto = updateLineAfterFetch(manual: false, standing: .notCheckedYet, notice: nil)
+check(failedAuto == .notCheckedYet && updateLineText(failedAuto) == "Not checked yet.", "a failed first check restores Not checked yet")
+let failedManual = updateLineAfterFetch(manual: true, standing: current, notice: nil)
+check(failedManual == .notice("Couldn't check for updates.") && updateLineText(failedManual) == "Couldn't check for updates.", "Check Now says when the fetch fails")
+let fetched = updateLineAfterFetch(manual: false, standing: .notCheckedYet, notice: "Version 0.4.0 is available.")
+check(fetched == .notice("Version 0.4.0 is available."), "a finished check shows the release line")
+
+let endsOn = "Jan 1, 2027"
+let quiet = licenseLineToShow(licensed: false, until: nil, renewingSoon: false, held: nil)
+check(quiet == .notActive && licenseLineText(quiet) == "Not active" && licenseLineTone(quiet) == .secondary, "an unlicensed Mac with nothing in flight reads Not active")
+let waiting = licenseLineToShow(licensed: false, until: nil, renewingSoon: false, held: .waitingForCheckout)
+check(waiting == .waitingForCheckout && licenseLineText(waiting) == "Waiting for checkout…", "checkout waiting survives a refresh while unlicensed")
+let licensedLine = licenseLineToShow(licensed: true, until: endsOn, renewingSoon: false, held: .waitingForCheckout)
+check(licensedLine == .activeThrough(endsOn) && licenseLineText(licensedLine) == "Active through \(endsOn)" && licenseLineTone(licensedLine) == .green, "a license replaces checkout waiting")
+let ending = licenseLineToShow(licensed: true, until: endsOn, renewingSoon: true, held: nil)
+check(ending == .ends(endsOn) && licenseLineText(ending) == "Ends \(endsOn)" && licenseLineTone(ending) == .orange, "a license renewing soon reads Ends")
+let undated = licenseLineToShow(licensed: true, until: nil, renewingSoon: true, held: nil)
+check(undated == .active && licenseLineText(undated) == "Active" && licenseLineTone(undated) == .green, "a license with no day reads Active")
+let server = LicenseLine.notice("could not reach the license server", .orange)
+let afterFailure = licenseLineToShow(licensed: false, until: nil, renewingSoon: false, held: nil)
+check(afterFailure == .notActive, "a failed purchase clears checkout waiting before refresh")
+check(licenseLineText(server) == "could not reach the license server" && licenseLineTone(server) == .orange, "the purchase error is the line painted after that refresh")
+check(licenseLineToShow(licensed: false, until: nil, renewingSoon: false, held: server) == .notActive, "the next refresh restores Not active")
+let seat = LicenseLine.notice("Use this code on the other Mac.", .secondary)
+check(licenseLineText(seat) == "Use this code on the other Mac." && licenseLineTone(seat) == .secondary, "a seat code tells the user to use it on the other Mac")
 
 rampTests()
 
