@@ -9,15 +9,15 @@ Download [Nightshift.zip](https://github.com/freechie/nightshift/releases/latest
 ```sh
 mkdir -p "$HOME/.local"
 unzip -o -d "$HOME/.local" Nightshift.zip
-open "$HOME/.local/Nightshift.app"
+open "$HOME/.local/NightshiftSwift.app"
 ```
 
-The zip holds `bin/nightshift` and `Nightshift.app`. Add `$HOME/.local/bin` to your `PATH`. The command finds the app beside `bin`.
+The zip holds `bin/nightshift` and `NightshiftSwift.app`. Add `$HOME/.local/bin` to your `PATH`. The command finds the app beside `bin`.
 
 A downloaded copy is quarantined. Clear that before the first open:
 
 ```sh
-xattr -dr com.apple.quarantine "$HOME/.local/Nightshift.app" "$HOME/.local/bin/nightshift"
+xattr -dr com.apple.quarantine "$HOME/.local/NightshiftSwift.app" "$HOME/.local/bin/nightshift"
 ```
 
 `make package` builds the same zip at `dist/Nightshift.zip`.
@@ -42,21 +42,17 @@ Each Mac has an install secret, and the license is served only to the Mac that h
 
 ## Menu bar
 
-`Nightshift.app` keeps an icon in the menu bar. The first line is the same sentence `nightshift` prints. Release Now or Max to set the warmth or the max. Full at is hour, minute, and AM/PM columns. 24-hour hides AM/PM. That choice is saved in `clock`, beside `max` and `full`.
+`NightshiftSwift.app` keeps an icon in the menu bar. The first line is the same sentence `nightshift` prints. Release Color temperature or Max to set the warmth or the max. Full at uses the system date picker. 24-hour is a Settings switch. That choice is saved in `clock`. Max, full, and menu sections live under `~/Library/Application Support/io.github.freechie.nightshift.swift/`.
 
-## Daemon
+## App and socket
 
-Open `Nightshift.app` and leave it running. It posts a banner when it starts and when the warmth changes. On a Custom schedule it begins at warmth 1 and reaches your max two hours later, or at the time you set. If no max is saved, the current warmth becomes the max. It holds that max until the schedule ends. `nightshift 40` during the schedule jumps to 40 and glides toward the max. A warmth above the max becomes the new max. `nightshift max 60` changes the max directly. Sunset to Sunrise is left alone.
+Open `NightshiftSwift.app` and leave it running. On a Custom schedule it begins at warmth 1 and reaches your max two hours later, or at the time you set. If no max is saved, the current warmth becomes the max. It holds that max until the schedule ends. `nightshift 40` during the schedule jumps to 40 and glides toward the max. A warmth above the max becomes the new max. `nightshift max 60` changes the max directly. Sunset to Sunrise is left alone.
 
-Notifications say "Warmth is at 40%", or "Warmth is at 20%, reaching 40% at 7:00 PM" while it is still climbing. Clicking one leaves it on screen. Its Options menu, or the arrow at its top right, opens Set Max and Set Time. In System Settings → Notifications → Nightshift, choose Alerts so those fields stay on screen.
-
-The daemon listens on `~/Library/Application Support/nightshift/nightshiftd.sock`. The max is stored beside it in `max`, a chosen arrival time in `full`, and 12-hour or 24-hour in `clock`. Only your user can read them.
-
-The command starts `Nightshift.app` if the daemon is not already running, then sends the instruction to it. That is what posts the banner. A command that exits cannot show a notification on its own: macOS needs the app bundle, and the evening ramp has to keep running after the command is gone.
+The app listens on `~/Library/Application Support/nightshift/nightshiftd.sock`. Only your user can use that socket. The command starts `NightshiftSwift.app` when schedule, clock, or warmth need a listener and nothing is listening. Plain `nightshift` only reports.
 
 ## Private API
 
-Night Shift has no public API. The daemon uses `CBBlueLightClient` from Apple's private `CoreBrightness` framework, and a macOS update can change it. It checks the method signatures first. If they changed, it prints `Night Shift is unavailable` and exits `1` instead of calling them.
+Night Shift has no public API. The app uses `CBBlueLightClient` from Apple's private `CoreBrightness` framework, and a macOS update can change it. It checks the method signatures first. If they changed, it prints `Night Shift is unavailable` and exits `1` instead of calling them.
 
 Checked on macOS 27.0 (Golden Gate).
 
@@ -64,17 +60,17 @@ Checked on macOS 27.0 (Golden Gate).
 
 ```sh
 make
-open Nightshift.app
+open NightshiftSwift.app
 ./nightshift
 ```
 
-Run `Nightshift.app`, not a bare `nightshiftd`, or notifications have nowhere to go. `./nightshift` sends commands to that app.
+Run `NightshiftSwift.app` so it can own `nightshiftd.sock`. `./nightshift` sends commands to that app.
 
-`main.m` is the command and `nightshiftd.m` is the daemon. `NightShift.m` holds the Night Shift calls they share.
+`main.m` is the command. The Swift app listens on the socket. `NightShift.m` holds the Night Shift calls they share. The archived ObjC daemon lives in `~/Sites/nightshift objc`.
 
 ## License server
 
-The app and CLI talk to a license server compiled in as an `https` origin: build releases with `make package LICENSE_SERVER=https://your.server`. `make package` stops with the reason if `LICENSE_SERVER` is missing or isn't a lowercase `https` origin (the app's own rule), `make install` warns when the build has none, and changing it rebuilds `nightshift` and `nightshiftd`. A `server` file in `~/Library/Application Support/nightshift` can replace it with another `https` origin. Plain `http` is accepted only for `127.0.0.1` and `localhost` in the test-key build. License requests never follow a redirect, so the install secret only goes to that origin. The only pages ever opened for buying are `https://checkout.stripe.com` and `https://billing.stripe.com`, and an address with a control character (a NUL included) is never opened. Turning on a Stripe custom domain for Checkout or the billing portal means adding that host to the allowlist in `nsPurchaseURLVerdict` (`NightshiftLogic.m`) first; otherwise the app refuses every purchase link.
+The app and CLI talk to a license server compiled in as an `https` origin: build releases with `make package LICENSE_SERVER=https://your.server`. `make package` stops with the reason if `LICENSE_SERVER` is missing or isn't a lowercase `https` origin (the app's own rule), `make install` warns when the build has none, and changing it rebuilds `nightshift`. A `server` file in `~/Library/Application Support/nightshift` can replace it with another `https` origin. Plain `http` is accepted only for `127.0.0.1` and `localhost` in the test-key build. License requests never follow a redirect, so the install secret only goes to that origin. The only pages ever opened for buying are `https://checkout.stripe.com` and `https://billing.stripe.com`, and an address with a control character (a NUL included) is never opened. Turning on a Stripe custom domain for Checkout or the billing portal means adding that host to the allowlist in `nsPurchaseURLVerdict` (`NightshiftLogic.m`) first; otherwise the app refuses every purchase link.
 
 `server/` sells and serves ramp licenses through Stripe. Every Stripe client in it is pinned to API version `2026-03-25.dahlia` (`stripeApiVersion` in `server/app.js`), and `setup.js` creates the webhook endpoint in that version. Invoices in this version carry no payment fields; the server asks Stripe for them. `server/test.js` fakes Stripe with scrubbed responses captured from a sandbox run in this version (`server/fixtures/stripe-2026-03-25/`).
 

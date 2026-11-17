@@ -2,11 +2,10 @@ SDK := $(shell xcrun --show-sdk-path)
 CFLAGS := -fobjc-arc -Wall -Wextra -F$(SDK)/System/Library/PrivateFrameworks
 LDLIBS := -framework Foundation -framework CoreBrightness -framework Security
 PREFIX ?= /usr/local
-VERSION := $(shell /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Info.plist)
+VERSION := $(shell /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' swift/Info.plist)
 SHARED := NightShift.m NightShift.h CBBlueLightClient.h
 LOGIC := NightshiftLogic.m NightshiftLogic.h
-# The license server, compiled into nightshift and nightshiftd: an https
-# origin, for example
+# The license server, compiled into nightshift: an https origin, for example
 #   make package LICENSE_SERVER=https://license.example.com
 # Without it, those builds have no license server (buy and renew report it
 # unreachable); make package refuses to run. The value goes to the compiler
@@ -20,14 +19,11 @@ SERVER_FLAGS = $(if $(LICENSE_SERVER),-DNIGHTSHIFT_LICENSE_SERVER="\"$$LICENSE_S
 # compares whole seconds, so a newer stamp alone could be missed.
 LICENSE_STAMP := .license-server
 LICENSE_QUOTED := '$(subst ','\'',$(LICENSE_SERVER))'
-$(shell printf '%s\n' $(LICENSE_QUOTED) | cmp -s - $(LICENSE_STAMP) || { rm -f nightshift nightshiftd; printf '%s\n' $(LICENSE_QUOTED) > $(LICENSE_STAMP); })
-APP := Nightshift.app
-BUNDLED := $(APP)/Contents/MacOS/nightshiftd
+$(shell printf '%s\n' $(LICENSE_QUOTED) | cmp -s - $(LICENSE_STAMP) || { rm -f nightshift; printf '%s\n' $(LICENSE_QUOTED) > $(LICENSE_STAMP); })
 DIST := dist
 STAGE := $(DIST)/root
 ZIP := $(DIST)/Nightshift.zip
-# The Swift rewrite: its own app, bundle id and build folder, so it never
-# replaces Nightshift.app.
+# The Swift rewrite: its own app, bundle id and build folder.
 SWIFT_APP := NightshiftSwift.app
 SWIFT_BUILD := build/swift
 SWIFT_SRC := swift/main.swift swift/App.swift swift/NightShiftClient.swift swift/Warmth.swift swift/WarmthHold.swift swift/HotKeys.swift swift/Ramp.swift swift/MenuModel.swift swift/MenuPanel.swift swift/Settings.swift swift/CommandWire.swift swift/CommandListener.swift
@@ -36,10 +32,10 @@ SWIFT_SRC := swift/main.swift swift/App.swift swift/NightShiftClient.swift swift
 SWIFT_TARGET := -target arm64-apple-macos15.0
 SWIFTFLAGS := -swift-version 6 -warnings-as-errors $(SWIFT_TARGET)
 
-all: nightshift nightshiftd $(BUNDLED)
+all: nightshift $(SWIFT_APP)/Contents/MacOS/nightshift-swift
 
 test: socket-main-check secret-scan workspace-open-check nightshift nightshift-tests logic-tests server-test license-server-check nightshift-swift swift-tests
-	./socket-main-check --siblings nightshiftd.m
+	./socket-main-check
 	./nightshift-tests
 	./logic-tests
 	./swift-tests
@@ -53,13 +49,14 @@ secret-scan:
 	sh scripts/scan-secrets.sh self-test
 	sh scripts/check-server-webhook.sh
 
-# One NSWorkspace openURL:, and it calls both license verdicts.
+# Settings opens URLs only through rampWorkspaceURL (both verdicts).
 workspace-open-check:
 	sh scripts/check-workspace-open.sh
 
 # glibc with -std=c11 declares mkdtemp only when _POSIX_C_SOURCE is at least
 # 200809L. Apple's headers hide mkdtemp when that macro is set, so Darwin
-# leaves it off. The check itself is unchanged.
+# leaves it off. The check itself is unchanged. Self-test only: accept() now
+# lives in CommandListener.swift, which this C checker does not parse.
 socket-main-check: tests/socket-main-check.c
 	cc -std=c11 -Wall -Wextra -Werror $(if $(filter Darwin,$(shell uname -s)),,-D_POSIX_C_SOURCE=200809L) -o $@ tests/socket-main-check.c
 
@@ -72,9 +69,6 @@ server-test: nightshift-testkey
 
 nightshift: main.m $(SHARED) $(LOGIC) $(LICENSE_STAMP)
 	clang $(CFLAGS) $(SERVER_FLAGS) $(LDLIBS) -o $@ main.m NightShift.m NightshiftLogic.m
-
-nightshiftd: nightshiftd.m $(SHARED) $(LOGIC) $(LICENSE_STAMP)
-	clang $(CFLAGS) $(SERVER_FLAGS) $(LDLIBS) -framework AppKit -framework Carbon -framework UserNotifications -framework ServiceManagement -framework SkyLight -o $@ nightshiftd.m NightShift.m NightshiftLogic.m
 
 nightshift-tests: tests/check.m $(SHARED) $(LOGIC)
 	clang $(CFLAGS) -I. $(LDLIBS) -o $@ tests/check.m NightShift.m NightshiftLogic.m
@@ -114,21 +108,12 @@ $(SWIFT_APP)/Contents/MacOS/nightshift-swift: nightshift-swift swift/Info.plist
 	cp nightshift-swift $@
 	sh scripts/dev-sign.sh $(SWIFT_APP)
 
-GLYPHS := $(wildcard icons/*.pdf)
-
-$(BUNDLED): nightshiftd Info.plist $(GLYPHS)
-	mkdir -p $(dir $@) $(APP)/Contents/Resources
-	cp Info.plist $(APP)/Contents/
-	cp $(GLYPHS) $(APP)/Contents/Resources/
-	cp nightshiftd $@
-	sh scripts/dev-sign.sh $(APP)
-
 install: all license-server-check
 	@./license-server-check install
 	install -d $(PREFIX)/bin
 	install -m 755 nightshift $(PREFIX)/bin
-	rm -rf $(PREFIX)/Nightshift.app
-	cp -R Nightshift.app $(PREFIX)/Nightshift.app
+	rm -rf $(PREFIX)/NightshiftSwift.app
+	cp -R $(SWIFT_APP) $(PREFIX)/NightshiftSwift.app
 
 # A release must carry a usable license server: checked before anything is
 # built, so a bad or missing LICENSE_SERVER stops here with the reason.
@@ -138,15 +123,15 @@ package: license-server-check
 	rm -rf $(STAGE) $(ZIP)
 	mkdir -p $(STAGE)/bin
 	install -m 755 nightshift $(STAGE)/bin/nightshift
-	cp -R $(APP) $(STAGE)/
+	cp -R $(SWIFT_APP) $(STAGE)/
 	codesign --force --options runtime --sign - $(STAGE)/bin/nightshift
 	ditto -c -k --norsrc $(STAGE) $(ZIP)
 	rm -rf $(STAGE)
 	@echo $(ZIP) $(VERSION)
 
 clean:
-	rm -rf nightshift nightshiftd nightshift-tests logic-tests nightshift-testkey \
-	    socket-main-check license-server-check $(LICENSE_STAMP) $(APP) $(DIST) \
+	rm -rf nightshift nightshift-tests logic-tests nightshift-testkey \
+	    socket-main-check license-server-check $(LICENSE_STAMP) $(DIST) \
 	    nightshift-swift swift-tests $(SWIFT_APP) build
 
 # Turns on scripts/hooks (the pre-commit secret scan) for this clone.

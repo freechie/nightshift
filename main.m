@@ -28,7 +28,7 @@
 
 extern char **environ;
 
-static NSString *daemonBinary(void) {
+static NSString *appBinary(void) {
   char exe[PATH_MAX];
   uint32_t size = sizeof(exe);
   if (_NSGetExecutablePath(exe, &size) != 0) {
@@ -41,12 +41,13 @@ static NSString *daemonBinary(void) {
   NSString *dir = [NSString stringWithUTF8String:resolved].stringByDeletingLastPathComponent;
   NSFileManager *files = [NSFileManager defaultManager];
   NSString *beside = [dir stringByAppendingPathComponent:
-                               @"Nightshift.app/Contents/MacOS/nightshiftd"];
+                               @"NightshiftSwift.app/Contents/MacOS/nightshift-swift"];
   if ([files isExecutableFileAtPath:beside]) {
     return beside;
   }
   NSString *installed = [[dir stringByDeletingLastPathComponent]
-      stringByAppendingPathComponent:@"Nightshift.app/Contents/MacOS/nightshiftd"];
+      stringByAppendingPathComponent:
+          @"NightshiftSwift.app/Contents/MacOS/nightshift-swift"];
   if ([files isExecutableFileAtPath:installed]) {
     return installed;
   }
@@ -54,7 +55,7 @@ static NSString *daemonBinary(void) {
 }
 
 static BOOL startDaemon(void) {
-  NSString *daemon = daemonBinary();
+  NSString *daemon = appBinary();
   if (daemon == nil) {
     return NO;
   }
@@ -204,7 +205,7 @@ static int finishReply(int sent, const char *reply, const char *failText, BOOL s
     return 0;
   }
   if (sent < 0) {
-    fprintf(stderr, "failed to reach nightshiftd\n");
+    fprintf(stderr, "failed to reach Nightshift\n");
     return 1;
   }
   fprintf(stderr, "%s\n", failText);
@@ -302,8 +303,8 @@ static void help(void) {
       "  evening starts.\n"
       "\n"
       "Menu bar:\n"
-      "  Nightshift.app keeps an icon in the menu bar. Release Current or Max to\n"
-      "  set warmth or the max. Type the Full at time, hour then minute.\n"
+      "  Nightshift Swift keeps an icon in the menu bar. Release Current or Max\n"
+      "  to set warmth or the max. Type the Full at time, hour then minute.\n"
       "  24-hour hides AM/PM. The menu also has Dark mode, True Tone,\n"
       "  Night Shift Off, Custom, or Sunset, and Quit. Settings opens\n"
       "  General, Night Shift, Keyboard, and Nightshift Pro.\n"
@@ -312,20 +313,15 @@ static void help(void) {
       "  nightshift command.\n"
       "\n"
       "Notifications:\n"
-      "  Every command goes through Nightshift.app, which starts on its own\n"
-      "  if it is not running. Plain nightshift only reports, so it says\n"
-      "  Nightshift isn't running instead. The app posts a banner when it\n"
-      "  starts and whenever warmth or the max changes.\n"
-      "\n"
-      "  A banner's Options menu, or its arrow, has Set Max and Set Time.\n"
-      "  They do the same as nightshift max and nightshift ramp. For banners\n"
-      "  that stay on screen, choose Alerts in System Settings >\n"
-      "  Notifications > Nightshift.\n"
+      "  Schedule, clock, and warmth start Nightshift Swift when nothing is\n"
+      "  listening. Plain nightshift only reports, so it says Nightshift isn't\n"
+      "  running instead.\n"
       "\n"
       "Files, in ~/Library/Application Support/nightshift:\n"
-      "  max               The saved max\n"
-      "  full              The ramp time\n"
-      "  nightshiftd.sock  How the command talks to Nightshift.app\n");
+      "  nightshiftd.sock  How the command talks to Nightshift Swift\n"
+      "  clock            12-hour or 24-hour for Full at\n"
+      "Max, full, and menu sections live under\n"
+      "  ~/Library/Application Support/io.github.freechie.nightshift.swift/\n");
 }
 
 // One line of input for `nightshift license secret`: typed with echo off
@@ -409,8 +405,8 @@ int main(int argc, const char *argv[]) {
         return 0;
       }
       fprintf(stderr, sent < 0 ? "Nightshift isn't running\n"
-                                 "Open Nightshift.app, or set a warmth with nightshift <0-100>\n"
-                               : "failed to reach nightshiftd\n");
+                                 "Open NightshiftSwift.app, or set a warmth with nightshift <0-100>\n"
+                               : "failed to reach Nightshift\n");
       return 1;
     }
 
@@ -563,7 +559,7 @@ int main(int argc, const char *argv[]) {
         return 0;
       }
       if (sent < 0) {
-        fprintf(stderr, "failed to reach nightshiftd\n");
+        fprintf(stderr, "failed to reach Nightshift\n");
         return 1;
       }
       fprintf(stderr, "failed to set max\n");
@@ -599,7 +595,7 @@ int main(int argc, const char *argv[]) {
         }
       }
       if (sent < 0) {
-        fprintf(stderr, "failed to reach nightshiftd\n");
+        fprintf(stderr, "failed to reach Nightshift\n");
         return 1;
       }
       fprintf(stderr, "failed to set the time\n");
@@ -696,7 +692,7 @@ int main(int argc, const char *argv[]) {
       printf("%s\n", reply);
       return 0;
     }
-    fprintf(stderr, sent < 0 ? "failed to reach nightshiftd\n"
+    fprintf(stderr, sent < 0 ? "failed to reach Nightshift\n"
                              : "failed to set Night Shift\n");
     return 1;
   }
