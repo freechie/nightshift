@@ -13,7 +13,7 @@
 // limitations under the License.
 
 // Hold state for warmth hotkeys. Carbon delivers press/release once; repeats
-// are our timer. Matches nightshiftd commandWarmthTick / hold fields.
+// are our timer. Same fields as the archived ObjC commandWarmthTick hold.
 
 struct WarmthHold: Equatable {
   var generation = 0
