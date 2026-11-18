@@ -814,7 +814,8 @@ static int ends_with(const char *name, const char *suf) {
 static int skip_dir(const char *name) {
   return strcmp(name, ".") == 0 || strcmp(name, "..") == 0 || strcmp(name, ".git") == 0 ||
          strcmp(name, "node_modules") == 0 || strcmp(name, "dist") == 0 ||
-         strcmp(name, "Nightshift.app") == 0 || strcmp(name, ".cursor") == 0;
+         strcmp(name, "Nightshift.app") == 0 || strcmp(name, "NightshiftSwift.app") == 0 ||
+         strcmp(name, ".cursor") == 0;
 }
 
 static int scan_tree(const char *dir, dev_t skip_dev, ino_t skip_ino, char *err, size_t errcap) {
@@ -875,7 +876,7 @@ static int scan_tree(const char *dir, dev_t skip_dev, ino_t skip_ino, char *err,
       bad = 1;
     } else if (n > 0) {
       char msg[PATH_MAX + 80];
-      snprintf(msg, sizeof(msg), "%s:%d: accept() is outside nightshiftd.m\n", path, line);
+      snprintf(msg, sizeof(msg), "%s:%d: accept() is outside the listener source\n", path, line);
       add_err(err, errcap, msg);
       bad = 1;
     }
@@ -1084,7 +1085,7 @@ static void run_sibling_cases(void) {
   }
   char daemon[PATH_MAX];
   char other[PATH_MAX];
-  snprintf(daemon, sizeof(daemon), "%s/nightshiftd.m", dir);
+  snprintf(daemon, sizeof(daemon), "%s/listener.m", dir);
   snprintf(other, sizeof(other), "%s/other.m", dir);
   static const char kOther[] = "int main(void) {\n  accept(0, 0, 0);\n  return 0;\n}\n";
   if (write_text(daemon, kGood) != 0) {

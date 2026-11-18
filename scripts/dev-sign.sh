@@ -1,5 +1,5 @@
 #!/bin/bash
-# Sign Nightshift.app with a stable identity so its code signature, and any
+# Sign NightshiftSwift.app with a stable identity so its code signature, and any
 # macOS grant tied to it, stays the same across rebuilds. Ad-hoc signing ("-")
 # changes the signature every time.
 # The download zip stays ad-hoc. This script is for the local app you test.

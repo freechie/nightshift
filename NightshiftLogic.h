@@ -51,7 +51,7 @@ long nsCommandWarmthNext(long percent, int direction);
 // spin the run loop if the system repeat interval is tiny.
 double nsCommandWarmthRepeatGap(double seconds);
 // While the menu is open, macOS holds the warmth hotkeys' Carbon events and
-// delivers them all when it closes, so nightshiftd reads the keys itself.
+// delivers them all when it closes, so the app polls the keys itself.
 // true when keyDown and the held modifiers (the kNSHotKey bits below) are
 // exactly the shortcut's.
 bool nsShortcutHeld(unsigned modifiers, bool keyDown, unsigned heldModifiers);
@@ -64,8 +64,7 @@ bool nsHotKeyDuringMenu(double eventTime, double openedAt, double closedAt, bool
 
 // The warmth hotkeys, as RegisterEventHotKey takes them. The values are
 // Carbon's (kVK_ANSI_Minus / kVK_ANSI_Equal, cmdKey, shiftKey, optionKey,
-// controlKey); nightshiftd.m checks them against Carbon at compile time,
-// so this file stays plain C.
+// controlKey). This file stays plain C; values match Carbon's constants.
 enum {
   kNSKeyCodeMinus = 0x1B,
   kNSKeyCodeEqual = 0x18,
