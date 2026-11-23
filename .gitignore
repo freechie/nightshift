@@ -14,6 +14,9 @@ server/data/
 server/.env
 .DS_Store
 .cursor/
+.agents/
+AGENTS.md
+graphify-out/
 nightshift-swift
 swift-tests
 NightshiftSwift.app/
