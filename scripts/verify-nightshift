@@ -1,0 +1,250 @@
+#!/bin/sh
+# Drive Nightshift Swift for verification. One system Night Shift display is
+# shared by every copy of the app, so this refuses a second process and never
+# kills a process it did not start.
+set -eu
+
+ROOT=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
+APP="$ROOT/NightshiftSwift.app"
+BIN="$APP/Contents/MacOS/nightshift-swift"
+UI="$ROOT/scripts/verify-nightshift-ui.applescript"
+RUN="${NIGHTSHIFT_VERIFY_RUN:-/tmp/nightshift-verify-run}"
+EVIDENCE="${NIGHTSHIFT_VERIFY_EVIDENCE:-/tmp/nightshift-verify-evidence}"
+
+usage() {
+  echo "usage: scripts/verify-nightshift launch|doctor|drive|cleanup" >&2
+  exit 2
+}
+
+plist_value() {
+  /usr/libexec/PlistBuddy -c "Print :$2" "$1"
+}
+
+# pid and command, one line, for processes whose command is this app's binary.
+our_processes() {
+  ps -axo pid=,command= | awk -v bin="$BIN" '
+    {
+      pid=$1
+      $1=""
+      sub(/^ /, "", $0)
+      if ($0 == bin) print pid
+    }
+  '
+}
+
+require_one() {
+  pids=$(our_processes)
+  count=$(printf '%s\n' "$pids" | awk 'NF { n++ } END { print n+0 }')
+  if [ "$count" -ne 1 ]; then
+    echo "doctor: want one process at $BIN, found $count" >&2
+    printf '%s\n' "$pids" >&2
+    exit 1
+  fi
+  printf '%s\n' "$pids"
+}
+
+cmd=${1:-}
+[ -n "$cmd" ] || usage
+
+case "$cmd" in
+  launch)
+    mkdir -p "$RUN"
+    if [ ! -x "$BIN" ]; then
+      make -C "$ROOT" swift
+    fi
+    pids=$(our_processes || true)
+    count=$(printf '%s\n' "$pids" | awk 'NF { n++ } END { print n+0 }')
+    if [ "$count" -gt 1 ]; then
+      echo "launch: more than one nightshift-swift is running. Refusing to drive a shared display." >&2
+      exit 1
+    fi
+    others=$(ps -axo pid=,command= | awk -v bin="$BIN" '
+      {
+        exe=$2
+        if ((exe == "nightshift-swift" || exe ~ /\/nightshift-swift$/) && exe != bin)
+          print $1, exe
+      }
+    ')
+    if [ -n "$others" ]; then
+      echo "launch: a different nightshift-swift is running. Quit that one yourself. This run will not kill it." >&2
+      printf '%s\n' "$others" >&2
+      exit 1
+    fi
+    if [ "$count" -eq 1 ]; then
+      echo "launch: reusing pid $pids"
+      echo "$pids" >"$RUN/reused.pid"
+      rm -f "$RUN/started.pid"
+    else
+      open "$APP"
+      i=0
+      while [ "$i" -lt 50 ]; do
+        pids=$(our_processes || true)
+        count=$(printf '%s\n' "$pids" | awk 'NF { n++ } END { print n+0 }')
+        if [ "$count" -eq 1 ]; then
+          break
+        fi
+        i=$((i + 1))
+        sleep 0.1
+      done
+      if [ "$count" -ne 1 ]; then
+        echo "launch: Nightshift Swift did not become ready" >&2
+        exit 1
+      fi
+      echo "$pids" >"$RUN/started.pid"
+      rm -f "$RUN/reused.pid"
+      echo "launch: started pid $pids"
+    fi
+    # Ready means the status item exists, not merely that the process answers.
+    i=0
+    while [ "$i" -lt 50 ]; do
+      if osascript "$UI" window >/dev/null 2>&1; then
+        echo "launch: ready pid $pids"
+        exit 0
+      fi
+      i=$((i + 1))
+      sleep 0.1
+    done
+    echo "launch: process is up but the status item is not reachable" >&2
+    exit 1
+    ;;
+  doctor)
+    pid=$(require_one)
+    app_short=$(plist_value "$APP/Contents/Info.plist" CFBundleShortVersionString)
+    app_build=$(plist_value "$APP/Contents/Info.plist" CFBundleVersion)
+    src_short=$(plist_value "$ROOT/swift/Info.plist" CFBundleShortVersionString)
+    src_build=$(plist_value "$ROOT/swift/Info.plist" CFBundleVersion)
+    if [ "$app_short" != "$src_short" ] || [ "$app_build" != "$src_build" ]; then
+      echo "doctor: app plist $app_short ($app_build) differs from swift/Info.plist $src_short ($src_build)" >&2
+      exit 1
+    fi
+    start=$(ps -o lstart= -p "$pid" | awk '{$1=$1; print}')
+    bin_mtime=$(stat -f %m "$BIN")
+    elapsed=$(ps -o etime= -p "$pid" | tr -d ' ')
+    seconds=$(printf '%s\n' "$elapsed" | awk -F- '
+      NF == 2 { days=$1; clock=$2 }
+      NF == 1 { days=0; clock=$1 }
+      {
+        n = split(clock, p, ":")
+        if (n == 2) sec = p[1] * 60 + p[2]
+        else sec = p[1] * 3600 + p[2] * 60 + p[3]
+        print days * 86400 + sec
+      }
+    ')
+    now=$(date +%s)
+    born=$((now - seconds))
+    if [ "$bin_mtime" -gt "$born" ]; then
+      echo "doctor: $BIN was rebuilt after pid $pid started. The running app is the older binary." >&2
+      exit 1
+    fi
+    echo "doctor: ok pid $pid version $app_short ($app_build) started $start"
+    ;;
+  drive)
+    feature=${2:-settings}
+    if [ "$feature" != "settings" ]; then
+      echo "drive: only settings is scripted. Other features are in .cursor/skills/verify-nightshift/features/. A screenshot is not proof of Night Shift tint." >&2
+      exit 1
+    fi
+    pid=$(require_one)
+    mkdir -p "$EVIDENCE/settings" "$RUN"
+    before=$(osascript "$UI" window)
+    printf '%s\n' "$before" >"$EVIDENCE/settings/window-before.txt"
+    case "$before" in
+      "WINDOW none") opened=1 ;;
+      *) opened=0 ;;
+    esac
+    osascript "$UI" open-settings
+    i=0
+    name=""
+    while [ "$i" -lt 40 ]; do
+      name=$(osascript "$UI" window)
+      case "$name" in
+        "WINDOW Nightshift Settings")
+          break
+          ;;
+      esac
+      i=$((i + 1))
+      sleep 0.1
+    done
+    case "$name" in
+      "WINDOW Nightshift Settings") ;;
+      *)
+        echo "drive: Settings did not open (last: $name)" >&2
+        exit 1
+        ;;
+    esac
+    page_before=$(osascript "$UI" page)
+    printf '%s\n' "$page_before" >"$EVIDENCE/settings/page-before.txt"
+    if [ "$opened" -eq 0 ]; then
+      printf '%s\n' "$page_before" >"$RUN/restore-page"
+      rm -f "$RUN/opened-settings" "$RUN/restore-window"
+    fi
+    osascript "$UI" select Settings
+    i=0
+    page_now=""
+    while [ "$i" -lt 30 ]; do
+      page_now=$(osascript "$UI" page)
+      if [ "$page_now" = "PAGE settings" ]; then
+        break
+      fi
+      i=$((i + 1))
+      sleep 0.1
+    done
+    if [ "$page_now" != "PAGE settings" ]; then
+      echo "drive: Settings page did not appear (last: $page_now)" >&2
+      exit 1
+    fi
+    osascript "$UI" toolbar >"$EVIDENCE/settings/toolbar.txt"
+    osascript "$UI" dump >"$EVIDENCE/settings/general.txt"
+    osascript "$UI" bounds >"$EVIDENCE/settings/bounds.txt"
+    printf '%s\n' "$name" >"$EVIDENCE/settings/window-title.txt"
+    # shellcheck disable=SC2046
+    set -- $(awk '{ print $2, $3, $4, $5 }' "$EVIDENCE/settings/bounds.txt")
+    screencapture -x -R"$1,$2,$3,$4" "$EVIDENCE/settings/general.png"
+    if ! grep -F -q "Open at login" "$EVIDENCE/settings/general.txt"; then
+      echo "drive: Settings page is missing Open at login" >&2
+      exit 1
+    fi
+    for label in "Show percent" "Bars and icon" "24-hour time" "Notification style"; do
+      if ! grep -F -q "$label" "$EVIDENCE/settings/general.txt"; then
+        echo "drive: Settings page is missing $label" >&2
+        exit 1
+      fi
+    done
+    if ! grep -F -q "TOOLBAR Settings | License | About" "$EVIDENCE/settings/toolbar.txt"; then
+      echo "drive: toolbar is missing a page" >&2
+      cat "$EVIDENCE/settings/toolbar.txt" >&2
+      exit 1
+    fi
+    if [ "$opened" -eq 1 ]; then
+      echo opened >"$RUN/opened-settings"
+      rm -f "$RUN/restore-page" "$RUN/restore-window"
+    fi
+    echo "drive: settings ok pid $pid evidence $EVIDENCE/settings"
+    ;;
+  cleanup)
+    if [ -f "$RUN/opened-settings" ]; then
+      osascript "$UI" close-window || true
+      rm -f "$RUN/opened-settings"
+    elif [ -f "$RUN/restore-page" ]; then
+      pane=$(awk '{ print $2 }' "$RUN/restore-page")
+      case "$pane" in
+        settings) osascript "$UI" select Settings || true ;;
+        license) osascript "$UI" select License || true ;;
+        about) osascript "$UI" select About || true ;;
+      esac
+      rm -f "$RUN/restore-page" "$RUN/restore-window"
+    fi
+    if [ -f "$RUN/started.pid" ]; then
+      pid=$(cat "$RUN/started.pid")
+      if our_processes | awk -v pid="$pid" '$1 == pid { found=1 } END { exit !found }'; then
+        kill "$pid"
+      fi
+      rm -f "$RUN/started.pid"
+    fi
+    rm -f "$RUN/reused.pid"
+    echo "cleanup: done. Evidence remains at $EVIDENCE"
+    ;;
+  *)
+    usage
+    ;;
+esac
