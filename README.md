@@ -2,26 +2,6 @@
 
 Set the macOS Night Shift warmth from the terminal or the menu bar. `0` is off. `100` is as warm as Night Shift goes.
 
-## Install
-
-Download [Nightshift.zip](https://github.com/freechie/nightshift/releases/latest/download/Nightshift.zip) and unpack it into `~/.local`:
-
-```sh
-mkdir -p "$HOME/.local"
-unzip -o -d "$HOME/.local" Nightshift.zip
-open "$HOME/.local/NightshiftSwift.app"
-```
-
-The zip holds `bin/nightshift` and `NightshiftSwift.app`. Add `$HOME/.local/bin` to your `PATH`. The command finds the app beside `bin`.
-
-A downloaded copy is quarantined. Clear that before the first open:
-
-```sh
-xattr -dr com.apple.quarantine "$HOME/.local/NightshiftSwift.app" "$HOME/.local/bin/nightshift"
-```
-
-`make package` builds the same zip at `dist/Nightshift.zip`.
-
 ## Usage
 
 ```sh
@@ -36,50 +16,14 @@ nightshift -h         # explain the commands, the ramp, and the notifications
 
 A warmth is a whole number from `0` to `100`. A max is from `1` to `100`.
 
-Setting a warmth is free. The evening ramp is a year at a time. `nightshift buy` opens checkout and saves the token. The menu button does the same. `nightshift license` prints the date it runs through. `nightshift license <token>` saves a token you already have. A token works only on the Mac it was issued for. If a license needs to move to another install ID (for example, after its ID file was lost), contact support with the email you paid with and the output of `nightshift license id`.
-
-Each Mac has an install secret, and the license is served only to the Mac that holds it. If support gives you a secret (after moving a license, granting one, or when this Mac lost its secret file), enter it with `nightshift license secret`. It asks for the secret without showing it, or reads one line from a pipe (`nightshift license secret < secret.txt`), then saves it and fetches the license. It never takes the secret as an argument, so it stays out of your shell history and `ps`. It won't replace a secret this Mac already has unless you add `--replace`. If `nightshift buy` says to contact support, this install ID already has a license under another secret (for example, this Mac lost its secret file): support can give you a new secret, so don't buy again.
+Leave Nightshift Swift running. On a Custom schedule it begins at warmth 1 and reaches your max two hours later, or at the time you set. If no max is saved, the current warmth becomes the max. It holds that max until the schedule ends. `nightshift 40` during the schedule jumps to 40 and glides toward the max. A warmth above the max becomes the new max. `nightshift max 60` changes the max directly. Sunset to Sunrise is left alone.
 
 ## Menu bar
 
-`NightshiftSwift.app` keeps an icon in the menu bar. The first line is the same sentence `nightshift` prints. Release Color temperature or Max to set the warmth or the max. Full at uses the system date picker. 24-hour is a Settings switch. That choice is saved in `clock`. Max, full, and menu sections live under `~/Library/Application Support/io.github.freechie.nightshift.swift/`.
+The menu bar icon shows the same sentence `nightshift` prints. Release Color temperature or Max to set the warmth or the max. Full at uses the system date picker. 24-hour is a Settings switch.
 
-## App and socket
+## The evening ramp
 
-Open `NightshiftSwift.app` and leave it running. On a Custom schedule it begins at warmth 1 and reaches your max two hours later, or at the time you set. If no max is saved, the current warmth becomes the max. It holds that max until the schedule ends. `nightshift 40` during the schedule jumps to 40 and glides toward the max. A warmth above the max becomes the new max. `nightshift max 60` changes the max directly. Sunset to Sunrise is left alone.
+Setting a warmth is free. The evening ramp is a year at a time. `nightshift buy` opens checkout and saves the license. The menu button does the same. `nightshift license` prints the date it runs through. `nightshift license <token>` saves a license you already have. A license works only on the Mac it was issued for. If a license needs to move to another Mac, contact support with the email you paid with and the output of `nightshift license id`.
 
-The app listens on `~/Library/Application Support/nightshift/nightshiftd.sock`. Only your user can use that socket. The command starts `NightshiftSwift.app` when schedule, clock, or warmth need a listener and nothing is listening. Plain `nightshift` only reports.
-
-## Private API
-
-Night Shift has no public API. The app uses `CBBlueLightClient` from Apple's private `CoreBrightness` framework, and a macOS update can change it. It checks the method signatures first. If they changed, it prints `Night Shift is unavailable` and exits `1` instead of calling them.
-
-Checked on macOS 27.0 (Golden Gate).
-
-## Build from source
-
-```sh
-make
-open NightshiftSwift.app
-./nightshift
-```
-
-Run `NightshiftSwift.app` so it can own `nightshiftd.sock`. `./nightshift` sends commands to that app.
-
-`main.m` is the command. The Swift app listens on the socket. `NightShift.m` holds the Night Shift calls they share. The archived ObjC daemon lives in `~/Sites/nightshift objc`.
-
-## License server
-
-The app and CLI talk to a license server compiled in as an `https` origin: build releases with `make package LICENSE_SERVER=https://your.server`. `make package` stops with the reason if `LICENSE_SERVER` is missing or isn't a lowercase `https` origin (the app's own rule), `make install` warns when the build has none, and changing it rebuilds `nightshift`. A `server` file in `~/Library/Application Support/nightshift` can replace it with another `https` origin. Plain `http` is accepted only for `127.0.0.1` and `localhost` in the test-key build. License requests never follow a redirect, so the install secret only goes to that origin. The only pages ever opened for buying are `https://checkout.stripe.com` and `https://billing.stripe.com`, and an address with a control character (a NUL included) is never opened. Turning on a Stripe custom domain for Checkout or the billing portal means adding that host to the allowlist in `nsPurchaseURLVerdict` (`NightshiftLogic.m`) first; otherwise the app refuses every purchase link.
-
-`server/` sells and serves ramp licenses through Stripe. Every Stripe client in it is pinned to API version `2026-03-25.dahlia` (`stripeApiVersion` in `server/app.js`), and `setup.js` creates the webhook endpoint in that version. Invoices in this version carry no payment fields; the server asks Stripe for them. `server/test.js` fakes Stripe with scrubbed responses captured from a sandbox run in this version (`server/fixtures/stripe-2026-03-25/`).
-
-Upgrading the version means re-running the sandbox check: a test-mode checkout paid with test card 4242, a purchase held and refunded, `stripe events resend` of its events, and a lapsed customer buying again. Recapture the fixtures from that run. The server logs `WEBHOOK-VERSION` when an event arrives in another version.
-
-The only pages `NSWorkspace` opens go through `rampWorkspaceURL` (`nsWorkspaceOpenAllowed`). That check calls `nsLicenseOriginVerdict` and `nsPurchaseURLVerdict` on every URL. A license-server origin is not opened. Settings and the project links are exact strings.
-
-Keep secrets out of commits: `server/.env` is ignored, and `server/.env.example` keeps every key, secret and token empty (`server/test.js` fails otherwise). `make test` runs `scripts/scan-secrets.sh` on the tracked tree. `make hooks` points this clone's `core.hooksPath` at `scripts/hooks`, whose `pre-commit` runs the same pattern on the index. Both name the file, line, and key, never the value. `server/.env` is not part of either scan. If one was ever pushed, rotate it in Stripe; deleting it from the file doesn't retire it. The deployed `STRIPE_WEBHOOK_SECRET` is the dashboard endpoint secret from `stripe.webhookEndpoints.create` in `server/setup.js`. `stripe listen` in that file is the local http hint.
-
-## License
-
-Apache License 2.0. See `LICENSE`. Copyright 2026 John.
+If support gives you a secret, enter it with `nightshift license secret`. It asks for the secret without showing it, or reads one line from a pipe (`nightshift license secret < secret.txt`). It won't replace a secret this Mac already has unless you add `--replace`. If `nightshift buy` says to contact support, this Mac already has a license under another secret: support can give you a new one, so don't buy again.
