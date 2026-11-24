@@ -1,6 +1,25 @@
 # Night Shift
 
-Easily set your nightshift warmth from the terminal or the menu bar. Set an Evening Ramp max value and set the time needed to reach it to have your night shift warmth automatically increase throughout the day available as a one-time purchase.
+Set your nightshift warmth intensity from the menu bar or CLI.
+
+Save an Evening Ramp time to set when the ramp will reach max intensity.
+
+The evening ramp is available as a one-time purchase for pro users.
+
+## Menu bar
+
+Release the **Color temperature** slider to set the warmth intensity. Release the **Max** slider to set the max intensity.
+
+**Full at** is when the warmth intensity reaches the max value pro users set. You have the option of **24-hour** time in Settings.
+
+## Evening
+
+Nightshift applies your schedule and **current** warmth intensity from System Settings.
+
+The Evening Ramp, once unlocked, glides on a pleasant curve towards your max intensity.
+
+Until you set a new max warmth, the current warmth is the max. Sunset to Sunrise works as is.
+
 
 ## Commands
 
@@ -15,19 +34,11 @@ nightshift -h           # the rest of the commands
 
 A warmth is a whole number from `0` to `100`. A max is from `1` to `100`.
 
-## Evening
+## Pro Users
 
-Nightshift applies your schedule and **max** intensity from System Settings. The Evening Ramp, if unlocked, glides on a pleasant curve towards your max intensity. The value and times can be changed right in the app or via **CLI**.
+Setting warmth intensity will always be free.
 
-Until you set a new max intensity, the current warmth is the max. It ramps towards that maximum night shift intensity until the schedule ends. Sunset to Sunrise stays as is.
-
-## Menu bar
-
-Release the **Color temperature** slider to set the warmth. Release the **Max** slider to set the max. **Full at** is the time the warmth reaches the max. You have the option of **24-hour** time in Settings.
-
-## Buy
-
-Setting warmth intensity is free. The evening ramp is a one-time purchase for up to 3 devices.
+The evening ramp is a one-time Pro user purchase for up to 3 devices.
 
 `nightshift buy` opens checkout. `nightshift license` prints the date the ramp runs through.
 
