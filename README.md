@@ -1,8 +1,6 @@
 # Night Shift
 
-Set your nightshift warmth intensity from the menu bar or CLI.
-
-Save an Evening Ramp time to set when the ramp will reach max intensity.
+Set your nightshift warmth intensity from the menu bar or CLI. Save an Evening Ramp time to set when the ramp will reach max intensity.
 
 The evening ramp is available as a one-time purchase for pro users.
 
